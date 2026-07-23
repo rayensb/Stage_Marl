@@ -1,0 +1,614 @@
+===== FILE: ./envs/formation_env.py =====
+"""
+FormationEnv3D — N-agent PettingZoo ParallelEnv, 3D space.
+
+Each drone locks onto its K nearest neighbors (RECON/LOCKED state machine)
+and controls (vx, vy, vz) to: track a moving target, maintain angular spread
+among its locked neighbors (emergent triangle/pyramid), avoid collision with
+locked neighbors, and avoid drifting too far from them.
+"""
+
+import math
+import functools
+import itertools
+import numpy as np
+from gymnasium import spaces
+from pettingzoo import ParallelEnv
+
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config import (
+    NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
+    COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED,
+    OBS_MAX_DIST, OBS_MAX_VEL, OBS_MAX_ANGLE,
+)
+
+
+class FormationEnv3D(ParallelEnv):
+    metadata = {"name": "formation_env_3d_v0"}
+
+    def __init__(self, num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS, scenario=None):
+        self.possible_agents = [f"drone{i+1}" for i in range(num_agents)]
+        self.agents = self.possible_agents[:]
+        self.k = min(k_neighbors, num_agents - 1)
+        self.forced_scenario = scenario
+
+        self._obs_dim = 7 + 7 * self.k   # own_vel(3)+rel_target(3)+dist_t(1) + k*(relpos3+relvel3+dist1)
+        self._act_dim = 3                 # vx, vy, vz
+
+        self.pos, self.vel = {}, {}
+        self.locked = {}   # agent -> list of neighbor ids
+        self.pos_t = np.zeros(3, np.float32)
+        self.step_count = 0
+        self.np_random = np.random.default_rng()
+
+    @functools.lru_cache(maxsize=None)
+    def observation_space(self, agent):
+        return spaces.Box(low=-1.0, high=1.0, shape=(self._obs_dim,), dtype=np.float32)
+
+    @functools.lru_cache(maxsize=None)
+    def action_space(self, agent):
+        return spaces.Box(low=-1.0, high=1.0, shape=(self._act_dim,), dtype=np.float32)
+
+    # ---- reset ----
+    def reset(self, seed=None, options=None):
+        if seed is not None:
+            self.np_random = np.random.default_rng(seed)
+        self.agents = self.possible_agents[:]
+        self.step_count = 0
+
+        self.pos_t = self.np_random.uniform(-3.0, 3.0, 3).astype(np.float32)
+        self.pos_t[2] = self.np_random.uniform(2.0, 3.0)  # altitude
+
+        for a in self.agents:
+            ang = self.np_random.uniform(0, 2 * math.pi)
+            elev = self.np_random.uniform(-0.3, 0.3)
+            d = self.np_random.uniform(3.5, 6.0)
+            offset = np.array([math.cos(ang) * math.cos(elev),
+                                math.sin(ang) * math.cos(elev),
+                                math.sin(elev)]) * d
+            self.pos[a] = (self.pos_t + offset).astype(np.float32)
+            self.vel[a] = np.zeros(3, np.float32)
+
+        self._resolve_overlaps()
+
+        self._target_dir = self.np_random.uniform(-1, 1, 3).astype(np.float32)
+        self._target_dir[2] *= 0.2  # gentle vertical drift
+        self._target_dir /= (np.linalg.norm(self._target_dir) + 1e-6)
+        self._target_speed = self.np_random.uniform(0.3, 1.0)
+
+        for a in self.agents:
+            self.locked[a] = self._select_neighbors(a)
+
+        obs = {a: self._get_obs(a) for a in self.agents}
+        infos = {a: {} for a in self.agents}
+        return obs, infos
+
+    def _resolve_overlaps(self):
+        max_iter = 50
+        for _ in range(max_iter):
+            worst = None
+            worst_d = COLLISION_DIST + 0.3
+            for a, b in itertools.combinations(self.agents, 2):
+                d = np.linalg.norm(self.pos[a] - self.pos[b])
+                if d < worst_d:
+                    worst_d, worst = d, (a, b)
+            if worst is None:
+                break
+            a, b = worst
+            diff = self.pos[b] - self.pos[a]
+            n = np.linalg.norm(diff) + 1e-6
+            self.pos[b] = (self.pos[b] + diff / n * 0.3).astype(np.float32)
+
+    def _select_neighbors(self, agent):
+        dists = [(o, np.linalg.norm(self.pos[agent] - self.pos[o]))
+                  for o in self.agents if o != agent]
+        dists.sort(key=lambda x: x[1])
+        return [o for o, _ in dists[:self.k]]
+
+    # ---- step ----
+    def step(self, actions):
+        self.step_count += 1
+
+        for a in self.agents:
+            act = np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED
+            self.vel[a] = act.astype(np.float32)
+            self.pos[a] = (self.pos[a] + self.vel[a] * DT).astype(np.float32)
+
+        self.pos_t = (self.pos_t + self._target_dir * self._target_speed * DT).astype(np.float32)
+
+        # re-lock (RECON) if a locked neighbor drifted too far
+        for a in self.agents:
+            max_locked_d = max(
+                (np.linalg.norm(self.pos[a] - self.pos[n]) for n in self.locked[a]),
+                default=0.0)
+            if max_locked_d > DIVERGE_DIST:
+                self.locked[a] = self._select_neighbors(a)
+
+        collision = any(
+            np.linalg.norm(self.pos[a] - self.pos[b]) < COLLISION_DIST
+            for a, b in itertools.combinations(self.agents, 2))
+        truncated = self.step_count >= MAX_STEPS
+
+        rewards = {a: self._get_reward(a) for a in self.agents}
+        terminations = {a: bool(collision) for a in self.agents}
+        truncations = {a: bool(truncated) for a in self.agents}
+        obs = {a: self._get_obs(a) for a in self.agents}
+        infos = {a: {"min_dist": self._min_dist(a)} for a in self.agents}
+
+        if collision or truncated:
+            self.agents = []
+
+        return obs, rewards, terminations, truncations, infos
+
+    # ---- helpers ----
+    def _min_dist(self, agent):
+        others = [o for o in self.possible_agents if o != agent]
+        return min(np.linalg.norm(self.pos[agent] - self.pos[o]) for o in others)
+
+    def _dist_to_target(self, agent):
+        return float(np.linalg.norm(self.pos[agent] - self.pos_t))
+
+    def _get_obs(self, agent):
+        p, v, t = self.pos[agent], self.vel[agent], self.pos_t
+        rel_t = (t - p) / OBS_MAX_DIST
+        dist_t = self._dist_to_target(agent) / OBS_MAX_DIST
+
+        feats = [v[0] / OBS_MAX_VEL, v[1] / OBS_MAX_VEL, v[2] / OBS_MAX_VEL,
+                  rel_t[0], rel_t[1], rel_t[2], dist_t]
+
+        neighbors = self.locked[agent]
+        for i in range(self.k):
+            if i < len(neighbors):
+                n = neighbors[i]
+                rel_p = (self.pos[n] - p) / OBS_MAX_DIST
+                rel_v = (self.vel[n] - v) / OBS_MAX_VEL
+                d = np.linalg.norm(self.pos[n] - p) / OBS_MAX_DIST
+                feats.extend([rel_p[0], rel_p[1], rel_p[2],
+                              rel_v[0], rel_v[1], rel_v[2], d])
+            else:
+                feats.extend([0, 0, 0, 0, 0, 0, 1.0])  # sentinel: no neighbor
+
+        return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
+
+    def _get_reward(self, agent):
+        p = self.pos[agent]
+        neighbors = self.locked[agent]
+
+        r_track = -0.5 * abs(self._dist_to_target(agent) - TARGET_DIST)
+
+        # angular spread among locked neighbors (ideal = evenly spaced, 2*pi/k apart)
+        r_spread = 0.0
+        if len(neighbors) >= 2:
+            bearings = []
+            for n in neighbors:
+                d = self.pos[n] - p
+                bearings.append(math.atan2(d[1], d[0]))
+            bearings.sort()
+            gaps = [(bearings[(i + 1) % len(bearings)] - bearings[i]) % (2 * math.pi)
+                    for i in range(len(bearings))]
+            min_gap = min(gaps)
+            ideal_gap = 2 * math.pi / len(neighbors)
+            r_spread = -0.3 * abs(min_gap - ideal_gap)
+
+        # local collision safety vs locked neighbors only
+        r_safety = 0.0
+        r_diverge = 0.0
+        for n in neighbors:
+            d = float(np.linalg.norm(self.pos[n] - p))
+            if d < COLLISION_DIST:
+                r_safety += -300.0
+            elif d < SAFE_DIST_ENTER:
+                r_safety += -50.0 * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
+            elif d < SAFE_DIST_EXIT:
+                center = (SAFE_DIST_ENTER + SAFE_DIST_EXIT) / 2.0
+                err = abs(d - center) / (SAFE_DIST_EXIT - SAFE_DIST_ENTER)
+                r_safety += 5.0 * (1.0 - err)
+            r_diverge += -5.0 * max(0.0, d - DIVERGE_DIST) / DIVERGE_DIST
+
+        return float(r_track + r_spread + r_safety + r_diverge)
+
+===== FILE: ./envs/test_env.py =====
+"""Sanity check — run random actions, confirm no crashes, print shapes."""
+import numpy as np
+from envs.formation_env import FormationEnv
+
+env = FormationEnv(scenario="danger")
+obs, infos = env.reset(seed=0)
+print("agents:", env.agents)
+print("obs['drone1'] shape:", obs["drone1"].shape, "sample:", obs["drone1"])
+
+for step in range(50):
+    actions = {a: env.action_space(a).sample() for a in env.agents}
+    obs, rewards, terms, truncs, infos = env.step(actions)
+    if step % 10 == 0:
+        print(f"step={step} inter_dist={infos.get('drone1',{}).get('inter_dist'):.2f} "
+              f"rew_d1={rewards.get('drone1', 0):.2f}")
+    if not env.agents:
+        print("Episode ended at step", step)
+        break
+
+print("Test finished OK.")
+
+===== FILE: ./envs/__init__.py =====
+
+===== FILE: ./config.py =====
+"""Shared constants for the MARL formation/collision-avoidance env."""
+
+NUM_AGENTS       = 4       # default swarm size (N-generic, test with 4)
+K_NEIGHBORS       = 2       # each drone locks onto its 2 nearest neighbors
+
+TARGET_DIST      = 3.5     # desired drone-to-target distance (m), now 3D
+SAFE_DIST_ENTER  = 4.20
+SAFE_DIST_EXIT   = 5.20
+COLLISION_DIST   = 4.20
+DIVERGE_DIST     = 10.0    # also used as re-lock trigger distance
+
+MAX_STEPS        = 200
+DT                = 0.05
+
+MAX_ACTION_SPEED = 1.2     # m/s, clamp on vx/vy/vz output by policy
+
+OBS_MAX_DIST      = 15.0
+OBS_MAX_VEL        = 2.0
+OBS_MAX_ANGLE      = 3.14159
+
+===== FILE: ./test_env.py =====
+from envs.formation_env import FormationEnv3D
+
+env = FormationEnv3D(num_agents=4, k_neighbors=2, scenario=None)
+obs, infos = env.reset(seed=0)
+print("agents:", env.agents)
+print("obs_dim:", obs["drone1"].shape)
+
+for step in range(200):
+    actions = {a: env.action_space(a).sample() for a in env.agents}
+    obs, rewards, terms, truncs, infos = env.step(actions)
+    if step % 20 == 0:
+        min_d = min(infos[a]["min_dist"] for a in env.agents)
+        print(f"step={step} min_dist={min_d:.2f} rew_d1={rewards.get('drone1', 0):.2f}")
+    if not env.agents:
+        print("ended at", step, "terms:", terms)
+        break
+else:
+    print("reached max steps OK")
+
+===== FILE: ./training/train.py =====
+import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+import numpy as np
+import torch
+import torch.optim as optim
+from collections import deque
+
+from envs.formation_env import FormationEnv3D
+from training.networks import Actor, CentralCritic
+from training.buffer import RolloutBuffer
+from training.checkpoint import save_checkpoint, load_checkpoint
+from training.logger import init_logger, log_row
+from config import NUM_AGENTS, K_NEIGHBORS
+
+AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
+OBS_DIM = 7 + 7 * K_NEIGHBORS
+ACT_DIM = 3
+ROLLOUT_LEN = 2048
+EPOCHS = 10
+BATCH_SIZE = 256
+LR = 3e-4
+CLIP = 0.2
+TOTAL_STEPS = 300_000
+CKPT_EVERY_UPDATES = 1     # save every rollout cycle (~2048 steps)
+DEVICE = "cpu"
+
+
+def joint(obs_dict):
+    return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
+
+
+def main():
+    init_logger()
+    env = FormationEnv3D(num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS)
+    actors = {a: Actor(OBS_DIM, ACT_DIM).to(DEVICE) for a in AGENTS}
+    critic = CentralCritic(OBS_DIM * len(AGENTS)).to(DEVICE)
+    opt_actors = {a: optim.Adam(actors[a].parameters(), lr=LR) for a in AGENTS}
+    opt_critic = optim.Adam(critic.parameters(), lr=LR)
+
+    total_steps, ep_count = load_checkpoint(actors, critic, opt_actors, opt_critic)
+
+    buf = RolloutBuffer(AGENTS, OBS_DIM, ACT_DIM, ROLLOUT_LEN)
+    obs, _ = env.reset()
+    ep_rewards = {a: 0.0 for a in AGENTS}
+    ep_len = 0
+
+    recent_rewards = deque(maxlen=50)
+    recent_collisions = deque(maxlen=50)   # 1 if episode ended in collision, else 0
+    recent_min_dist = deque(maxlen=50)
+    recent_ep_len = deque(maxlen=50)
+    update_count = 0
+
+    while total_steps < TOTAL_STEPS:
+        buf.reset()
+        for t in range(ROLLOUT_LEN):
+            act_dict, logp_dict = {}, {}
+            with torch.no_grad():
+                for a in env.agents:
+                    o = torch.as_tensor(obs[a]).unsqueeze(0)
+                    act, logp = actors[a].get_action(o)
+                    act_dict[a] = act.squeeze(0).numpy()
+                    logp_dict[a] = logp.item()
+                jobs = torch.as_tensor(joint(obs)).unsqueeze(0)
+                value = critic(jobs).item()
+
+            next_obs, rewards, terms, truncs, infos = env.step(act_dict)
+            done = any(terms.values()) or any(truncs.values())
+            collided = any(terms.values())
+
+            buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value)
+            for a in AGENTS:
+                ep_rewards[a] += rewards.get(a, 0.0)
+            ep_len += 1
+            total_steps += 1
+
+            if done:
+                ep_count += 1
+                min_d = min((infos[a]["min_dist"] for a in infos), default=0.0)
+                recent_rewards.append(np.mean(list(ep_rewards.values())))
+                recent_collisions.append(1.0 if collided else 0.0)
+                recent_min_dist.append(min_d)
+                recent_ep_len.append(ep_len)
+
+                obs, _ = env.reset()
+                ep_rewards = {a: 0.0 for a in AGENTS}
+                ep_len = 0
+            else:
+                obs = next_obs
+
+        with torch.no_grad():
+            jobs = torch.as_tensor(joint(obs)).unsqueeze(0)
+            last_value = critic(jobs).item()
+
+        # ---- PPO update ----
+        last_actor_loss, last_critic_loss, last_entropy = 0.0, 0.0, 0.0
+        for a in AGENTS:
+            o, jo, act, old_logp, adv, ret = buf.get_tensors_normalized(a, last_value)
+            n = o.shape[0]
+            for _ in range(EPOCHS):
+                idx = torch.randperm(n)
+                for start in range(0, n, BATCH_SIZE):
+                    b = idx[start:start + BATCH_SIZE]
+                    logp, entropy = actors[a].evaluate(o[b], act[b])
+                    ratio = torch.exp(logp - old_logp[b])
+                    s1 = ratio * adv[b]
+                    s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[b]
+                    actor_loss = -torch.min(s1, s2).mean() - 0.01 * entropy.mean()
+
+                    value_pred = critic(jo[b])
+                    critic_loss = ((value_pred - ret[b]) ** 2).mean()
+
+                    opt_actors[a].zero_grad()
+                    actor_loss.backward(retain_graph=True)
+                    opt_actors[a].step()
+
+                    opt_critic.zero_grad()
+                    critic_loss.backward()
+                    opt_critic.step()
+
+                    last_actor_loss = actor_loss.item()
+                    last_critic_loss = critic_loss.item()
+                    last_entropy = entropy.mean().item()
+
+        update_count += 1
+
+        # ---- metrics + logging ----
+        avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
+        collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
+        avg_min_dist = float(np.mean(recent_min_dist)) if recent_min_dist else 0.0
+        avg_ep_len = float(np.mean(recent_ep_len)) if recent_ep_len else 0.0
+
+        print(f"steps={total_steps:>8} ep={ep_count:>5} "
+              f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
+              f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f}")
+
+        log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
+                 collision_rate=collision_rate, avg_min_dist=avg_min_dist,
+                 avg_ep_len=avg_ep_len, entropy=last_entropy,
+                 actor_loss=last_actor_loss, critic_loss=last_critic_loss)
+
+        if update_count % CKPT_EVERY_UPDATES == 0:
+            save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count)
+
+    os.makedirs("models", exist_ok=True)
+    for a in AGENTS:
+        torch.save(actors[a].state_dict(), f"models/actor_{a}.pt")
+    print("Training done. Final models saved to models/")
+
+
+if __name__ == "__main__":
+    main()
+
+===== FILE: ./training/buffer.py =====
+import numpy as np
+import torch
+
+class RolloutBuffer:
+    """Stores transitions for both agents + joint obs for the central critic."""
+    def __init__(self, agents, obs_dim, act_dim, size, gamma=0.99, lam=0.95):
+        self.agents = agents
+        self.size = size
+        self.gamma = gamma
+        self.lam = lam
+        self.obs_dim = obs_dim
+        self.act_dim = act_dim
+        self.joint_obs_dim = obs_dim * len(agents)
+        self.reset()
+
+    def reset(self):
+        n = self.size
+        self.obs = {a: np.zeros((n, self.obs_dim), np.float32) for a in self.agents}
+        self.joint_obs = np.zeros((n, self.joint_obs_dim), np.float32)
+        self.actions = {a: np.zeros((n, self.act_dim), np.float32) for a in self.agents}
+        self.logp = {a: np.zeros(n, np.float32) for a in self.agents}
+        self.rewards = {a: np.zeros(n, np.float32) for a in self.agents}
+        self.dones = np.zeros(n, np.float32)
+        self.values = np.zeros(n, np.float32)
+        self.ptr = 0
+
+    def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value):
+        i = self.ptr
+        for a in self.agents:
+            self.obs[a][i] = obs_dict[a]
+            self.actions[a][i] = act_dict[a]
+            self.logp[a][i] = logp_dict[a]
+            self.rewards[a][i] = rew_dict[a]
+        self.joint_obs[i] = joint_obs
+        self.dones[i] = done
+        self.values[i] = value
+        self.ptr += 1
+
+    def compute_gae(self, last_value, agent):
+        adv = np.zeros(self.size, np.float32)
+        lastgae = 0.0
+        for t in reversed(range(self.size)):
+            nextval = last_value if t == self.size - 1 else self.values[t + 1]
+            nextnonterminal = 1.0 - self.dones[t]
+            delta = self.rewards[agent][t] + self.gamma * nextval * nextnonterminal - self.values[t]
+            lastgae = delta + self.gamma * self.lam * nextnonterminal * lastgae
+            adv[t] = lastgae
+        returns = adv + self.values
+        return adv, returns
+
+    def get_tensors_normalized(self, agent, last_value):
+        adv, ret = self.compute_gae(last_value, agent)
+        adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        ret_norm = (ret - ret.mean()) / (ret.std() + 1e-8)
+        return (
+            torch.as_tensor(self.obs[agent]),
+            torch.as_tensor(self.joint_obs),
+            torch.as_tensor(self.actions[agent]),
+            torch.as_tensor(self.logp[agent]),
+            torch.as_tensor(adv),
+            torch.as_tensor(ret_norm),
+        )
+
+===== FILE: ./training/networks.py =====
+import torch
+import torch.nn as nn
+
+class Actor(nn.Module):
+    """Per-agent policy: local obs -> action mean (Gaussian)."""
+    def __init__(self, obs_dim, act_dim, hidden=64):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+        )
+        self.mu = nn.Linear(hidden, act_dim)
+        self.log_std = nn.Parameter(torch.zeros(act_dim) - 0.5)
+
+    def forward(self, obs):
+        h = self.net(obs)
+        mu = torch.tanh(self.mu(h))
+        std = torch.exp(self.log_std)
+        return mu, std
+
+    def get_action(self, obs, deterministic=False):
+        mu, std = self.forward(obs)
+        if deterministic:
+            return mu, None
+        dist = torch.distributions.Normal(mu, std)
+        action = dist.sample()
+        logp = dist.log_prob(action).sum(-1)
+        return torch.clamp(action, -1, 1), logp
+
+    def evaluate(self, obs, action):
+        mu, std = self.forward(obs)
+        dist = torch.distributions.Normal(mu, std)
+        logp = dist.log_prob(action).sum(-1)
+        entropy = dist.entropy().sum(-1)
+        return logp, entropy
+
+
+class CentralCritic(nn.Module):
+    """Centralized critic: sees concatenated obs of ALL agents -> value."""
+    def __init__(self, joint_obs_dim, hidden=128):
+        super().__init__()
+        self.net = nn.Sequential(
+            nn.Linear(joint_obs_dim, hidden), nn.Tanh(),
+            nn.Linear(hidden, hidden), nn.Tanh(),
+            nn.Linear(hidden, 1),
+        )
+
+    def forward(self, joint_obs):
+        return self.net(joint_obs).squeeze(-1)
+
+===== FILE: ./training/logger.py =====
+import os
+import csv
+
+LOG_PATH = "logs/training_log.csv"
+FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate",
+          "avg_min_dist", "avg_ep_len", "entropy", "actor_loss", "critic_loss"]
+
+def init_logger():
+    os.makedirs("logs", exist_ok=True)
+    if not os.path.exists(LOG_PATH):
+        with open(LOG_PATH, "w", newline="") as f:
+            csv.DictWriter(f, fieldnames=FIELDS).writeheader()
+
+def log_row(**kwargs):
+    with open(LOG_PATH, "a", newline="") as f:
+        csv.DictWriter(f, fieldnames=FIELDS).writerow(kwargs)
+
+===== FILE: ./training/plot_training.py =====
+import pandas as pd
+import matplotlib
+matplotlib.use('Agg')
+import matplotlib.pyplot as plt
+
+df = pd.read_csv("logs/training_log.csv")
+fig, axes = plt.subplots(2, 2, figsize=(12, 8))
+
+axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
+axes[0,1].plot(df.total_steps, df.collision_rate, color='red')
+axes[0,1].set_title("Collision Rate (should trend -> 0)")
+axes[0,1].axhline(0, color='green', ls='--', alpha=0.5)
+axes[1,0].plot(df.total_steps, df.avg_min_dist); axes[1,0].set_title("Avg Min Dist")
+axes[1,1].plot(df.total_steps, df.critic_loss, color='orange')
+axes[1,1].set_title("Critic Loss (should stabilize/decrease)")
+
+plt.tight_layout()
+plt.savefig("logs/training_curves.png", dpi=120)
+print("Saved logs/training_curves.png")
+
+===== FILE: ./training/checkpoint.py =====
+import os
+import torch
+
+CKPT_PATH = "checkpoints/latest.pt"
+
+def save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count):
+    os.makedirs("checkpoints", exist_ok=True)
+    state = {
+        "actors": {a: actors[a].state_dict() for a in actors},
+        "critic": critic.state_dict(),
+        "opt_actors": {a: opt_actors[a].state_dict() for a in opt_actors},
+        "opt_critic": opt_critic.state_dict(),
+        "total_steps": total_steps,
+        "ep_count": ep_count,
+    }
+    torch.save(state, CKPT_PATH)
+
+def load_checkpoint(actors, critic, opt_actors, opt_critic):
+    if not os.path.exists(CKPT_PATH):
+        return 0, 0
+    state = torch.load(CKPT_PATH, map_location="cpu")
+    for a in actors:
+        actors[a].load_state_dict(state["actors"][a])
+        opt_actors[a].load_state_dict(state["opt_actors"][a])
+    critic.load_state_dict(state["critic"])
+    opt_critic.load_state_dict(state["opt_critic"])
+    print(f"Resumed from checkpoint: steps={state['total_steps']} ep={state['ep_count']}")
+    return state["total_steps"], state["ep_count"]
+
+===== FILE: ./training/__init__.py =====
+
