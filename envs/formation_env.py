@@ -196,7 +196,7 @@ class FormationEnv3D(ParallelEnv):
         for n in neighbors:
             d = float(np.linalg.norm(self.pos[n] - p))
             if d < COLLISION_DIST:
-                r_safety += -100.0
+                r_safety += -300.0
             elif d < SAFE_DIST_ENTER:
                 r_safety += -50.0 * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
             elif d < SAFE_DIST_EXIT:

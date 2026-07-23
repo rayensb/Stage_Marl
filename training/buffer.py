@@ -14,7 +14,7 @@ class RolloutBuffer:
         self.reset()
 
     def reset(self):
-        n, A = self.size, len(self.agents)
+        n = self.size
         self.obs = {a: np.zeros((n, self.obs_dim), np.float32) for a in self.agents}
         self.joint_obs = np.zeros((n, self.joint_obs_dim), np.float32)
         self.actions = {a: np.zeros((n, self.act_dim), np.float32) for a in self.agents}
@@ -48,14 +48,15 @@ class RolloutBuffer:
         returns = adv + self.values
         return adv, returns
 
-    def get_tensors(self, agent, last_value):
+    def get_tensors_normalized(self, agent, last_value):
         adv, ret = self.compute_gae(last_value, agent)
         adv = (adv - adv.mean()) / (adv.std() + 1e-8)
+        ret_norm = (ret - ret.mean()) / (ret.std() + 1e-8)
         return (
             torch.as_tensor(self.obs[agent]),
             torch.as_tensor(self.joint_obs),
             torch.as_tensor(self.actions[agent]),
             torch.as_tensor(self.logp[agent]),
             torch.as_tensor(adv),
-            torch.as_tensor(ret),
+            torch.as_tensor(ret_norm),
         )

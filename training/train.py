@@ -94,7 +94,7 @@ def main():
         # ---- PPO update ----
         last_actor_loss, last_critic_loss, last_entropy = 0.0, 0.0, 0.0
         for a in AGENTS:
-            o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value)
+            o, jo, act, old_logp, adv, ret = buf.get_tensors_normalized(a, last_value)
             n = o.shape[0]
             for _ in range(EPOCHS):
                 idx = torch.randperm(n)
