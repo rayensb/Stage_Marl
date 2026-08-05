@@ -1,6 +1,9 @@
 import torch
 import torch.nn as nn
 
+LOG_STD_MIN = -2.0   # std ~= 0.135 (near-deterministic floor)
+LOG_STD_MAX = 0.5    # std ~= 1.65 (exploration ceiling)
+
 class Actor(nn.Module):
     """Per-agent policy: local obs -> tanh-squashed Gaussian action."""
     def __init__(self, obs_dim, act_dim, hidden=64):
@@ -9,13 +12,14 @@ class Actor(nn.Module):
             nn.Linear(obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
         )
-        self.mu = nn.Linear(hidden, act_dim)          # RAW mean, unbounded
+        self.mu = nn.Linear(hidden, act_dim)
         self.log_std = nn.Parameter(torch.zeros(act_dim) - 0.5)
 
     def forward(self, obs):
         h = self.net(obs)
         mu = self.mu(h)
-        std = torch.exp(self.log_std)
+        log_std = torch.clamp(self.log_std, LOG_STD_MIN, LOG_STD_MAX)
+        std = torch.exp(log_std)
         return mu, std
 
     def get_action(self, obs, deterministic=False):
@@ -30,7 +34,6 @@ class Actor(nn.Module):
         return a, logp
 
     def evaluate(self, obs, action):
-        """Recompute log-prob for a STORED (already tanh-squashed) action."""
         mu, std = self.forward(obs)
         dist = torch.distributions.Normal(mu, std)
         a_clamped = torch.clamp(action, -0.999999, 0.999999)
@@ -42,7 +45,6 @@ class Actor(nn.Module):
 
 
 class CentralCritic(nn.Module):
-    """Centralized critic: sees concatenated obs of ALL agents -> value."""
     def __init__(self, joint_obs_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(

@@ -30,6 +30,12 @@ class FormationEnv3D(ParallelEnv):
         self.possible_agents = [f"drone{i+1}" for i in range(num_agents)]
         self.agents = self.possible_agents[:]
         self.k = min(k_neighbors, num_agents - 1)
+        # NEIGHBOR GRAPH DESIGN CHOICE: mutual (reciprocal) k-nearest-neighbors.
+        # Each drone computes its own top-k nearest candidates; a candidate is
+        # only "locked" if the relationship is mutual (A in B_top_k AND B in A_top_k).
+        # This avoids asymmetric graphs (A->B, B->C) while remaining fully
+        # decentralized -- each drone only needs its own local distance measurements,
+        # no global consensus step. See _compute_all_candidates() / _relock_all().
         self.forced_scenario = scenario
 
         # own_vel(3) + rel_target_pos(3) + dist_t(1) + rel_target_vel(3) + k*(relpos3+relvel3+dist1)
@@ -139,11 +145,13 @@ class FormationEnv3D(ParallelEnv):
             for a, b in itertools.combinations(self.agents, 2))
         truncated = self.step_count >= MAX_STEPS
 
-        rewards = {a: self._get_reward(a, collision) for a in self.agents}
+        reward_tuples = {a: self._get_reward(a, collision) for a in self.agents}
+        rewards = {a: reward_tuples[a][0] for a in self.agents}
+        reward_components = {a: reward_tuples[a][1] for a in self.agents}
         terminations = {a: bool(collision) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
-        infos = {a: {"min_dist": self._min_dist(a)} for a in self.agents}
+        infos = {a: {"min_dist": self._min_dist(a), "reward_components": reward_components[a]} for a in self.agents}
 
         if collision or truncated:
             self.agents = []
@@ -196,6 +204,7 @@ class FormationEnv3D(ParallelEnv):
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
     def _get_reward(self, agent, global_collision):
+        """Returns (total_reward, components_dict) for diagnostic logging."""
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
@@ -231,4 +240,10 @@ class FormationEnv3D(ParallelEnv):
 
         r_collision_global = -300.0 if global_collision else 0.0
 
-        return float(r_track + r_spread + r_safety + r_diverge + r_collision_global + r_velocity)
+        total = float(r_track + r_spread + r_safety + r_diverge + r_collision_global + r_velocity)
+        components = {
+            "track": float(r_track), "spread": float(r_spread),
+            "safety": float(r_safety), "diverge": float(r_diverge),
+            "collision": float(r_collision_global), "velocity": float(r_velocity),
+        }
+        return total, components

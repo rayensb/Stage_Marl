@@ -34,6 +34,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
+COMPONENT_KEYS = ["track", "spread", "safety", "diverge", "collision", "velocity"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -53,6 +54,7 @@ def main():
     buf = RolloutBuffer(AGENTS, OBS_DIM, ACT_DIM, ROLLOUT_LEN)
     obs, _ = env.reset()
     ep_rewards = {a: 0.0 for a in AGENTS}
+    ep_components = {k: 0.0 for k in COMPONENT_KEYS}
     ep_len = 0
 
     recent_rewards = deque(maxlen=50)
@@ -62,6 +64,7 @@ def main():
     recent_mean_pw = deque(maxlen=50)
     recent_std_pw = deque(maxlen=50)
     recent_diameter = deque(maxlen=50)
+    recent_components = {k: deque(maxlen=50) for k in COMPONENT_KEYS}
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         buf.reset()
@@ -83,6 +86,11 @@ def main():
             buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value)
             for a in AGENTS:
                 ep_rewards[a] += rewards.get(a, 0.0)
+            if env.agents:
+                any_agent = env.agents[0]
+                comps = infos.get(any_agent, {}).get("reward_components", {})
+                for k in COMPONENT_KEYS:
+                    ep_components[k] += comps.get(k, 0.0)
             ep_len += 1
             total_steps += 1
 
@@ -98,9 +106,12 @@ def main():
                 recent_mean_pw.append(swarm["mean_pairwise"])
                 recent_std_pw.append(swarm["std_pairwise"])
                 recent_diameter.append(swarm["swarm_diameter"])
+                for k in COMPONENT_KEYS:
+                    recent_components[k].append(ep_components[k])
 
                 obs, _ = env.reset()
                 ep_rewards = {a: 0.0 for a in AGENTS}
+                ep_components = {k: 0.0 for k in COMPONENT_KEYS}
                 ep_len = 0
             else:
                 obs = next_obs
@@ -149,17 +160,25 @@ def main():
             mean_pw = float(np.mean(recent_mean_pw)) if recent_mean_pw else 0.0
             std_pw = float(np.mean(recent_std_pw)) if recent_std_pw else 0.0
             diameter = float(np.mean(recent_diameter)) if recent_diameter else 0.0
+            comp_avgs = {k: float(np.mean(recent_components[k])) if recent_components[k] else 0.0
+                          for k in COMPONENT_KEYS}
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
-                  f"mean_pw={mean_pw:.2f} diam={diameter:.2f}")
+                  f"entropy={last_entropy:.2f} "
+                  f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
+                  f"safety={comp_avgs['safety']:.1f} diverge={comp_avgs['diverge']:.1f} "
+                  f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
-                     mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter)
+                     mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
+                     r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
+                     r_safety=comp_avgs['safety'], r_diverge=comp_avgs['diverge'],
+                     r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'])
 
         save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count)
 
