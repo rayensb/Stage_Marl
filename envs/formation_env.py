@@ -1,10 +1,10 @@
 """
 FormationEnv3D — N-agent PettingZoo ParallelEnv, 3D space.
 
-Each drone locks onto its K nearest neighbors (RECON/LOCKED state machine)
-and controls (vx, vy, vz) to: track a moving target, maintain angular spread
-among its locked neighbors (emergent triangle/pyramid), avoid collision with
-locked neighbors, and avoid drifting too far from them.
+Fixes applied:
+- Mutual/reciprocal k-NN neighbor graph (no more asymmetric A->B, B->C)
+- Global collision penalty (all agents penalized on any pairwise collision)
+- Target velocity added to observation
 """
 
 import math
@@ -24,7 +24,7 @@ from config import (
 
 
 class FormationEnv3D(ParallelEnv):
-    metadata = {"name": "formation_env_3d_v0"}
+    metadata = {"name": "formation_env_3d_v1"}
 
     def __init__(self, num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS, scenario=None):
         self.possible_agents = [f"drone{i+1}" for i in range(num_agents)]
@@ -32,11 +32,12 @@ class FormationEnv3D(ParallelEnv):
         self.k = min(k_neighbors, num_agents - 1)
         self.forced_scenario = scenario
 
-        self._obs_dim = 7 + 7 * self.k   # own_vel(3)+rel_target(3)+dist_t(1) + k*(relpos3+relvel3+dist1)
-        self._act_dim = 3                 # vx, vy, vz
+        # own_vel(3) + rel_target_pos(3) + dist_t(1) + rel_target_vel(3) + k*(relpos3+relvel3+dist1)
+        self._obs_dim = 10 + 7 * self.k
+        self._act_dim = 3
 
         self.pos, self.vel = {}, {}
-        self.locked = {}   # agent -> list of neighbor ids
+        self.locked = {}
         self.pos_t = np.zeros(3, np.float32)
         self.step_count = 0
         self.np_random = np.random.default_rng()
@@ -57,7 +58,7 @@ class FormationEnv3D(ParallelEnv):
         self.step_count = 0
 
         self.pos_t = self.np_random.uniform(-3.0, 3.0, 3).astype(np.float32)
-        self.pos_t[2] = self.np_random.uniform(2.0, 3.0)  # altitude
+        self.pos_t[2] = self.np_random.uniform(2.0, 3.0)
 
         for a in self.agents:
             ang = self.np_random.uniform(0, 2 * math.pi)
@@ -72,22 +73,19 @@ class FormationEnv3D(ParallelEnv):
         self._resolve_overlaps()
 
         self._target_dir = self.np_random.uniform(-1, 1, 3).astype(np.float32)
-        self._target_dir[2] *= 0.2  # gentle vertical drift
+        self._target_dir[2] *= 0.2
         self._target_dir /= (np.linalg.norm(self._target_dir) + 1e-6)
         self._target_speed = self.np_random.uniform(0.3, 1.0)
 
-        for a in self.agents:
-            self.locked[a] = self._select_neighbors(a)
+        self._relock_all()
 
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {} for a in self.agents}
         return obs, infos
 
     def _resolve_overlaps(self):
-        max_iter = 50
-        for _ in range(max_iter):
-            worst = None
-            worst_d = COLLISION_DIST + 0.3
+        for _ in range(50):
+            worst, worst_d = None, COLLISION_DIST + 0.3
             for a, b in itertools.combinations(self.agents, 2):
                 d = np.linalg.norm(self.pos[a] - self.pos[b])
                 if d < worst_d:
@@ -99,11 +97,23 @@ class FormationEnv3D(ParallelEnv):
             n = np.linalg.norm(diff) + 1e-6
             self.pos[b] = (self.pos[b] + diff / n * 0.3).astype(np.float32)
 
-    def _select_neighbors(self, agent):
-        dists = [(o, np.linalg.norm(self.pos[agent] - self.pos[o]))
-                  for o in self.agents if o != agent]
-        dists.sort(key=lambda x: x[1])
-        return [o for o, _ in dists[:self.k]]
+    # ---- mutual k-NN neighbor graph ----
+    def _compute_all_candidates(self):
+        cand = {}
+        for a in self.agents:
+            dists = [(o, np.linalg.norm(self.pos[a] - self.pos[o]))
+                      for o in self.agents if o != a]
+            dists.sort(key=lambda x: x[1])
+            cand[a] = [o for o, _ in dists[:self.k]]
+        return cand
+
+    def _relock_all(self):
+        cand = self._compute_all_candidates()
+        for a in self.agents:
+            mutual = [b for b in cand[a] if a in cand[b]]
+            if not mutual and cand[a]:
+                mutual = cand[a][:1]   # fallback: avoid empty neighbor set
+            self.locked[a] = mutual[:self.k]
 
     # ---- step ----
     def step(self, actions):
@@ -116,20 +126,20 @@ class FormationEnv3D(ParallelEnv):
 
         self.pos_t = (self.pos_t + self._target_dir * self._target_speed * DT).astype(np.float32)
 
-        # re-lock (RECON) if a locked neighbor drifted too far
-        for a in self.agents:
-            max_locked_d = max(
-                (np.linalg.norm(self.pos[a] - self.pos[n]) for n in self.locked[a]),
-                default=0.0)
-            if max_locked_d > DIVERGE_DIST:
-                self.locked[a] = self._select_neighbors(a)
+        needs_relock = any(
+            max((np.linalg.norm(self.pos[a] - self.pos[n]) for n in self.locked[a]), default=0.0)
+            > DIVERGE_DIST
+            for a in self.agents
+        )
+        if needs_relock:
+            self._relock_all()
 
         collision = any(
             np.linalg.norm(self.pos[a] - self.pos[b]) < COLLISION_DIST
             for a, b in itertools.combinations(self.agents, 2))
         truncated = self.step_count >= MAX_STEPS
 
-        rewards = {a: self._get_reward(a) for a in self.agents}
+        rewards = {a: self._get_reward(a, collision) for a in self.agents}
         terminations = {a: bool(collision) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
@@ -148,13 +158,28 @@ class FormationEnv3D(ParallelEnv):
     def _dist_to_target(self, agent):
         return float(np.linalg.norm(self.pos[agent] - self.pos_t))
 
+    def get_swarm_stats(self):
+        dists = np.array([
+            np.linalg.norm(self.pos[a] - self.pos[b])
+            for a, b in itertools.combinations(self.possible_agents, 2)
+        ])
+        return {
+            "mean_pairwise": float(dists.mean()),
+            "std_pairwise": float(dists.std()),
+            "min_pairwise": float(dists.min()),
+            "swarm_diameter": float(dists.max()),
+        }
+
     def _get_obs(self, agent):
         p, v, t = self.pos[agent], self.vel[agent], self.pos_t
         rel_t = (t - p) / OBS_MAX_DIST
         dist_t = self._dist_to_target(agent) / OBS_MAX_DIST
+        target_vel = self._target_dir * self._target_speed
+        rel_target_vel = (target_vel - v) / OBS_MAX_VEL
 
         feats = [v[0] / OBS_MAX_VEL, v[1] / OBS_MAX_VEL, v[2] / OBS_MAX_VEL,
-                  rel_t[0], rel_t[1], rel_t[2], dist_t]
+                  rel_t[0], rel_t[1], rel_t[2], dist_t,
+                  rel_target_vel[0], rel_target_vel[1], rel_target_vel[2]]
 
         neighbors = self.locked[agent]
         for i in range(self.k):
@@ -166,17 +191,19 @@ class FormationEnv3D(ParallelEnv):
                 feats.extend([rel_p[0], rel_p[1], rel_p[2],
                               rel_v[0], rel_v[1], rel_v[2], d])
             else:
-                feats.extend([0, 0, 0, 0, 0, 0, 1.0])  # sentinel: no neighbor
+                feats.extend([0, 0, 0, 0, 0, 0, 1.0])
 
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
-    def _get_reward(self, agent):
-        p = self.pos[agent]
+    def _get_reward(self, agent, global_collision):
+        p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
         r_track = -0.5 * abs(self._dist_to_target(agent) - TARGET_DIST)
 
-        # angular spread among locked neighbors (ideal = evenly spaced, 2*pi/k apart)
+        target_vel = self._target_dir * self._target_speed
+        r_velocity = -0.05 * float(np.linalg.norm(v - target_vel))
+
         r_spread = 0.0
         if len(neighbors) >= 2:
             bearings = []
@@ -190,14 +217,11 @@ class FormationEnv3D(ParallelEnv):
             ideal_gap = 2 * math.pi / len(neighbors)
             r_spread = -0.3 * abs(min_gap - ideal_gap)
 
-        # local collision safety vs locked neighbors only
         r_safety = 0.0
         r_diverge = 0.0
         for n in neighbors:
             d = float(np.linalg.norm(self.pos[n] - p))
-            if d < COLLISION_DIST:
-                r_safety += -300.0
-            elif d < SAFE_DIST_ENTER:
+            if d < SAFE_DIST_ENTER:
                 r_safety += -50.0 * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
             elif d < SAFE_DIST_EXIT:
                 center = (SAFE_DIST_ENTER + SAFE_DIST_EXIT) / 2.0
@@ -205,4 +229,6 @@ class FormationEnv3D(ParallelEnv):
                 r_safety += 5.0 * (1.0 - err)
             r_diverge += -5.0 * max(0.0, d - DIVERGE_DIST) / DIVERGE_DIST
 
-        return float(r_track + r_spread + r_safety + r_diverge)
+        r_collision_global = -300.0 if global_collision else 0.0
+
+        return float(r_track + r_spread + r_safety + r_diverge + r_collision_global + r_velocity)

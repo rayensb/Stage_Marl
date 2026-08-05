@@ -14,7 +14,7 @@ from training.logger import init_logger, log_row
 from config import NUM_AGENTS, K_NEIGHBORS
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
-OBS_DIM = 7 + 7 * K_NEIGHBORS
+OBS_DIM = 10 + 7 * K_NEIGHBORS
 ACT_DIM = 3
 ROLLOUT_LEN = 2048
 EPOCHS = 10
@@ -59,6 +59,9 @@ def main():
     recent_collisions = deque(maxlen=50)
     recent_min_dist = deque(maxlen=50)
     recent_ep_len = deque(maxlen=50)
+    recent_mean_pw = deque(maxlen=50)
+    recent_std_pw = deque(maxlen=50)
+    recent_diameter = deque(maxlen=50)
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         buf.reset()
@@ -86,10 +89,15 @@ def main():
             if done:
                 ep_count += 1
                 min_d = min((infos[a]["min_dist"] for a in infos), default=0.0)
+                swarm = env.get_swarm_stats()
+
                 recent_rewards.append(np.mean(list(ep_rewards.values())))
                 recent_collisions.append(1.0 if collided else 0.0)
                 recent_min_dist.append(min_d)
                 recent_ep_len.append(ep_len)
+                recent_mean_pw.append(swarm["mean_pairwise"])
+                recent_std_pw.append(swarm["std_pairwise"])
+                recent_diameter.append(swarm["swarm_diameter"])
 
                 obs, _ = env.reset()
                 ep_rewards = {a: 0.0 for a in AGENTS}
@@ -104,11 +112,10 @@ def main():
             jobs = torch.as_tensor(joint(obs)).unsqueeze(0)
             last_value = critic(jobs).item()
 
-        # ---- PPO update (skip if interrupted mid-rollout, buffer incomplete) ----
         last_actor_loss, last_critic_loss, last_entropy = 0.0, 0.0, 0.0
         if buf.ptr == ROLLOUT_LEN:
             for a in AGENTS:
-                o, jo, act, old_logp, adv, ret = buf.get_tensors_normalized(a, last_value)
+                o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value)
                 n = o.shape[0]
                 for _ in range(EPOCHS):
                     idx = torch.randperm(n)
@@ -139,15 +146,20 @@ def main():
             collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
             avg_min_dist = float(np.mean(recent_min_dist)) if recent_min_dist else 0.0
             avg_ep_len = float(np.mean(recent_ep_len)) if recent_ep_len else 0.0
+            mean_pw = float(np.mean(recent_mean_pw)) if recent_mean_pw else 0.0
+            std_pw = float(np.mean(recent_std_pw)) if recent_std_pw else 0.0
+            diameter = float(np.mean(recent_diameter)) if recent_diameter else 0.0
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
-                  f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f}")
+                  f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
+                  f"mean_pw={mean_pw:.2f} diam={diameter:.2f}")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
-                     actor_loss=last_actor_loss, critic_loss=last_critic_loss)
+                     actor_loss=last_actor_loss, critic_loss=last_critic_loss,
+                     mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter)
 
         save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count)
 

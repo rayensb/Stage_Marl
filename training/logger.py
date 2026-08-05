@@ -3,7 +3,8 @@ import csv
 
 LOG_PATH = "logs/training_log.csv"
 FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate",
-          "avg_min_dist", "avg_ep_len", "entropy", "actor_loss", "critic_loss"]
+          "avg_min_dist", "avg_ep_len", "entropy", "actor_loss", "critic_loss",
+          "mean_pairwise", "std_pairwise", "swarm_diameter"]
 
 def init_logger():
     os.makedirs("logs", exist_ok=True)
