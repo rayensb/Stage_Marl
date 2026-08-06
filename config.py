@@ -22,5 +22,5 @@ OBS_MAX_ANGLE      = 3.14159
 TRACK_WEIGHT      = -2.0    # was -0.5, too weak vs safety magnitude
 SAFETY_MAX_BONUS  = 2.0     # was 5.0, reduce dominance
 SAFETY_URGENT_COEF = -30.0  # was -50.0
-COHESION_LIMIT     = 10.5   # global swarm-diameter soft cap (~3x TARGET_DIST)
-COHESION_WEIGHT     = -0.15
+COHESION_LIMIT     = 13.5   # global swarm-diameter soft cap (~3x TARGET_DIST)
+COHESION_WEIGHT     = -0.05

@@ -101,7 +101,7 @@ def main():
                 min_d = min((infos[a]["min_dist"] for a in infos), default=0.0)
                 swarm = env.get_swarm_stats()
 
-                recent_rewards.append(np.mean(list(ep_rewards.values())))
+                recent_rewards.append(np.mean(list(ep_rewards.values())) / max(ep_len, 1))
                 recent_collisions.append(1.0 if collided else 0.0)
                 recent_min_dist.append(min_d)
                 recent_ep_len.append(ep_len)
@@ -109,7 +109,7 @@ def main():
                 recent_std_pw.append(swarm["std_pairwise"])
                 recent_diameter.append(swarm["swarm_diameter"])
                 for k in COMPONENT_KEYS:
-                    recent_components[k].append(ep_components[k])
+                    recent_components[k].append(ep_components[k] / max(ep_len, 1))
 
                 obs, _ = env.reset()
                 ep_rewards = {a: 0.0 for a in AGENTS}
