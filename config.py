@@ -4,8 +4,8 @@ NUM_AGENTS       = 4
 K_NEIGHBORS       = 2
 
 TARGET_DIST      = 3.5
-SAFE_DIST_ENTER  = 4.20
-SAFE_DIST_EXIT   = 5.20
+SAFE_DIST_ENTER  = 4.60    # was 4.20 == COLLISION_DIST -- left no warning zone before termination
+SAFE_DIST_EXIT   = 5.60
 COLLISION_DIST   = 4.20
 DIVERGE_DIST     = 10.0     # used for re-lock trigger only now
 

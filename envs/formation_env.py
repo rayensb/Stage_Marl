@@ -232,7 +232,11 @@ class FormationEnv3D(ParallelEnv):
         for n in neighbors:
             d = float(np.linalg.norm(self.pos[n] - p))
             if d < SAFE_DIST_ENTER:
-                r_safety += SAFETY_URGENT_COEF * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
+                # Ramps linearly from 0 at SAFE_DIST_ENTER to full SAFETY_URGENT_COEF
+                # exactly at COLLISION_DIST, so the policy gets a real warning
+                # gradient before termination instead of a flat bonus up to the cliff.
+                span = SAFE_DIST_ENTER - COLLISION_DIST
+                r_safety += SAFETY_URGENT_COEF * min(1.0, (SAFE_DIST_ENTER - d) / span)
             elif d < SAFE_DIST_EXIT:
                 center = (SAFE_DIST_ENTER + SAFE_DIST_EXIT) / 2.0
                 err = abs(d - center) / (SAFE_DIST_EXIT - SAFE_DIST_ENTER)
