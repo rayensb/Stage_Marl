@@ -172,7 +172,7 @@ def main():
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
-                  f"safety={comp_avgs['safety']:.1f} diverge={comp_avgs['diverge']:.1f} "
+                  f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
@@ -181,7 +181,7 @@ def main():
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
-                     r_safety=comp_avgs['safety'], r_diverge=comp_avgs['diverge'],
+                     r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'])
 
         save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count)
