@@ -21,6 +21,8 @@ EPOCHS = 10
 BATCH_SIZE = 256
 LR = 3e-4
 CLIP = 0.2
+ENT_COEF_START = 0.01
+ENT_COEF_END = 0.001
 TOTAL_STEPS = 600_000
 DEVICE = "cpu"
 
@@ -136,7 +138,9 @@ def main():
                         ratio = torch.exp(logp - old_logp[b])
                         s1 = ratio * adv[b]
                         s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[b]
-                        actor_loss = -torch.min(s1, s2).mean() - 0.01 * entropy.mean()
+                        frac = min(1.0, total_steps / TOTAL_STEPS)
+                        ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
+                        actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean()
 
                         value_pred = critic(jo[b])
                         critic_loss = ((value_pred - ret[b]) ** 2).mean()
