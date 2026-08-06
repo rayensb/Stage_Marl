@@ -21,6 +21,7 @@ EPOCHS = 10
 BATCH_SIZE = 256
 LR = 3e-4
 CLIP = 0.2
+GAMMA = 0.99
 ENT_COEF_START = 0.01
 ENT_COEF_END = 0.001
 TOTAL_STEPS = 600_000
@@ -54,7 +55,7 @@ def main():
 
     total_steps, ep_count = load_checkpoint(actors, critic, opt_actors, opt_critic)
 
-    buf = RolloutBuffer(AGENTS, OBS_DIM, ACT_DIM, ROLLOUT_LEN)
+    buf = RolloutBuffer(AGENTS, OBS_DIM, ACT_DIM, ROLLOUT_LEN, gamma=GAMMA)
     obs, _ = env.reset()
     ep_rewards = {a: 0.0 for a in AGENTS}
     ep_components = {k: 0.0 for k in COMPONENT_KEYS}
@@ -86,6 +87,19 @@ def main():
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
             done = any(terms.values()) or any(truncs.values())
             collided = any(terms.values())
+
+            if done and not collided:
+                # Time-limit cutoff, not a true terminal state -- fold the
+                # critic's estimate of the actual next observation into this
+                # transition's reward so GAE doesn't treat "ran out of steps"
+                # the same as "crashed" (matches CleanRL's truncation handling;
+                # leaves buffer/GAE code untouched since the bootstrap is
+                # already baked into the reward by the time it's stored).
+                with torch.no_grad():
+                    jobs_next = torch.as_tensor(joint(next_obs)).unsqueeze(0)
+                    boot_values = critic(jobs_next).squeeze(0)
+                for a in AGENTS:
+                    rewards[a] = rewards[a] + GAMMA * boot_values[agent_idx[a]].item()
 
             buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict)
             for a in AGENTS:

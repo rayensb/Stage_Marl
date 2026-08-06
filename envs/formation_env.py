@@ -115,11 +115,71 @@ class FormationEnv3D(ParallelEnv):
 
     def _relock_all(self):
         cand = self._compute_all_candidates()
+        locked = {}
         for a in self.agents:
             mutual = [b for b in cand[a] if a in cand[b]]
             if not mutual and cand[a]:
                 mutual = cand[a][:1]
-            self.locked[a] = mutual[:self.k]
+            locked[a] = mutual[:self.k]
+        self._repair_connectivity(locked)
+        self.locked = locked
+
+    def _repair_connectivity(self, locked):
+        """Mutual k-NN locking has no guarantee of staying connected -- the
+        swarm can fragment into isolated sub-groups (e.g. A<->B, C<->D) that
+        never observe each other and drift apart with nothing to stop them.
+        Repeatedly force-connect the closest pair of agents across different
+        components until the whole swarm is one component, evicting each
+        side's farthest current lock if it's already at the k-neighbor cap.
+        This uses global position knowledge, which the simulator already has
+        centrally -- it is not a decentralized operation and would need a
+        distributed protocol before running on real, comms-limited hardware.
+        """
+        parent = {a: a for a in self.agents}
+
+        def find(x):
+            while parent[x] != x:
+                parent[x] = parent[parent[x]]
+                x = parent[x]
+            return x
+
+        def union(x, y):
+            rx, ry = find(x), find(y)
+            if rx != ry:
+                parent[rx] = ry
+
+        for a in self.agents:
+            for b in locked[a]:
+                union(a, b)
+
+        while True:
+            components = {}
+            for a in self.agents:
+                components.setdefault(find(a), []).append(a)
+            if len(components) <= 1:
+                break
+
+            comp_list = list(components.values())
+            best = None
+            for i in range(len(comp_list)):
+                for j in range(i + 1, len(comp_list)):
+                    for a in comp_list[i]:
+                        for b in comp_list[j]:
+                            d = np.linalg.norm(self.pos[a] - self.pos[b])
+                            if best is None or d < best[0]:
+                                best = (d, a, b)
+            _, a, b = best
+
+            for x, y in ((a, b), (b, a)):
+                if y in locked[x]:
+                    continue
+                if len(locked[x]) < self.k:
+                    locked[x].append(y)
+                else:
+                    farthest = max(locked[x], key=lambda o: np.linalg.norm(self.pos[x] - self.pos[o]))
+                    locked[x].remove(farthest)
+                    locked[x].append(y)
+            union(a, b)
 
     def step(self, actions):
         self.step_count += 1
@@ -228,8 +288,14 @@ class FormationEnv3D(ParallelEnv):
             ideal_gap = 2 * math.pi / len(neighbors)
             r_spread = -0.3 * abs(min_gap - ideal_gap)
 
+        # Safety is checked against ALL other agents, not just locked
+        # neighbors -- collision termination is global (any pair, anywhere),
+        # so a drone closing on an unlocked neighbor previously got zero
+        # warning gradient until the episode ended under it.
         r_safety = 0.0
-        for n in neighbors:
+        for n in self.agents:
+            if n == agent:
+                continue
             d = float(np.linalg.norm(self.pos[n] - p))
             if d < SAFE_DIST_ENTER:
                 # Ramps linearly from 0 at SAFE_DIST_ENTER to full SAFETY_URGENT_COEF

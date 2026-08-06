@@ -40,7 +40,11 @@ class Actor(nn.Module):
         u = torch.atanh(a_clamped)
         logp_u = dist.log_prob(u).sum(-1)
         logp = logp_u - torch.log(1 - a_clamped.pow(2) + 1e-6).sum(-1)
-        entropy = dist.entropy().sum(-1)
+        # dist.entropy() is the entropy of the untransformed base Gaussian,
+        # not the actual tanh-squashed action distribution -- it systematically
+        # overstates true action-space randomness. -logp is a Monte Carlo
+        # estimate of entropy under the real (squashed) distribution.
+        entropy = -logp
         return logp, entropy
 
 
