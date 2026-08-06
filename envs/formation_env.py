@@ -23,7 +23,7 @@ import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
-    COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED,
+    COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
     OBS_MAX_DIST, OBS_MAX_VEL, OBS_MAX_ANGLE,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
     COHESION_LIMIT, COHESION_WEIGHT,
@@ -69,7 +69,7 @@ class FormationEnv3D(ParallelEnv):
         for a in self.agents:
             ang = self.np_random.uniform(0, 2 * math.pi)
             elev = self.np_random.uniform(-0.3, 0.3)
-            d = self.np_random.uniform(3.5, 6.0)
+            d = self.np_random.uniform(TARGET_DIST, TARGET_DIST + 2 * REACTION_DIST)
             offset = np.array([math.cos(ang) * math.cos(elev),
                                 math.sin(ang) * math.cos(elev),
                                 math.sin(elev)]) * d

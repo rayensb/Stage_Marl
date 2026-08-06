@@ -3,32 +3,59 @@
 NUM_AGENTS       = 4
 K_NEIGHBORS       = 2
 
-SAFE_DIST_ENTER  = 4.60    # was 4.20 == COLLISION_DIST -- left no warning zone before termination
-SAFE_DIST_EXIT   = 5.60
-COLLISION_DIST   = 4.20
+COLLISION_DIST   = 4.20     # hard physical clearance radius (rotor/frame safety)
 DIVERGE_DIST     = 10.0     # used for re-lock trigger only now
+
+MAX_STEPS        = 200
+DT                = 0.05    # 20 Hz control loop
+
+MAX_ACTION_SPEED = 1.2      # actions set velocity directly -- no acceleration/
+                              # inertia limit in this sim, so there's no classical
+                              # braking-distance (v^2/2a) term; adding one later
+                              # (real dynamics, sim-to-real work) would only make
+                              # REACTION_DIST below larger, which is safe.
+
+# Every safety-zone distance below is derived from a single physical quantity:
+# how far two drones can close on each other, worst case, before the policy
+# can be expected to react. Worst case = head-on, both at MAX_ACTION_SPEED.
+# N_REACT is the one real judgment call here (comparable to picking a
+# perception-reaction-time constant in vehicle stopping-sight-distance
+# standards) -- it covers policy imperfection/action noise (residual std
+# floor never reaches 0, entropy never fully collapses), not hardware
+# latency. 10 cycles (0.5s) is a moderate budget: enough for a stochastic,
+# still-imperfect controller to notice a closing trajectory and commit to a
+# correction, without forcing drones absurdly far apart.
+N_REACT       = 10
+REACTION_DIST = 2 * MAX_ACTION_SPEED * (N_REACT * DT)   # = 1.20
+
+# SAFE_DIST_ENTER: even in the worst-case closing scenario, one full
+# reaction window still leaves COLLISION_DIST of clearance -- this is the
+# point past which "urgent" backoff pressure must apply.
+SAFE_DIST_ENTER = COLLISION_DIST + REACTION_DIST                 # = 5.40
+# SAFE_DIST_EXIT: a second reaction-distance of comfortable buffer above
+# the warning threshold, in the same physical unit rather than an arbitrary
+# band width.
+SAFE_DIST_EXIT  = SAFE_DIST_ENTER + REACTION_DIST                 # = 6.60
 
 # TARGET_DIST derived, not hand-picked: the best possible arrangement of
 # NUM_AGENTS points all at distance TARGET_DIST from a shared target is the
 # packing that maximizes their minimum pairwise separation. For N=4 that's a
-# regular tetrahedron, edge = TARGET_DIST * sqrt(8/3). At the old flat value
-# (3.5) that edge was 5.72 -- just 0.12 above SAFE_DIST_EXIT, i.e. even the
-# mathematically best-case formation had ~2% safety margin. Any exploration
-# noise or imperfect coordination pushed pairs below the safe zone, which is
-# why collision_rate kept relapsing every time the policy got *better* at
-# tracking (converging harder onto that razor-thin-margin sphere) no matter
-# how SAFETY_URGENT_COEF/COHESION_LIMIT were rebalanced -- reweighting a
-# reward can't fix a target geometry that has no safe solution to converge to.
+# regular tetrahedron, edge = TARGET_DIST * sqrt(8/3). At the original flat
+# value (3.5) that edge was 5.72 -- against the *original* SAFE_DIST_EXIT
+# (5.60) that was just 0.12 of margin, i.e. even the mathematically best-case
+# formation had ~2% safety margin. That's why collision_rate kept relapsing
+# every time the policy got *better* at tracking across every prior fix:
+# converging harder onto a razor-thin-margin sphere is the correct optimum
+# of an over-constrained task, not a policy bug. No amount of reweighting
+# SAFETY vs COHESION vs TRACK fixes a target geometry with no safe solution
+# to converge to. The optimal formation should clear the whole comfort zone
+# with a further full reaction-distance to spare, for imperfect real-world
+# coordination (a decentralized policy won't hit a perfect tetrahedron).
 # (No simple closed-form packing ratio for N != 4 -- revisit this formula if
 # NUM_AGENTS changes.)
-_TETRA_RATIO   = (8 / 3) ** 0.5     # regular-tetrahedron edge/radius ratio, ~1.633
-_SAFETY_MARGIN = 1.6                 # target tetrahedron edge 60% above SAFE_DIST_EXIT
-TARGET_DIST    = _SAFETY_MARGIN * SAFE_DIST_EXIT / _TETRA_RATIO   # ~5.49
-
-MAX_STEPS        = 200
-DT                = 0.05
-
-MAX_ACTION_SPEED = 1.2
+_TETRA_RATIO      = (8 / 3) ** 0.5                          # tetrahedron edge/radius ratio, ~1.633
+_TETRA_EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST          # = 7.80
+TARGET_DIST        = _TETRA_EDGE_TARGET / _TETRA_RATIO       # ~4.78
 
 OBS_MAX_DIST      = 15.0
 OBS_MAX_VEL        = 2.0
