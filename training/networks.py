@@ -45,13 +45,16 @@ class Actor(nn.Module):
 
 
 class CentralCritic(nn.Module):
-    def __init__(self, joint_obs_dim, hidden=128):
+    """Sees joint obs, outputs one value head per agent -- agents have
+    different individual rewards, so a single shared scalar output would be
+    trained against N conflicting regression targets per update."""
+    def __init__(self, joint_obs_dim, num_agents, hidden=128):
         super().__init__()
-        self.net = nn.Sequential(
+        self.trunk = nn.Sequential(
             nn.Linear(joint_obs_dim, hidden), nn.Tanh(),
             nn.Linear(hidden, hidden), nn.Tanh(),
-            nn.Linear(hidden, 1),
         )
+        self.heads = nn.Linear(hidden, num_agents)
 
     def forward(self, joint_obs):
-        return self.net(joint_obs).squeeze(-1)
+        return self.heads(self.trunk(joint_obs))  # (batch, num_agents)

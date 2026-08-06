@@ -4,7 +4,7 @@ matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
 df = pd.read_csv("logs/training_log.csv")
-fig, axes = plt.subplots(4, 2, figsize=(12, 16))
+fig, axes = plt.subplots(5, 2, figsize=(12, 20))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
 axes[0,1].plot(df.total_steps, df.collision_rate, color='red')
@@ -23,6 +23,8 @@ for k, c in [("r_track","blue"),("r_spread","green"),("r_safety","orange"),
     axes[3,0].plot(df.total_steps, df[k], label=k, color=c)
 axes[3,0].set_title("Reward Components"); axes[3,0].legend(fontsize=7)
 axes[3,1].plot(df.total_steps, df.critic_loss, color='orange'); axes[3,1].set_title("Critic Loss")
+axes[4,0].plot(df.total_steps, df.approx_kl, color='teal'); axes[4,0].set_title("Approx KL (watch for spikes)")
+axes[4,1].plot(df.total_steps, df.clip_frac, color='magenta'); axes[4,1].set_title("Clip Fraction")
 
 plt.tight_layout()
 plt.savefig("logs/training_curves.png", dpi=120)

@@ -47,7 +47,8 @@ def main():
     init_logger()
     env = FormationEnv3D(num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS)
     actors = {a: Actor(OBS_DIM, ACT_DIM).to(DEVICE) for a in AGENTS}
-    critic = CentralCritic(OBS_DIM * len(AGENTS)).to(DEVICE)
+    critic = CentralCritic(OBS_DIM * len(AGENTS), num_agents=len(AGENTS)).to(DEVICE)
+    agent_idx = {a: i for i, a in enumerate(AGENTS)}
     opt_actors = {a: optim.Adam(actors[a].parameters(), lr=LR) for a in AGENTS}
     opt_critic = optim.Adam(critic.parameters(), lr=LR)
 
@@ -79,13 +80,14 @@ def main():
                     act_dict[a] = act.squeeze(0).numpy()
                     logp_dict[a] = logp.item()
                 jobs = torch.as_tensor(joint(obs)).unsqueeze(0)
-                value = critic(jobs).item()
+                values = critic(jobs).squeeze(0)
+                value_dict = {a: values[agent_idx[a]].item() for a in AGENTS}
 
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
             done = any(terms.values()) or any(truncs.values())
             collided = any(terms.values())
 
-            buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value)
+            buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict)
             for a in AGENTS:
                 ep_rewards[a] += rewards.get(a, 0.0)
             if env.agents:
@@ -123,12 +125,14 @@ def main():
 
         with torch.no_grad():
             jobs = torch.as_tensor(joint(obs)).unsqueeze(0)
-            last_value = critic(jobs).item()
+            last_values = critic(jobs).squeeze(0)
+            last_value_dict = {a: last_values[agent_idx[a]].item() for a in AGENTS}
 
         last_actor_loss, last_critic_loss, last_entropy = 0.0, 0.0, 0.0
+        last_approx_kl, last_clip_frac = 0.0, 0.0
         if buf.ptr == ROLLOUT_LEN:
             for a in AGENTS:
-                o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value)
+                o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value_dict[a])
                 n = o.shape[0]
                 for _ in range(EPOCHS):
                     idx = torch.randperm(n)
@@ -142,7 +146,7 @@ def main():
                         ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
                         actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean()
 
-                        value_pred = critic(jo[b])
+                        value_pred = critic(jo[b])[:, agent_idx[a]]
                         critic_loss = ((value_pred - ret[b]) ** 2).mean()
 
                         opt_actors[a].zero_grad()
@@ -153,6 +157,9 @@ def main():
                         critic_loss.backward()
                         opt_critic.step()
 
+                        with torch.no_grad():
+                            last_approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
+                            last_clip_frac = (torch.abs(ratio - 1) > CLIP).float().mean().item()
                         last_actor_loss = actor_loss.item()
                         last_critic_loss = critic_loss.item()
                         last_entropy = entropy.mean().item()
@@ -170,7 +177,7 @@ def main():
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
-                  f"entropy={last_entropy:.2f} "
+                  f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f}]")
@@ -179,6 +186,7 @@ def main():
                      collision_rate=collision_rate, avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
+                     approx_kl=last_approx_kl, clip_frac=last_clip_frac,
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],

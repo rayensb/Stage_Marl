@@ -20,31 +20,32 @@ class RolloutBuffer:
         self.logp = {a: np.zeros(n, np.float32) for a in self.agents}
         self.rewards = {a: np.zeros(n, np.float32) for a in self.agents}
         self.dones = np.zeros(n, np.float32)
-        self.values = np.zeros(n, np.float32)
+        self.values = {a: np.zeros(n, np.float32) for a in self.agents}
         self.ptr = 0
 
-    def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value):
+    def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value_dict):
         i = self.ptr
         for a in self.agents:
             self.obs[a][i] = obs_dict[a]
             self.actions[a][i] = act_dict[a]
             self.logp[a][i] = logp_dict[a]
             self.rewards[a][i] = rew_dict[a]
+            self.values[a][i] = value_dict[a]
         self.joint_obs[i] = joint_obs
         self.dones[i] = done
-        self.values[i] = value
         self.ptr += 1
 
     def compute_gae(self, last_value, agent):
+        values = self.values[agent]
         adv = np.zeros(self.size, np.float32)
         lastgae = 0.0
         for t in reversed(range(self.size)):
-            nextval = last_value if t == self.size - 1 else self.values[t + 1]
+            nextval = last_value if t == self.size - 1 else values[t + 1]
             nextnonterminal = 1.0 - self.dones[t]
-            delta = self.rewards[agent][t] + self.gamma * nextval * nextnonterminal - self.values[t]
+            delta = self.rewards[agent][t] + self.gamma * nextval * nextnonterminal - values[t]
             lastgae = delta + self.gamma * self.lam * nextnonterminal * lastgae
             adv[t] = lastgae
-        returns = adv + self.values
+        returns = adv + values
         return adv, returns
 
     def get_tensors(self, agent, last_value):
