@@ -1,10 +1,15 @@
 """
 FormationEnv3D — N-agent PettingZoo ParallelEnv, 3D space.
 
-Fixes applied:
-- Mutual/reciprocal k-NN neighbor graph (no more asymmetric A->B, B->C)
-- Global collision penalty (all agents penalized on any pairwise collision)
-- Target velocity added to observation
+Reward-balance fix: track weight increased, safety magnitude reduced,
+old per-locked-neighbor "diverge" penalty (had a relock loophole) replaced
+with a GLOBAL swarm-cohesion penalty based on swarm_diameter -- can't be
+gamed by relocking onto a different neighbor.
+
+NEIGHBOR GRAPH DESIGN CHOICE: mutual (reciprocal) k-nearest-neighbors.
+Each drone computes its own top-k nearest candidates; a candidate is only
+"locked" if the relationship is mutual (A in B_top_k AND B in A_top_k).
+Fully decentralized -- no global consensus step needed.
 """
 
 import math
@@ -20,25 +25,20 @@ from config import (
     NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED,
     OBS_MAX_DIST, OBS_MAX_VEL, OBS_MAX_ANGLE,
+    TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
+    COHESION_LIMIT, COHESION_WEIGHT,
 )
 
 
 class FormationEnv3D(ParallelEnv):
-    metadata = {"name": "formation_env_3d_v1"}
+    metadata = {"name": "formation_env_3d_v2"}
 
     def __init__(self, num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS, scenario=None):
         self.possible_agents = [f"drone{i+1}" for i in range(num_agents)]
         self.agents = self.possible_agents[:]
         self.k = min(k_neighbors, num_agents - 1)
-        # NEIGHBOR GRAPH DESIGN CHOICE: mutual (reciprocal) k-nearest-neighbors.
-        # Each drone computes its own top-k nearest candidates; a candidate is
-        # only "locked" if the relationship is mutual (A in B_top_k AND B in A_top_k).
-        # This avoids asymmetric graphs (A->B, B->C) while remaining fully
-        # decentralized -- each drone only needs its own local distance measurements,
-        # no global consensus step. See _compute_all_candidates() / _relock_all().
         self.forced_scenario = scenario
 
-        # own_vel(3) + rel_target_pos(3) + dist_t(1) + rel_target_vel(3) + k*(relpos3+relvel3+dist1)
         self._obs_dim = 10 + 7 * self.k
         self._act_dim = 3
 
@@ -46,6 +46,7 @@ class FormationEnv3D(ParallelEnv):
         self.locked = {}
         self.pos_t = np.zeros(3, np.float32)
         self.step_count = 0
+        self._current_diameter = 0.0
         self.np_random = np.random.default_rng()
 
     @functools.lru_cache(maxsize=None)
@@ -56,7 +57,6 @@ class FormationEnv3D(ParallelEnv):
     def action_space(self, agent):
         return spaces.Box(low=-1.0, high=1.0, shape=(self._act_dim,), dtype=np.float32)
 
-    # ---- reset ----
     def reset(self, seed=None, options=None):
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
@@ -84,6 +84,7 @@ class FormationEnv3D(ParallelEnv):
         self._target_speed = self.np_random.uniform(0.3, 1.0)
 
         self._relock_all()
+        self._current_diameter = self.get_swarm_stats()["swarm_diameter"]
 
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {} for a in self.agents}
@@ -103,7 +104,6 @@ class FormationEnv3D(ParallelEnv):
             n = np.linalg.norm(diff) + 1e-6
             self.pos[b] = (self.pos[b] + diff / n * 0.3).astype(np.float32)
 
-    # ---- mutual k-NN neighbor graph ----
     def _compute_all_candidates(self):
         cand = {}
         for a in self.agents:
@@ -118,10 +118,9 @@ class FormationEnv3D(ParallelEnv):
         for a in self.agents:
             mutual = [b for b in cand[a] if a in cand[b]]
             if not mutual and cand[a]:
-                mutual = cand[a][:1]   # fallback: avoid empty neighbor set
+                mutual = cand[a][:1]
             self.locked[a] = mutual[:self.k]
 
-    # ---- step ----
     def step(self, actions):
         self.step_count += 1
 
@@ -140,6 +139,8 @@ class FormationEnv3D(ParallelEnv):
         if needs_relock:
             self._relock_all()
 
+        self._current_diameter = self.get_swarm_stats()["swarm_diameter"]
+
         collision = any(
             np.linalg.norm(self.pos[a] - self.pos[b]) < COLLISION_DIST
             for a, b in itertools.combinations(self.agents, 2))
@@ -148,17 +149,18 @@ class FormationEnv3D(ParallelEnv):
         reward_tuples = {a: self._get_reward(a, collision) for a in self.agents}
         rewards = {a: reward_tuples[a][0] for a in self.agents}
         reward_components = {a: reward_tuples[a][1] for a in self.agents}
+
         terminations = {a: bool(collision) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
-        infos = {a: {"min_dist": self._min_dist(a), "reward_components": reward_components[a]} for a in self.agents}
+        infos = {a: {"min_dist": self._min_dist(a),
+                       "reward_components": reward_components[a]} for a in self.agents}
 
         if collision or truncated:
             self.agents = []
 
         return obs, rewards, terminations, truncations, infos
 
-    # ---- helpers ----
     def _min_dist(self, agent):
         others = [o for o in self.possible_agents if o != agent]
         return min(np.linalg.norm(self.pos[agent] - self.pos[o]) for o in others)
@@ -204,11 +206,11 @@ class FormationEnv3D(ParallelEnv):
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
     def _get_reward(self, agent, global_collision):
-        """Returns (total_reward, components_dict) for diagnostic logging."""
+        """Returns (total_reward, components_dict)."""
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
-        r_track = -0.5 * abs(self._dist_to_target(agent) - TARGET_DIST)
+        r_track = TRACK_WEIGHT * abs(self._dist_to_target(agent) - TARGET_DIST)
 
         target_vel = self._target_dir * self._target_speed
         r_velocity = -0.05 * float(np.linalg.norm(v - target_vel))
@@ -227,23 +229,26 @@ class FormationEnv3D(ParallelEnv):
             r_spread = -0.3 * abs(min_gap - ideal_gap)
 
         r_safety = 0.0
-        r_diverge = 0.0
         for n in neighbors:
             d = float(np.linalg.norm(self.pos[n] - p))
             if d < SAFE_DIST_ENTER:
-                r_safety += -50.0 * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
+                r_safety += SAFETY_URGENT_COEF * (SAFE_DIST_ENTER - d) / SAFE_DIST_ENTER
             elif d < SAFE_DIST_EXIT:
                 center = (SAFE_DIST_ENTER + SAFE_DIST_EXIT) / 2.0
                 err = abs(d - center) / (SAFE_DIST_EXIT - SAFE_DIST_ENTER)
-                r_safety += 5.0 * (1.0 - err)
-            r_diverge += -5.0 * max(0.0, d - DIVERGE_DIST) / DIVERGE_DIST
+                r_safety += SAFETY_MAX_BONUS * (1.0 - err)
+
+        # GLOBAL cohesion penalty -- based on swarm_diameter, shared by all agents.
+        # Cannot be evaded by relocking onto a nearer neighbor (unlike the old
+        # per-locked-neighbor diverge penalty).
+        r_cohesion = COHESION_WEIGHT * max(0.0, self._current_diameter - COHESION_LIMIT)
 
         r_collision_global = -300.0 if global_collision else 0.0
 
-        total = float(r_track + r_spread + r_safety + r_diverge + r_collision_global + r_velocity)
+        total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global + r_velocity)
         components = {
             "track": float(r_track), "spread": float(r_spread),
-            "safety": float(r_safety), "diverge": float(r_diverge),
+            "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
         }
         return total, components

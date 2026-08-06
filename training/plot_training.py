@@ -19,7 +19,7 @@ axes[2,0].set_title("Pairwise Distance"); axes[2,0].legend()
 axes[2,1].plot(df.total_steps, df.swarm_diameter, color='brown')
 axes[2,1].set_title("Swarm Diameter")
 for k, c in [("r_track","blue"),("r_spread","green"),("r_safety","orange"),
-             ("r_diverge","red"),("r_collision","black"),("r_velocity","gray")]:
+             ("r_cohesion","red"),("r_collision","black"),("r_velocity","gray")]:
     axes[3,0].plot(df.total_steps, df[k], label=k, color=c)
 axes[3,0].set_title("Reward Components"); axes[3,0].legend(fontsize=7)
 axes[3,1].plot(df.total_steps, df.critic_loss, color='orange'); axes[3,1].set_title("Critic Loss")
