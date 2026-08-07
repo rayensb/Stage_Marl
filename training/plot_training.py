@@ -1,9 +1,17 @@
+import sys, os
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-df = pd.read_csv("logs/training_log.csv")
+# Matches logger.py's run_id suffixing: pass a run id as the first arg, or
+# rely on the same SEED env var used to launch training (so a plain re-run
+# in the same Kaggle session picks up the right file automatically).
+run_id = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SEED", "")
+LOG_PATH = f"logs/training_log_{run_id}.csv" if run_id else "logs/training_log.csv"
+OUT_PATH = f"logs/training_curves_{run_id}.png" if run_id else "logs/training_curves.png"
+
+df = pd.read_csv(LOG_PATH)
 fig, axes = plt.subplots(5, 2, figsize=(12, 20))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
@@ -27,5 +35,5 @@ axes[4,0].plot(df.total_steps, df.approx_kl, color='teal'); axes[4,0].set_title(
 axes[4,1].plot(df.total_steps, df.clip_frac, color='magenta'); axes[4,1].set_title("Clip Fraction")
 
 plt.tight_layout()
-plt.savefig("logs/training_curves.png", dpi=120)
-print("Saved logs/training_curves.png")
+plt.savefig(OUT_PATH, dpi=120)
+print(f"Saved {OUT_PATH}")
