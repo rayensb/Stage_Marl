@@ -1,12 +1,24 @@
 """Shared constants for the MARL formation/collision-avoidance env."""
 
-NUM_AGENTS       = 4
-K_NEIGHBORS       = 2
+import os
+
+# NUM_AGENTS/N_REACT are env-var overridable (like SEED/DEVICE in train.py)
+# so parallel Kaggle sessions can sweep them -- e.g. NUM_AGENTS=2 for a
+# curriculum-learning starting point, or different N_REACT values to compare
+# safety-margin assumptions -- without hand-editing this file each time.
+NUM_AGENTS  = int(os.environ.get("NUM_AGENTS", 4))
+K_NEIGHBORS = 2
 
 # Single source of truth for network I/O shapes -- train.py and evaluate.py
 # both need these to match exactly (evaluate.py loads weights saved by
-# train.py), so this is not duplicated in either file.
-OBS_DIM = 10 + 7 * K_NEIGHBORS
+# train.py), so this is not duplicated in either file. Must use the same
+# num_agents-capped neighbor count the env actually produces (formation_env's
+# self.k = min(K_NEIGHBORS, NUM_AGENTS-1)) -- using raw K_NEIGHBORS here was a
+# latent bug: harmless at NUM_AGENTS=4 (min(2,3)=2, matches), but NUM_AGENTS=2
+# gives the env k=1 while the network would still expect k=2 -- a shape
+# mismatch that only surfaces once anyone actually tries fewer agents.
+EFFECTIVE_K = min(K_NEIGHBORS, NUM_AGENTS - 1)
+OBS_DIM = 10 + 7 * EFFECTIVE_K
 ACT_DIM = 3
 
 COLLISION_DIST   = 4.20     # hard physical clearance radius (rotor/frame safety)
@@ -31,8 +43,8 @@ MAX_ACTION_SPEED = 1.2      # actions set velocity directly -- no acceleration/
 # latency. 10 cycles (0.5s) is a moderate budget: enough for a stochastic,
 # still-imperfect controller to notice a closing trajectory and commit to a
 # correction, without forcing drones absurdly far apart.
-N_REACT       = 10
-REACTION_DIST = 2 * MAX_ACTION_SPEED * (N_REACT * DT)   # = 1.20
+N_REACT       = int(os.environ.get("N_REACT", 10))
+REACTION_DIST = 2 * MAX_ACTION_SPEED * (N_REACT * DT)   # = 1.20 at N_REACT=10
 
 # SAFE_DIST_ENTER: even in the worst-case closing scenario, one full
 # reaction window still leaves COLLISION_DIST of clearance -- this is the
@@ -45,23 +57,30 @@ SAFE_DIST_EXIT  = SAFE_DIST_ENTER + REACTION_DIST                 # = 6.60
 
 # TARGET_DIST derived, not hand-picked: the best possible arrangement of
 # NUM_AGENTS points all at distance TARGET_DIST from a shared target is the
-# packing that maximizes their minimum pairwise separation. For N=4 that's a
-# regular tetrahedron, edge = TARGET_DIST * sqrt(8/3). At the original flat
-# value (3.5) that edge was 5.72 -- against the *original* SAFE_DIST_EXIT
-# (5.60) that was just 0.12 of margin, i.e. even the mathematically best-case
-# formation had ~2% safety margin. That's why collision_rate kept relapsing
-# every time the policy got *better* at tracking across every prior fix:
-# converging harder onto a razor-thin-margin sphere is the correct optimum
-# of an over-constrained task, not a policy bug. No amount of reweighting
-# SAFETY vs COHESION vs TRACK fixes a target geometry with no safe solution
-# to converge to. The optimal formation should clear the whole comfort zone
+# packing that maximizes their minimum pairwise separation (the Tammes
+# problem). Closed-form optimal packings only exist for small N -- N=2 is
+# antipodal points (edge = 2x radius), N=3 is an equilateral triangle on a
+# great circle (edge = sqrt(3) x radius), N=4 is a regular tetrahedron (edge
+# = sqrt(8/3) x radius). At the original flat TARGET_DIST (3.5, N=4) that
+# edge was 5.72 -- against the *original* SAFE_DIST_EXIT (5.60) that was just
+# 0.12 of margin, i.e. even the mathematically best-case formation had ~2%
+# safety margin. That's why collision_rate kept relapsing every time the
+# policy got *better* at tracking across every prior fix: converging harder
+# onto a razor-thin-margin sphere is the correct optimum of an
+# over-constrained task, not a policy bug. No amount of reweighting SAFETY
+# vs COHESION vs TRACK fixes a target geometry with no safe solution to
+# converge to. The optimal formation should clear the whole comfort zone
 # with a further full reaction-distance to spare, for imperfect real-world
-# coordination (a decentralized policy won't hit a perfect tetrahedron).
-# (No simple closed-form packing ratio for N != 4 -- revisit this formula if
-# NUM_AGENTS changes.)
-_TETRA_RATIO      = (8 / 3) ** 0.5                          # tetrahedron edge/radius ratio, ~1.633
-_TETRA_EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST          # = 7.80
-TARGET_DIST        = _TETRA_EDGE_TARGET / _TETRA_RATIO       # ~4.78
+# coordination (a decentralized policy won't hit the exact optimal packing).
+_PACKING_RATIO = {2: 2.0, 3: 3 ** 0.5, 4: (8 / 3) ** 0.5}
+if NUM_AGENTS not in _PACKING_RATIO:
+    raise ValueError(
+        f"No known optimal spherical-packing ratio for NUM_AGENTS={NUM_AGENTS} "
+        f"-- add it to _PACKING_RATIO in config.py (see the Tammes problem) "
+        f"before running with this many agents."
+    )
+_EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST                    # = 7.80, independent of N
+TARGET_DIST  = _EDGE_TARGET / _PACKING_RATIO[NUM_AGENTS]          # ~4.78 at N=4
 
 OBS_MAX_DIST      = 15.0
 OBS_MAX_VEL        = 2.0
@@ -71,17 +90,17 @@ TRACK_WEIGHT      = -2.0    # was -0.5, too weak vs safety magnitude
 SAFETY_MAX_BONUS  = 2.0     # was 5.0, reduce dominance
 SAFETY_URGENT_COEF = -30.0  # was -50.0
 
-# Kept proportional to the ideal tetrahedron edge (_TETRA_EDGE_TARGET) rather
-# than a fixed absolute, so it automatically stays meaningful if TARGET_DIST
-# changes again. Was 1.6x -- err, was ~2.7x TARGET_DIST (~21.2 absolute):
-# eval.py on the first joint-bonus run showed the swarm settling near/under
-# that limit at diameter 18-21 in successful episodes, using "just stay very
-# loose" as a cheap way to avoid collisions instead of converging toward the
-# tight, accurate-AND-safe ideal (~7.8). Tightened to 1.6x the ideal edge --
-# real slack remains for imperfect coordination, but "very loose" is no
-# longer close to free.
-COHESION_MARGIN = 1.6
-COHESION_LIMIT   = COHESION_MARGIN * _TETRA_EDGE_TARGET   # ~12.5
+# Kept proportional to the ideal formation edge (_EDGE_TARGET) rather than a
+# fixed absolute, so it automatically stays meaningful if TARGET_DIST
+# changes. Tried tightening this from ~2.7x to 1.6x on the theory that the
+# swarm was defaulting to "just stay very loose" as a cheap safety strategy
+# (diameter 18-21 in successful episodes) instead of converging toward the
+# tight ideal (~7.8) -- measured result: collision_rate got WORSE (0.31 ->
+# 0.47), not better. The wide formation was functioning as real safety
+# margin, not laziness; removing it made things more dangerous. Reverted to
+# the value that was actually measured to work.
+COHESION_MARGIN = 2.7
+COHESION_LIMIT   = COHESION_MARGIN * _EDGE_TARGET   # ~21.1
 COHESION_WEIGHT = -0.05
 
 # Joint track+safety bonus. Additive reward composition (the terms above)

@@ -52,7 +52,10 @@ DEVICE = os.environ.get("DEVICE", "cpu")
 _seed_env = os.environ.get("SEED")
 if _seed_env is not None:
     SEED = int(_seed_env)
-    RUN_ID = str(SEED)
+    # Prefix with agent count whenever it's non-default, so NUM_AGENTS=2/3
+    # curriculum runs are self-documenting in their filenames instead of
+    # relying on the user picking a distinguishing SEED by convention.
+    RUN_ID = f"n{NUM_AGENTS}_{SEED}" if NUM_AGENTS != 4 else str(SEED)
 else:
     SEED = int.from_bytes(os.urandom(4), "little") % (2**31)
     RUN_ID = ""

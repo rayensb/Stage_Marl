@@ -99,11 +99,22 @@ def run_episode(env, actors, device, seed, record=False):
     return metrics, trajectory
 
 
+def _default_run_id():
+    """Mirrors train.py's RUN_ID scheme exactly (SEED, prefixed with agent
+    count when NUM_AGENTS is overridden away from the default) so a plain
+    `python training/evaluate.py` run in the same session finds the right
+    files without the user needing to reconstruct the id by hand."""
+    seed = os.environ.get("SEED")
+    if seed is None:
+        return ""
+    return f"n{NUM_AGENTS}_{seed}" if NUM_AGENTS != 4 else seed
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--episodes", type=int, default=100)
     parser.add_argument("--model-dir", default="models")
-    parser.add_argument("--run-id", default=os.environ.get("SEED", ""))
+    parser.add_argument("--run-id", default=_default_run_id())
     parser.add_argument("--seed", type=int, default=0, help="Eval-scenario base seed, independent of the training seed")
     parser.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
     parser.add_argument("--save-trajectory", default=None, help="Optional path to save episode 0's position history as .npz, for a future 3D replay viewer")
