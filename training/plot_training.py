@@ -1,13 +1,25 @@
 import sys, os
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import pandas as pd
 import matplotlib
 matplotlib.use('Agg')
 import matplotlib.pyplot as plt
 
-# Matches logger.py's run_id suffixing: pass a run id as the first arg, or
-# rely on the same SEED env var used to launch training (so a plain re-run
-# in the same Kaggle session picks up the right file automatically).
-run_id = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("SEED", "")
+from config import NUM_AGENTS
+
+# Matches train.py/evaluate.py's run_id scheme exactly: SEED, prefixed with
+# agent count when NUM_AGENTS is overridden away from the default. Without
+# this it silently looked for the wrong (unprefixed) filename whenever
+# NUM_AGENTS was set, e.g. NUM_AGENTS=2 SEED=1 -> training_log_n2_1.csv, but
+# this used to look for training_log_1.csv and crash with FileNotFoundError.
+if len(sys.argv) > 1:
+    run_id = sys.argv[1]
+else:
+    _seed = os.environ.get("SEED")
+    if _seed is None:
+        run_id = ""
+    else:
+        run_id = f"n{NUM_AGENTS}_{_seed}" if NUM_AGENTS != 4 else _seed
 LOG_PATH = f"logs/training_log_{run_id}.csv" if run_id else "logs/training_log.csv"
 OUT_PATH = f"logs/training_curves_{run_id}.png" if run_id else "logs/training_curves.png"
 
