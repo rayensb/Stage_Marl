@@ -117,3 +117,16 @@ COHESION_WEIGHT = -0.05
 # treat as the first thing to tune if this doesn't move the needle.
 JOINT_TRACK_TOL = REACTION_DIST   # ~1.20
 JOINT_BONUS     = 3.0
+
+# Was hardcoded (-0.05) directly in formation_env.py -- pulled out here so
+# it can be swept like everything else. At realistic velocity errors this
+# contributes roughly -0.03 to -0.05 per step, versus -2 to -6 for r_track
+# and up to -30 for r_safety -- functionally zero influence on the learned
+# policy. This is the likely reason tracking_rmse plateaus around 3 (against
+# TARGET_DIST ~3.9-4.8) instead of converging tighter: r_track only scores
+# radial distance to the target, nothing scores whether a drone holds a
+# stable position/bearing as the target moves, and velocity-matching (which
+# would implicitly reward smooth co-movement without hardcoding a specific
+# formation angle) barely factors into the reward. Env-var overridable for
+# a parallel sweep against the current value.
+VELOCITY_WEIGHT = float(os.environ.get("VELOCITY_WEIGHT", -0.05))

@@ -45,7 +45,7 @@ from config import (
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
     OBS_MAX_DIST, OBS_MAX_VEL,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
-    COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL,
+    COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
 )
 
 
@@ -301,7 +301,7 @@ class FormationEnv3D(ParallelEnv):
         r_track = TRACK_WEIGHT * track_err
 
         target_vel = self._target_dir * self._target_speed
-        r_velocity = -0.05 * float(np.linalg.norm(v - target_vel))
+        r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - target_vel))
 
         r_spread = 0.0
         if len(neighbors) >= 2:
