@@ -12,11 +12,9 @@ from training.networks import Actor, CentralCritic
 from training.buffer import RolloutBuffer
 from training.checkpoint import save_checkpoint, load_checkpoint
 from training.logger import init_logger, log_row
-from config import NUM_AGENTS, K_NEIGHBORS
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
-OBS_DIM = 10 + 7 * K_NEIGHBORS
-ACT_DIM = 3
 ROLLOUT_LEN = 2048
 EPOCHS = 10
 BATCH_SIZE = 256

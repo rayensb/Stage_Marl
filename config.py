@@ -3,6 +3,12 @@
 NUM_AGENTS       = 4
 K_NEIGHBORS       = 2
 
+# Single source of truth for network I/O shapes -- train.py and evaluate.py
+# both need these to match exactly (evaluate.py loads weights saved by
+# train.py), so this is not duplicated in either file.
+OBS_DIM = 10 + 7 * K_NEIGHBORS
+ACT_DIM = 3
+
 COLLISION_DIST   = 4.20     # hard physical clearance radius (rotor/frame safety)
 DIVERGE_DIST     = 10.0     # used for re-lock trigger only now
 
