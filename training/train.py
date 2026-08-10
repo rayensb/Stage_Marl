@@ -1,6 +1,7 @@
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import signal
+import time
 import numpy as np
 import torch
 import torch.optim as optim
@@ -35,8 +36,11 @@ TOTAL_STEPS = 600_000
 # on GPU rather than compute-bound, since the network itself is tiny. Only
 # the EPOCHS/BATCH_SIZE=256 minibatch training phase is a real batched
 # workload that GPU can actually accelerate. Falls back to CPU automatically
-# if no CUDA device is visible.
-DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+# if no CUDA device is visible. DEVICE env var forces a choice regardless
+# (e.g. DEVICE=cpu to skip CUDA even if a GPU is attached, without touching
+# Kaggle's accelerator setting) -- steps_per_sec is now logged so this is a
+# measured decision instead of a guess.
+DEVICE = os.environ.get("DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
 
 # SEED env var enables reproducible, non-colliding parallel runs (e.g. one
 # Kaggle session per seed): set SEED=1/2/3 per session and each gets its own
@@ -98,6 +102,7 @@ def main():
     recent_components = {k: deque(maxlen=50) for k in COMPONENT_KEYS}
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
+        rollout_start = time.time()
         buf.reset()
         for t in range(ROLLOUT_LEN):
             act_dict, logp_dict = {}, {}
@@ -164,6 +169,9 @@ def main():
             if _stop_requested:
                 break
 
+        rollout_elapsed = time.time() - rollout_start   # collection phase only
+        train_start = time.time()
+
         with torch.no_grad():
             jobs = torch.as_tensor(joint(obs)).unsqueeze(0).to(DEVICE)
             last_values = critic(jobs).squeeze(0)
@@ -224,6 +232,11 @@ def main():
                     if np.mean(epoch_kls) > TARGET_KL:
                         break
 
+            train_elapsed = time.time() - train_start
+            total_elapsed = rollout_elapsed + train_elapsed
+            steps_per_sec = ROLLOUT_LEN / total_elapsed if total_elapsed > 0 else 0.0
+            collect_sps = ROLLOUT_LEN / rollout_elapsed if rollout_elapsed > 0 else 0.0
+
             avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
             collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
             avg_min_dist = float(np.mean(recent_min_dist)) if recent_min_dist else 0.0
@@ -238,6 +251,7 @@ def main():
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} lr={lr_now:.2e} "
+                  f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f}]")
@@ -247,6 +261,7 @@ def main():
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
                      approx_kl=last_approx_kl, clip_frac=last_clip_frac,
+                     steps_per_sec=steps_per_sec, collect_steps_per_sec=collect_sps,
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],

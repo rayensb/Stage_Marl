@@ -12,7 +12,7 @@ LOG_PATH = f"logs/training_log_{run_id}.csv" if run_id else "logs/training_log.c
 OUT_PATH = f"logs/training_curves_{run_id}.png" if run_id else "logs/training_curves.png"
 
 df = pd.read_csv(LOG_PATH)
-fig, axes = plt.subplots(5, 2, figsize=(12, 20))
+fig, axes = plt.subplots(6, 2, figsize=(12, 24))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
 axes[0,1].plot(df.total_steps, df.collision_rate, color='red')
@@ -33,6 +33,10 @@ axes[3,0].set_title("Reward Components"); axes[3,0].legend(fontsize=7)
 axes[3,1].plot(df.total_steps, df.critic_loss, color='orange'); axes[3,1].set_title("Critic Loss")
 axes[4,0].plot(df.total_steps, df.approx_kl, color='teal'); axes[4,0].set_title("Approx KL (watch for spikes)")
 axes[4,1].plot(df.total_steps, df.clip_frac, color='magenta'); axes[4,1].set_title("Clip Fraction")
+axes[5,0].plot(df.total_steps, df.steps_per_sec, label="total", color='darkgreen')
+axes[5,0].plot(df.total_steps, df.collect_steps_per_sec, label="rollout collection only", color='olive')
+axes[5,0].set_title("Throughput (steps/sec)"); axes[5,0].legend(fontsize=7)
+axes[5,1].axis('off')
 
 plt.tight_layout()
 plt.savefig(OUT_PATH, dpi=120)
