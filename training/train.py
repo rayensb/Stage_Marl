@@ -143,10 +143,20 @@ def main():
     recent_components = {k: deque(maxlen=50) for k in COMPONENT_KEYS}
 
     last_entropy = 0.0   # carried across rollouts for logging
-    best_collision_rate = float("inf")
+    best_collision_rate = float("inf")   # drives entropy-recovery patience only
     since_best = 0
     cooldown_remaining = 0
     recovery_trigger_count = 0
+    # Drives which checkpoint gets saved as "best" -- separate from the
+    # collision-rate-only tracking above. Pure collision_rate can prefer a
+    # policy that's safe only by spreading out excessively (confirmed: one
+    # run's best-by-collision-rate checkpoint had meaningfully worse
+    # tracking_rmse and swarm_diameter than its own final-step model).
+    # Rounding collision_rate to 2dp groups meaningfully-equal safety levels
+    # together so tracking quality (comp_avgs['track'], less negative is
+    # better) breaks ties within that group -- a genuinely safer policy
+    # still always wins outright on the primary criterion.
+    best_score = (float("inf"), float("inf"))
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
@@ -235,7 +245,6 @@ def main():
             if collision_rate < best_collision_rate - BEST_MIN_DELTA:
                 best_collision_rate = collision_rate
                 since_best = 0
-                save_best_actor(actor, RUN_ID)
             else:
                 since_best += 1
 
@@ -286,6 +295,7 @@ def main():
             head_idx = torch.cat(head_list).to(DEVICE)
 
             n = o.shape[0]
+            stop_early = False
             for _ in range(EPOCHS):
                 idx = torch.randperm(n)
                 epoch_kls = []
@@ -302,10 +312,17 @@ def main():
 
                     opt_actor.zero_grad()
                     actor_loss.backward(retain_graph=True)
+                    # Standard PPO safeguard (SB3 default max_grad_norm=0.5)
+                    # -- matters more here than usual given the -300
+                    # collision spike sitting next to much smaller ordinary
+                    # rewards, which can produce occasional large advantage
+                    # excursions and correspondingly large gradients.
+                    torch.nn.utils.clip_grad_norm_(actor.parameters(), 0.5)
                     opt_actor.step()
 
                     opt_critic.zero_grad()
                     critic_loss.backward()
+                    torch.nn.utils.clip_grad_norm_(critic.parameters(), 0.5)
                     opt_critic.step()
 
                     with torch.no_grad():
@@ -316,7 +333,15 @@ def main():
                     last_critic_loss = critic_loss.item()
                     last_entropy = entropy.mean().item()
 
-                if np.mean(epoch_kls) > TARGET_KL:
+                    # Per-minibatch check, not just per-epoch: the previous
+                    # version only stopped between epochs, so a single bad
+                    # minibatch could still be followed by the rest of that
+                    # epoch's updates before anything reacted.
+                    if last_approx_kl > TARGET_KL:
+                        stop_early = True
+                        break
+
+                if stop_early or np.mean(epoch_kls) > TARGET_KL:
                     break
 
             train_elapsed = time.time() - train_start
@@ -333,6 +358,12 @@ def main():
             comp_avgs = {k: float(np.mean(recent_components[k])) if recent_components[k] else 0.0
                           for k in COMPONENT_KEYS}
 
+            if recent_collisions:
+                current_score = (round(collision_rate, 2), -comp_avgs['track'])
+                if current_score < best_score:
+                    best_score = current_score
+                    save_best_actor(actor, RUN_ID)
+
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
@@ -348,7 +379,7 @@ def main():
                      collision_rate=collision_rate, avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
-                     approx_kl=last_approx_kl, clip_frac=last_clip_frac,
+                     approx_kl=last_approx_kl, clip_frac=last_clip_frac, early_stop_kl=int(stop_early),
                      steps_per_sec=steps_per_sec, collect_steps_per_sec=collect_sps,
                      ent_coef=ent_coef, entropy_recovery=int(entropy_recovery),
                      best_collision_rate=best_collision_rate,
