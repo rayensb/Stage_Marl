@@ -10,7 +10,7 @@ from collections import deque
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor, CentralCritic
 from training.buffer import RolloutBuffer
-from training.checkpoint import save_checkpoint, load_checkpoint
+from training.checkpoint import save_checkpoint, load_checkpoint, save_best_actor
 from training.logger import init_logger, log_row
 from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM
 
@@ -41,14 +41,27 @@ TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
 TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
                           # entropy floor above, not a new baseline.
 
-# Performance-gated entropy recovery: instead of only a fixed calendar-based
-# anneal, if the policy has become confident (entropy < 0) but is still
-# performing badly (collision_rate above this threshold), boost exploration
-# back toward ENT_COEF_START rather than letting the schedule keep
-# suppressing it. The 3M-step run showed unconditional annealing keeps
-# shrinking entropy even while collision_rate is stuck high, with no
-# mechanism to back off and try something else -- this gives it one.
-ENTROPY_RECOVERY_COLLISION_THRESHOLD = 0.10
+# Plateau-triggered entropy recovery (same idea as ReduceLROnPlateau, but
+# boosting exploration instead of cutting LR): the entropy<0 trigger tried
+# before was too strict -- the NUM_AGENTS=3/shared-actor run relapsed
+# (collision_rate 0.02 -> 0.25+) without entropy ever going negative, so
+# that check never fired even though the run needed it. This instead
+# watches the same collision_rate rolling window (last <=50 episodes)
+# everything else uses, and tracks whether it's actually improving:
+#   - new best (with a real margin, not noise) -> save it, reset patience
+#   - no new best for RECOVERY_PATIENCE rollouts -> boost exploration for
+#     RECOVERY_COOLDOWN rollouts, then resume watching
+# The cooldown is what prevents "triggered multiple times and explode":
+# once boosted, we don't re-judge for a full cooldown window, so the boost
+# gets a real chance to work before being re-evaluated, and can't fire
+# again immediately if the very next rollout still looks bad.
+# RECOVERY_MAX_TRIGGERS caps total interventions so a run that's simply
+# stuck can't loop forever -- it lets the schedule finish normally after
+# that many honest attempts instead.
+BEST_MIN_DELTA = 0.01        # min collision_rate improvement to count as real progress, not noise
+RECOVERY_PATIENCE = 15        # rollouts (~30k steps) without a new best before boosting
+RECOVERY_COOLDOWN = 10        # rollouts (~20k steps) to hold the boost before re-judging
+RECOVERY_MAX_TRIGGERS = 5     # safety cap on total interventions per run
 ENTROPY_RECOVERY_ENT_COEF = ENT_COEF_START
 
 # Rollout collection is ~2048 sequential steps -- measured on Kaggle: CPU
@@ -129,7 +142,11 @@ def main():
     recent_diameter = deque(maxlen=50)
     recent_components = {k: deque(maxlen=50) for k in COMPONENT_KEYS}
 
-    last_entropy = 0.0   # carried across rollouts for the entropy-recovery check
+    last_entropy = 0.0   # carried across rollouts for logging
+    best_collision_rate = float("inf")
+    since_best = 0
+    cooldown_remaining = 0
+    recovery_trigger_count = 0
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
@@ -209,9 +226,30 @@ def main():
 
         collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
 
+        # Best-checkpoint tracking and entropy recovery share this signal:
+        # only judge once the rolling window has real episodes in it, and
+        # only count an improvement if it clears BEST_MIN_DELTA (avoids
+        # noise flip-flopping the patience counter).
+        entropy_recovery = False
+        if recent_collisions:
+            if collision_rate < best_collision_rate - BEST_MIN_DELTA:
+                best_collision_rate = collision_rate
+                since_best = 0
+                save_best_actor(actor, RUN_ID)
+            else:
+                since_best += 1
+
+            if cooldown_remaining > 0:
+                cooldown_remaining -= 1
+                entropy_recovery = True
+            elif since_best >= RECOVERY_PATIENCE and recovery_trigger_count < RECOVERY_MAX_TRIGGERS:
+                entropy_recovery = True
+                cooldown_remaining = RECOVERY_COOLDOWN
+                recovery_trigger_count += 1
+                since_best = 0   # fresh patience window once the boost ends
+
         last_actor_loss, last_critic_loss = 0.0, 0.0
         last_approx_kl, last_clip_frac = 0.0, 0.0
-        entropy_recovery = False
         if buf.ptr == ROLLOUT_LEN:
             # Linear LR anneal to 0 over training -- constant with a
             # collapsing action std means the same gradient step moves the
@@ -226,11 +264,7 @@ def main():
                 g["lr"] = lr_now
 
             scheduled_ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
-            if last_entropy < 0.0 and collision_rate > ENTROPY_RECOVERY_COLLISION_THRESHOLD:
-                ent_coef = ENTROPY_RECOVERY_ENT_COEF
-                entropy_recovery = True
-            else:
-                ent_coef = scheduled_ent_coef
+            ent_coef = ENTROPY_RECOVERY_ENT_COEF if entropy_recovery else scheduled_ent_coef
 
             # Pool all agents' rollout data into one batch for the shared
             # actor -- GAE is still computed per-agent (each has its own
@@ -300,7 +334,7 @@ def main():
                           for k in COMPONENT_KEYS}
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
-                  f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
+                  f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
                   f"lr={lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
@@ -317,6 +351,7 @@ def main():
                      approx_kl=last_approx_kl, clip_frac=last_clip_frac,
                      steps_per_sec=steps_per_sec, collect_steps_per_sec=collect_sps,
                      ent_coef=ent_coef, entropy_recovery=int(entropy_recovery),
+                     best_collision_rate=best_collision_rate,
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
@@ -330,12 +365,12 @@ def main():
     else:
         os.makedirs("models", exist_ok=True)
         suffix = f"_{RUN_ID}" if RUN_ID else ""
-        # Same shared weights saved once per agent-name file, so evaluate.py
-        # (and anything else expecting one file per drone) doesn't need to
-        # change at all -- it just happens to load identical weights each time.
-        for a in AGENTS:
-            torch.save(actor.state_dict(), f"models/actor_{a}{suffix}.pt")
-        print("Training done. Final models saved to models/")
+        # One shared actor -> one file (evaluate.py loads it once and reuses
+        # the same object for every agent, rather than expecting a
+        # per-drone-name file each).
+        torch.save(actor.state_dict(), f"models/actor{suffix}.pt")
+        print(f"Training done. Final model saved to models/actor{suffix}.pt "
+              f"(best model during the run: models/actor_best{suffix}.pt, collision_rate={best_collision_rate:.2f})")
 
 
 if __name__ == "__main__":

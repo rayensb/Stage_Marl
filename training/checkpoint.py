@@ -29,3 +29,17 @@ def load_checkpoint(actor, critic, opt_actor, opt_critic, run_id="", device="cpu
     opt_critic.load_state_dict(state["opt_critic"])
     print(f"Resumed from checkpoint: steps={state['total_steps']} ep={state['ep_count']}")
     return state["total_steps"], state["ep_count"]
+
+
+def _best_actor_path(run_id=""):
+    return f"models/actor_best_{run_id}.pt" if run_id else "models/actor_best.pt"
+
+
+def save_best_actor(actor, run_id=""):
+    """Actor weights only, not full training state -- this is for
+    evaluation/deployment (the best point a run reached), not resuming
+    training from. Training curves repeatedly show a real peak mid-run
+    that the final step doesn't preserve, so this captures it directly
+    instead of hoping the run doesn't drift past it."""
+    os.makedirs("models", exist_ok=True)
+    torch.save(actor.state_dict(), _best_actor_path(run_id))

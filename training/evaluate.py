@@ -25,36 +25,35 @@ from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
 
-def load_actors(model_dir, run_id, device):
-    """Prefers the final models/actor_*.pt files (only written when training
-    completes TOTAL_STEPS naturally), falls back to the training checkpoint
-    (written every rollout, including on Ctrl+C) so an interrupted run can
-    still be evaluated without waiting for it to finish."""
+def load_actors(model_dir, run_id, device, best=False):
+    """One shared actor -> one file. Prefers models/actor[_best]_<run_id>.pt
+    (actor_best is only written when a new best collision_rate is reached
+    during training; actor is only written when TOTAL_STEPS completes
+    naturally), falls back to the training checkpoint (written every
+    rollout, including on Ctrl+C) so an interrupted run can still be
+    evaluated without waiting for it to finish. Returns the same actor
+    object under every agent key, since it's one shared policy."""
     suffix = f"_{run_id}" if run_id else ""
-    actors = {a: Actor(OBS_DIM, ACT_DIM).to(device) for a in AGENTS}
+    tag = "_best" if best else ""
+    path = os.path.join(model_dir, f"actor{tag}{suffix}.pt")
 
-    missing = [a for a in AGENTS if not os.path.exists(os.path.join(model_dir, f"actor_{a}{suffix}.pt"))]
-    if not missing:
-        for a in AGENTS:
-            path = os.path.join(model_dir, f"actor_{a}{suffix}.pt")
-            actors[a].load_state_dict(torch.load(path, map_location=device))
+    actor = Actor(OBS_DIM, ACT_DIM).to(device)
+    if os.path.exists(path):
+        actor.load_state_dict(torch.load(path, map_location=device))
     else:
         ckpt_path = f"checkpoints/latest{suffix}.pt"
         if not os.path.exists(ckpt_path):
             raise FileNotFoundError(
-                f"No final models/actor_*{suffix}.pt and no checkpoint at {ckpt_path} either -- "
+                f"No {path} and no checkpoint at {ckpt_path} either -- "
                 f"check --model-dir/--run-id match how training saved this run."
             )
-        print(f"[eval] final models/ files not found (run likely interrupted) -- loading from checkpoint {ckpt_path} instead")
+        print(f"[eval] {path} not found (run likely interrupted, or --best requested before any best was saved) "
+              f"-- loading from checkpoint {ckpt_path} instead")
         state = torch.load(ckpt_path, map_location=device)
-        # Shared actor -- one set of weights, same state dict loaded into
-        # every agent's slot (matches how train.py saves models/actor_*.pt).
-        for a in AGENTS:
-            actors[a].load_state_dict(state["actor"])
+        actor.load_state_dict(state["actor"])
 
-    for a in AGENTS:
-        actors[a].eval()
-    return actors
+    actor.eval()
+    return {a: actor for a in AGENTS}
 
 
 def run_episode(env, actors, device, seed, record=False):
@@ -120,10 +119,11 @@ def main():
     parser.add_argument("--seed", type=int, default=0, help="Eval-scenario base seed, independent of the training seed")
     parser.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
     parser.add_argument("--save-trajectory", default=None, help="Optional path to save episode 0's position history as .npz, for a future 3D replay viewer")
+    parser.add_argument("--best", action="store_true", help="Evaluate the best-checkpointed model (by training-time collision_rate) instead of the final one")
     args = parser.parse_args()
 
-    print(f"[eval] device={args.device} run_id={args.run_id or '(none)'} episodes={args.episodes}")
-    actors = load_actors(args.model_dir, args.run_id, args.device)
+    print(f"[eval] device={args.device} run_id={args.run_id or '(none)'} episodes={args.episodes}" + (" model=best" if args.best else " model=final"))
+    actors = load_actors(args.model_dir, args.run_id, args.device, best=args.best)
     env = FormationEnv3D(num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS)
 
     rows = []
@@ -162,7 +162,8 @@ def main():
         print(f"  {k:>20}: {v:.3f}" if isinstance(v, float) else f"  {k:>20}: {v}")
 
     os.makedirs("logs", exist_ok=True)
-    out_path = f"logs/eval_{args.run_id}.csv" if args.run_id else "logs/eval.csv"
+    name_parts = [p for p in (["best"] if args.best else []) + ([args.run_id] if args.run_id else []) if p]
+    out_path = f"logs/eval_{'_'.join(name_parts)}.csv" if name_parts else "logs/eval.csv"
     with open(out_path, "w", newline="") as f:
         w = csv.DictWriter(f, fieldnames=["episode"] + list(rows[0].keys()))
         w.writeheader()
