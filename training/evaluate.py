@@ -26,18 +26,32 @@ AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
 
 def load_actors(model_dir, run_id, device):
+    """Prefers the final models/actor_*.pt files (only written when training
+    completes TOTAL_STEPS naturally), falls back to the training checkpoint
+    (written every rollout, including on Ctrl+C) so an interrupted run can
+    still be evaluated without waiting for it to finish."""
     suffix = f"_{run_id}" if run_id else ""
-    actors = {}
-    for a in AGENTS:
-        path = os.path.join(model_dir, f"actor_{a}{suffix}.pt")
-        if not os.path.exists(path):
+    actors = {a: Actor(OBS_DIM, ACT_DIM).to(device) for a in AGENTS}
+
+    missing = [a for a in AGENTS if not os.path.exists(os.path.join(model_dir, f"actor_{a}{suffix}.pt"))]
+    if not missing:
+        for a in AGENTS:
+            path = os.path.join(model_dir, f"actor_{a}{suffix}.pt")
+            actors[a].load_state_dict(torch.load(path, map_location=device))
+    else:
+        ckpt_path = f"checkpoints/latest{suffix}.pt"
+        if not os.path.exists(ckpt_path):
             raise FileNotFoundError(
-                f"Missing model file: {path} -- check --model-dir/--run-id match how training saved it."
+                f"No final models/actor_*{suffix}.pt and no checkpoint at {ckpt_path} either -- "
+                f"check --model-dir/--run-id match how training saved this run."
             )
-        actor = Actor(OBS_DIM, ACT_DIM).to(device)
-        actor.load_state_dict(torch.load(path, map_location=device))
-        actor.eval()
-        actors[a] = actor
+        print(f"[eval] final models/ files not found (run likely interrupted) -- loading from checkpoint {ckpt_path} instead")
+        state = torch.load(ckpt_path, map_location=device)
+        for a in AGENTS:
+            actors[a].load_state_dict(state["actors"][a])
+
+    for a in AGENTS:
+        actors[a].eval()
     return actors
 
 

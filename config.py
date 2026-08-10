@@ -80,3 +80,18 @@ SAFETY_URGENT_COEF = -30.0  # was -50.0
 COHESION_RATIO      = 3.857
 COHESION_LIMIT       = COHESION_RATIO * TARGET_DIST   # ~21.2
 COHESION_WEIGHT     = -0.05
+
+# Joint track+safety bonus. Additive reward composition (the terms above)
+# lets the policy bank "good enough" total reward from tracking OR safety
+# alone -- confirmed in eval.py results (100 deterministic episodes on the
+# 600k-step model): episodes split into two modes, tight formation that
+# tracks well but collides fast, or spread formation that's safe but tracks
+# poorly, never both. This adds an explicit bonus only when both hold at
+# once, so the region that's actually the goal has a reward advantage
+# instead of just being hoped for by the sum. JOINT_TRACK_TOL is derived
+# (within one REACTION_DIST of ideal TARGET_DIST -- an error a single
+# reaction window could correct); JOINT_BONUS's magnitude is a starting
+# guess sized to be comparable to SAFETY_MAX_BONUS, not a derived value --
+# treat as the first thing to tune if this doesn't move the needle.
+JOINT_TRACK_TOL = REACTION_DIST   # ~1.20
+JOINT_BONUS     = 3.0

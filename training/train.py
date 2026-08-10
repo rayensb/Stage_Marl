@@ -27,18 +27,13 @@ TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
                      # range ~0.01-0.03) -- stop an agent's epoch loop early if
                      # an update has already moved the policy this far, instead
                      # of blindly running all EPOCHS regardless of update size.
-TOTAL_STEPS = 2_000_000   # was 600k -- eval on the SEED=1/600k model showed a
-                            # fully converged (entropy -1.29), non-exploring
-                            # policy that still collided 56% of the time in
-                            # deterministic eval, with two flawed modes (tight
-                            # formation that crashes fast, or spread formation
-                            # with worse tracking) instead of the "both good"
-                            # solution the reward geometry allows. ENT_COEF and
-                            # LR both anneal as a fraction of TOTAL_STEPS with
-                            # no awareness of whether a good policy was actually
-                            # found -- this tests whether 600k was cutting off
-                            # exploration before convergence, not after it.
-                            # ~1.7h at the measured 330 steps/sec CPU throughput.
+TOTAL_STEPS = 600_000   # was raised to 2M to test premature-convergence --
+                          # that made collision_rate strictly worse the longer
+                          # it trained (more steps = more confidently wrong,
+                          # not "getting there"), so more training time wasn't
+                          # the missing piece. Back to 600k: fast iteration
+                          # while testing the JOINT_BONUS reward change below,
+                          # which is the more likely actual cause.
 
 # Rollout collection is ~2048 sequential batch-1 forward passes per step
 # (4 actors + 1 critic, not vectorized) -- measured on Kaggle: CPU sustains
@@ -72,7 +67,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity"]
+COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -262,7 +257,8 @@ def main():
                   f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
-                  f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f}]")
+                  f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f} "
+                  f"joint={comp_avgs['joint']:.1f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, avg_min_dist=avg_min_dist,
@@ -273,7 +269,8 @@ def main():
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
-                     r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'])
+                     r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
+                     r_joint=comp_avgs['joint'])
 
         save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count, RUN_ID)
 

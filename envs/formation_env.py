@@ -26,7 +26,7 @@ from config import (
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
     OBS_MAX_DIST, OBS_MAX_VEL, OBS_MAX_ANGLE,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
-    COHESION_LIMIT, COHESION_WEIGHT,
+    COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL,
 )
 
 
@@ -270,7 +270,8 @@ class FormationEnv3D(ParallelEnv):
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
-        r_track = TRACK_WEIGHT * abs(self._dist_to_target(agent) - TARGET_DIST)
+        track_err = abs(self._dist_to_target(agent) - TARGET_DIST)
+        r_track = TRACK_WEIGHT * track_err
 
         target_vel = self._target_dir * self._target_speed
         r_velocity = -0.05 * float(np.linalg.norm(v - target_vel))
@@ -293,11 +294,13 @@ class FormationEnv3D(ParallelEnv):
         # so a drone closing on an unlocked neighbor previously got zero
         # warning gradient until the episode ended under it.
         r_safety = 0.0
+        all_clear = True
         for n in self.agents:
             if n == agent:
                 continue
             d = float(np.linalg.norm(self.pos[n] - p))
             if d < SAFE_DIST_ENTER:
+                all_clear = False
                 # Ramps linearly from 0 at SAFE_DIST_ENTER to full SAFETY_URGENT_COEF
                 # exactly at COLLISION_DIST, so the policy gets a real warning
                 # gradient before termination instead of a flat bonus up to the cliff.
@@ -315,10 +318,23 @@ class FormationEnv3D(ParallelEnv):
 
         r_collision_global = -300.0 if global_collision else 0.0
 
-        total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global + r_velocity)
+        # Joint bonus: an ADDITIVE reward composition lets the policy bank
+        # "good enough" reward from tracking OR safety alone, which is
+        # exactly the two-mode failure eval.py measured -- tight formation
+        # that tracks well but collides fast, or spread formation that's
+        # safe but tracks poorly. Neither mode needed to find the region
+        # where both are true, because the sum rewards each dimension
+        # independently. This adds an explicit bonus only when both are
+        # true at once, so that joint region has a reward advantage instead
+        # of just being hoped for. Existing weights are untouched so this is
+        # an isolated addition, not a re-balance of what's already there.
+        r_joint = JOINT_BONUS if (track_err < JOINT_TRACK_TOL and all_clear) else 0.0
+
+        total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global + r_velocity + r_joint)
         components = {
             "track": float(r_track), "spread": float(r_spread),
             "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
+            "joint": float(r_joint),
         }
         return total, components
