@@ -65,21 +65,24 @@ TARGET_DIST        = _TETRA_EDGE_TARGET / _TETRA_RATIO       # ~4.78
 
 OBS_MAX_DIST      = 15.0
 OBS_MAX_VEL        = 2.0
-OBS_MAX_ANGLE      = 3.14159
 
 # Reward weights -- rebalanced so no single term numerically dominates
 TRACK_WEIGHT      = -2.0    # was -0.5, too weak vs safety magnitude
 SAFETY_MAX_BONUS  = 2.0     # was 5.0, reduce dominance
 SAFETY_URGENT_COEF = -30.0  # was -50.0
 
-# Kept proportional to TARGET_DIST (same ratio as the old 13.5/3.5 pairing)
-# rather than left as a fixed absolute -- otherwise raising TARGET_DIST alone
-# would make this soft cap relatively *tighter* against the new, naturally
-# larger formation, recreating the same cohesion-vs-safety conflict this
-# TARGET_DIST change exists to remove.
-COHESION_RATIO      = 3.857
-COHESION_LIMIT       = COHESION_RATIO * TARGET_DIST   # ~21.2
-COHESION_WEIGHT     = -0.05
+# Kept proportional to the ideal tetrahedron edge (_TETRA_EDGE_TARGET) rather
+# than a fixed absolute, so it automatically stays meaningful if TARGET_DIST
+# changes again. Was 1.6x -- err, was ~2.7x TARGET_DIST (~21.2 absolute):
+# eval.py on the first joint-bonus run showed the swarm settling near/under
+# that limit at diameter 18-21 in successful episodes, using "just stay very
+# loose" as a cheap way to avoid collisions instead of converging toward the
+# tight, accurate-AND-safe ideal (~7.8). Tightened to 1.6x the ideal edge --
+# real slack remains for imperfect coordination, but "very loose" is no
+# longer close to free.
+COHESION_MARGIN = 1.6
+COHESION_LIMIT   = COHESION_MARGIN * _TETRA_EDGE_TARGET   # ~12.5
+COHESION_WEIGHT = -0.05
 
 # Joint track+safety bonus. Additive reward composition (the terms above)
 # lets the policy bank "good enough" total reward from tracking OR safety

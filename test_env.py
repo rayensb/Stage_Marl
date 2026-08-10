@@ -1,6 +1,6 @@
 from envs.formation_env import FormationEnv3D
 
-env = FormationEnv3D(num_agents=4, k_neighbors=2, scenario=None)
+env = FormationEnv3D(num_agents=4, k_neighbors=2)
 obs, infos = env.reset(seed=0)
 print("agents:", env.agents)
 print("obs_dim:", obs["drone1"].shape)

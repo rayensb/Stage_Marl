@@ -1,5 +1,5 @@
 """
-FormationEnv3D — N-agent PettingZoo ParallelEnv, 3D space.
+FormationEnv3D — 4-agent PettingZoo ParallelEnv, 3D space.
 
 Reward-balance fix: track weight increased, safety magnitude reduced,
 old per-locked-neighbor "diverge" penalty (had a relock loophole) replaced
@@ -9,7 +9,26 @@ gamed by relocking onto a different neighbor.
 NEIGHBOR GRAPH DESIGN CHOICE: mutual (reciprocal) k-nearest-neighbors.
 Each drone computes its own top-k nearest candidates; a candidate is only
 "locked" if the relationship is mutual (A in B_top_k AND B in A_top_k).
-Fully decentralized -- no global consensus step needed.
+Mutual k-NN has no connectivity guarantee on its own (can fragment into
+isolated sub-swarms), so _repair_connectivity() force-connects across
+components using global position knowledge computed centrally by the
+simulator -- this makes EXECUTION decentralized (each actor still only
+receives its own local/relative observations) but NOT the neighbor-graph
+maintenance mechanism itself. Precise framing for writeups: "decentralized
+execution", not "fully decentralized system".
+
+SCOPE: TARGET_DIST in config.py is derived from the regular-tetrahedron
+packing ratio for exactly 4 points on a sphere -- it is not a general-N
+formula, even though most of this env (NUM_AGENTS, K_NEIGHBORS) is
+N-generic. This is a 4-agent study; revisit the derivation before changing
+NUM_AGENTS.
+
+KNOWN SIMPLIFICATION: the angular-spread reward (_get_reward's r_spread)
+only considers the XY (horizontal) projection of neighbor bearings, not
+true 3D angular separation -- a drone directly above/below a neighbor barely
+registers here. Distance-based terms (r_track, r_safety) still constrain
+vertical separation, so this isn't a safety gap, but it means "spread" is a
+horizontal-angular-distribution objective, not a full 3D geometric one.
 """
 
 import math
@@ -24,7 +43,7 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
-    OBS_MAX_DIST, OBS_MAX_VEL, OBS_MAX_ANGLE,
+    OBS_MAX_DIST, OBS_MAX_VEL,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
     COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL,
 )
@@ -33,11 +52,10 @@ from config import (
 class FormationEnv3D(ParallelEnv):
     metadata = {"name": "formation_env_3d_v2"}
 
-    def __init__(self, num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS, scenario=None):
+    def __init__(self, num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS):
         self.possible_agents = [f"drone{i+1}" for i in range(num_agents)]
         self.agents = self.possible_agents[:]
         self.k = min(k_neighbors, num_agents - 1)
-        self.forced_scenario = scenario
 
         self._obs_dim = 10 + 7 * self.k
         self._act_dim = 3
@@ -122,6 +140,15 @@ class FormationEnv3D(ParallelEnv):
                 mutual = cand[a][:1]
             locked[a] = mutual[:self.k]
         self._repair_connectivity(locked)
+        # _repair_connectivity appends connector agents to whichever end,
+        # not by distance -- re-sort so slot 0 is always the nearest locked
+        # neighbor and slot 1 the second-nearest, regardless of whether that
+        # agent's list went through a repair. Without this, a repair event
+        # could silently swap what slot 0 vs slot 1 means in the observation
+        # (a discontinuous change in feature semantics the network has to
+        # learn around instead of a stable "nearest, second-nearest" contract).
+        for a in self.agents:
+            locked[a].sort(key=lambda n: np.linalg.norm(self.pos[n] - self.pos[a]))
         self.locked = locked
 
     def _repair_connectivity(self, locked):
