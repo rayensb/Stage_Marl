@@ -228,12 +228,30 @@ class FormationEnv3D(ParallelEnv):
 
         self._current_diameter = self.get_swarm_stats()["swarm_diameter"]
 
-        collision = any(
-            np.linalg.norm(self.pos[a] - self.pos[b]) < COLLISION_DIST
-            for a, b in itertools.combinations(self.agents, 2))
+        # Collision termination stays global -- a collision ends the episode
+        # for the whole scene, that's a fact about it, not a credit question.
+        # But which agents get *penalized* for it is a separate question:
+        # colliding_agents tracks only the agents actually within
+        # COLLISION_DIST of someone, so an uninvolved agent (e.g. a 3rd
+        # drone nowhere near a 2-drone collision) doesn't get the same -300
+        # penalty as the agents that actually caused it. The old global-to-
+        # everyone version was itself a fix for a worse bug (locked-neighbor-
+        # only attribution let some actually-involved agents get zero
+        # penalty), but overcorrected: literature on MARL collision avoidance
+        # documents this exact failure mode -- shared penalties inject noisy,
+        # unrelated gradient into every agent's credit assignment, and it
+        # gets worse as agent count grows (more uninvolved bystanders per
+        # collision event), which matches collision_rate getting measurably
+        # worse from NUM_AGENTS=2 to 3 despite nothing else changing.
+        colliding_agents = set()
+        for a, b in itertools.combinations(self.agents, 2):
+            if np.linalg.norm(self.pos[a] - self.pos[b]) < COLLISION_DIST:
+                colliding_agents.add(a)
+                colliding_agents.add(b)
+        collision = len(colliding_agents) > 0
         truncated = self.step_count >= MAX_STEPS
 
-        reward_tuples = {a: self._get_reward(a, collision) for a in self.agents}
+        reward_tuples = {a: self._get_reward(a, a in colliding_agents) for a in self.agents}
         rewards = {a: reward_tuples[a][0] for a in self.agents}
         reward_components = {a: reward_tuples[a][1] for a in self.agents}
 
@@ -292,8 +310,10 @@ class FormationEnv3D(ParallelEnv):
 
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
-    def _get_reward(self, agent, global_collision):
-        """Returns (total_reward, components_dict)."""
+    def _get_reward(self, agent, agent_collided):
+        """Returns (total_reward, components_dict). agent_collided is True
+        only if this specific agent is within COLLISION_DIST of another
+        agent, not just whether the episode is ending in collision."""
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
@@ -343,7 +363,7 @@ class FormationEnv3D(ParallelEnv):
         # per-locked-neighbor diverge penalty).
         r_cohesion = COHESION_WEIGHT * max(0.0, self._current_diameter - COHESION_LIMIT)
 
-        r_collision_global = -300.0 if global_collision else 0.0
+        r_collision_global = -300.0 if agent_collided else 0.0
 
         # Joint bonus: an ADDITIVE reward composition lets the policy bank
         # "good enough" reward from tracking OR safety alone, which is
