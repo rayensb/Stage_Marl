@@ -22,18 +22,37 @@ LR = 3e-4
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
-ENT_COEF_END = 0.001
+ENT_COEF_END = 0.004    # was 0.001 (10x decay) -- every run so far shows the
+                          # same rise-then-relapse collision_rate shape
+                          # regardless of which other fix was applied, while
+                          # entropy keeps declining cleanly on a fixed
+                          # calendar unrelated to whether a good policy was
+                          # actually found. Hypothesis: residual action noise
+                          # was masking a systematic bias in the policy's
+                          # mean behavior early/mid training (occasionally
+                          # jittering a drone off a collision course it was
+                          # actually drifting toward); as entropy keeps
+                          # shrinking on schedule, that noise-based margin
+                          # disappears and the same biased mean action gets
+                          # executed deterministically instead of randomly
+                          # interrupted. Raised to a gentler ~2.5x final decay
+                          # instead of 10x, to keep a real exploration floor
+                          # for the whole run and test whether collision_rate
+                          # stabilizes late in training instead of relapsing.
 TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
                      # range ~0.01-0.03) -- stop an agent's epoch loop early if
                      # an update has already moved the policy this far, instead
                      # of blindly running all EPOCHS regardless of update size.
-TOTAL_STEPS = 600_000   # was raised to 2M to test premature-convergence --
-                          # that made collision_rate strictly worse the longer
-                          # it trained (more steps = more confidently wrong,
-                          # not "getting there"), so more training time wasn't
-                          # the missing piece. Back to 600k: fast iteration
-                          # while testing the JOINT_BONUS reward change below,
-                          # which is the more likely actual cause.
+TOTAL_STEPS = 3_000_000   # was 600k. The earlier 2M-step attempt made things
+                            # strictly worse the longer it trained -- but that
+                            # was WITHOUT an entropy floor, so more steps just
+                            # meant more time to collapse entropy and commit
+                            # harder to a bad solution. This time the floor
+                            # above is specifically meant to prevent that
+                            # dynamic, so a long run is a fair re-test of
+                            # whether more training time helps once entropy
+                            # isn't allowed to fully collapse. ~2.2h at the
+                            # measured ~380 steps/sec.
 
 # Rollout collection is ~2048 sequential batch-1 forward passes per step
 # (4 actors + 1 critic, not vectorized) -- measured on Kaggle: CPU sustains
