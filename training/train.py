@@ -22,46 +22,42 @@ LR = 3e-4
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
-ENT_COEF_END = 0.004    # was 0.001 (10x decay) -- every run so far shows the
-                          # same rise-then-relapse collision_rate shape
-                          # regardless of which other fix was applied, while
-                          # entropy keeps declining cleanly on a fixed
-                          # calendar unrelated to whether a good policy was
-                          # actually found. Hypothesis: residual action noise
-                          # was masking a systematic bias in the policy's
-                          # mean behavior early/mid training (occasionally
-                          # jittering a drone off a collision course it was
-                          # actually drifting toward); as entropy keeps
-                          # shrinking on schedule, that noise-based margin
-                          # disappears and the same biased mean action gets
-                          # executed deterministically instead of randomly
-                          # interrupted. Raised to a gentler ~2.5x final decay
-                          # instead of 10x, to keep a real exploration floor
-                          # for the whole run and test whether collision_rate
-                          # stabilizes late in training instead of relapsing.
+ENT_COEF_END = 0.001    # back to the original 10x decay -- the 0.004/3M-step
+                          # experiment was a clear, decisive failure (see
+                          # ENTROPY_RECOVERY below for what replaced this
+                          # approach): collision_rate plateaued at 0.78 for
+                          # the last 2M steps, worse than any prior run, and
+                          # entropy still collapsed to -3.92 anyway. Raising
+                          # the floor coefficient didn't stop the collapse,
+                          # it just gave the policy more time to commit
+                          # harder to trading safety for precise tracking --
+                          # the reward genuinely permits that trade, so a
+                          # fixed-calendar entropy schedule (of any shape)
+                          # can't fix it by itself.
 TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
-                     # range ~0.01-0.03) -- stop an agent's epoch loop early if
-                     # an update has already moved the policy this far, instead
+                     # range ~0.01-0.03) -- stop the epoch loop early if an
+                     # update has already moved the policy this far, instead
                      # of blindly running all EPOCHS regardless of update size.
-TOTAL_STEPS = 3_000_000   # was 600k. The earlier 2M-step attempt made things
-                            # strictly worse the longer it trained -- but that
-                            # was WITHOUT an entropy floor, so more steps just
-                            # meant more time to collapse entropy and commit
-                            # harder to a bad solution. This time the floor
-                            # above is specifically meant to prevent that
-                            # dynamic, so a long run is a fair re-test of
-                            # whether more training time helps once entropy
-                            # isn't allowed to fully collapse. ~2.2h at the
-                            # measured ~380 steps/sec.
+TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
+                          # entropy floor above, not a new baseline.
 
-# Rollout collection is ~2048 sequential batch-1 forward passes per step
-# (4 actors + 1 critic, not vectorized) -- measured on Kaggle: CPU sustains
-# ~330 steps/sec, CUDA only ~190 steps/sec (~40% slower) -- the network is
-# tiny enough that per-call GPU overhead dominates over any compute benefit.
-# Defaults to CPU because of that measurement, not a guess. DEVICE env var
-# overrides (e.g. DEVICE=cuda to opt back in, if e.g. the network gets
-# meaningfully bigger later) -- steps_per_sec stays logged either way so any
-# future default change is also a measured decision.
+# Performance-gated entropy recovery: instead of only a fixed calendar-based
+# anneal, if the policy has become confident (entropy < 0) but is still
+# performing badly (collision_rate above this threshold), boost exploration
+# back toward ENT_COEF_START rather than letting the schedule keep
+# suppressing it. The 3M-step run showed unconditional annealing keeps
+# shrinking entropy even while collision_rate is stuck high, with no
+# mechanism to back off and try something else -- this gives it one.
+ENTROPY_RECOVERY_COLLISION_THRESHOLD = 0.10
+ENTROPY_RECOVERY_ENT_COEF = ENT_COEF_START
+
+# Rollout collection is ~2048 sequential steps -- measured on Kaggle: CPU
+# sustains ~330 steps/sec, CUDA only ~190 steps/sec (~40% slower) -- the
+# network is tiny enough that per-call GPU overhead dominates over any
+# compute benefit. Defaults to CPU because of that measurement, not a guess.
+# DEVICE env var overrides (e.g. DEVICE=cuda to opt back in, if e.g. the
+# network gets meaningfully bigger later) -- steps_per_sec stays logged
+# either way so any future default change is also a measured decision.
 DEVICE = os.environ.get("DEVICE", "cpu")
 
 # SEED env var enables reproducible, non-colliding parallel runs (e.g. one
@@ -103,13 +99,20 @@ def main():
 
     init_logger(RUN_ID)
     env = FormationEnv3D(num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS)
-    actors = {a: Actor(OBS_DIM, ACT_DIM).to(DEVICE) for a in AGENTS}
+
+    # Shared actor: the drones are homogeneous (identical dynamics, same
+    # local/neighbor-relative observation shape), so one policy learning
+    # from all NUM_AGENTS agents' experience at once replaces NUM_AGENTS
+    # separate actors each learning from only 1/NUM_AGENTS of the data.
+    # The critic already shares a trunk across a per-agent head, so it's
+    # untouched -- this only pools the actor's training.
+    actor = Actor(OBS_DIM, ACT_DIM).to(DEVICE)
     critic = CentralCritic(OBS_DIM * len(AGENTS), num_agents=len(AGENTS)).to(DEVICE)
     agent_idx = {a: i for i, a in enumerate(AGENTS)}
-    opt_actors = {a: optim.Adam(actors[a].parameters(), lr=LR) for a in AGENTS}
+    opt_actor = optim.Adam(actor.parameters(), lr=LR)
     opt_critic = optim.Adam(critic.parameters(), lr=LR)
 
-    total_steps, ep_count = load_checkpoint(actors, critic, opt_actors, opt_critic, RUN_ID, DEVICE)
+    total_steps, ep_count = load_checkpoint(actor, critic, opt_actor, opt_critic, RUN_ID, DEVICE)
 
     buf = RolloutBuffer(AGENTS, OBS_DIM, ACT_DIM, ROLLOUT_LEN, gamma=GAMMA)
     obs, _ = env.reset(seed=SEED)
@@ -126,17 +129,19 @@ def main():
     recent_diameter = deque(maxlen=50)
     recent_components = {k: deque(maxlen=50) for k in COMPONENT_KEYS}
 
+    last_entropy = 0.0   # carried across rollouts for the entropy-recovery check
+
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
         buf.reset()
         for t in range(ROLLOUT_LEN):
-            act_dict, logp_dict = {}, {}
             with torch.no_grad():
-                for a in env.agents:
-                    o = torch.as_tensor(obs[a]).unsqueeze(0).to(DEVICE)
-                    act, logp = actors[a].get_action(o)
-                    act_dict[a] = act.squeeze(0).cpu().numpy()
-                    logp_dict[a] = logp.item()
+                agents_now = env.agents
+                obs_batch = torch.as_tensor(np.stack([obs[a] for a in agents_now])).to(DEVICE)
+                act_batch, logp_batch = actor.get_action(obs_batch)
+                act_dict = {a: act_batch[i].cpu().numpy() for i, a in enumerate(agents_now)}
+                logp_dict = {a: logp_batch[i].item() for i, a in enumerate(agents_now)}
+
                 jobs = torch.as_tensor(joint(obs)).unsqueeze(0).to(DEVICE)
                 values = critic(jobs).squeeze(0)
                 value_dict = {a: values[agent_idx[a]].item() for a in AGENTS}
@@ -202,8 +207,11 @@ def main():
             last_values = critic(jobs).squeeze(0)
             last_value_dict = {a: last_values[agent_idx[a]].item() for a in AGENTS}
 
-        last_actor_loss, last_critic_loss, last_entropy = 0.0, 0.0, 0.0
+        collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
+
+        last_actor_loss, last_critic_loss = 0.0, 0.0
         last_approx_kl, last_clip_frac = 0.0, 0.0
+        entropy_recovery = False
         if buf.ptr == ROLLOUT_LEN:
             # Linear LR anneal to 0 over training -- constant with a
             # collapsing action std means the same gradient step moves the
@@ -212,50 +220,70 @@ def main():
             # in the back half of every prior run instead of settling.
             frac = min(1.0, total_steps / TOTAL_STEPS)
             lr_now = LR * (1.0 - frac)
-            for a in AGENTS:
-                for g in opt_actors[a].param_groups:
-                    g["lr"] = lr_now
+            for g in opt_actor.param_groups:
+                g["lr"] = lr_now
             for g in opt_critic.param_groups:
                 g["lr"] = lr_now
-            ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
 
+            scheduled_ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
+            if last_entropy < 0.0 and collision_rate > ENTROPY_RECOVERY_COLLISION_THRESHOLD:
+                ent_coef = ENTROPY_RECOVERY_ENT_COEF
+                entropy_recovery = True
+            else:
+                ent_coef = scheduled_ent_coef
+
+            # Pool all agents' rollout data into one batch for the shared
+            # actor -- GAE is still computed per-agent (each has its own
+            # reward stream and critic head), only the actor's training
+            # batch is combined.
+            o_list, jo_list, act_list, old_logp_list, adv_list, ret_list, head_list = [], [], [], [], [], [], []
             for a in AGENTS:
                 o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value_dict[a])
-                o, jo, act, old_logp, adv, ret = (o.to(DEVICE), jo.to(DEVICE), act.to(DEVICE),
-                                                     old_logp.to(DEVICE), adv.to(DEVICE), ret.to(DEVICE))
-                n = o.shape[0]
-                for _ in range(EPOCHS):
-                    idx = torch.randperm(n)
-                    epoch_kls = []
-                    for start in range(0, n, BATCH_SIZE):
-                        b = idx[start:start + BATCH_SIZE]
-                        logp, entropy = actors[a].evaluate(o[b], act[b])
-                        ratio = torch.exp(logp - old_logp[b])
-                        s1 = ratio * adv[b]
-                        s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[b]
-                        actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean()
+                o_list.append(o); jo_list.append(jo); act_list.append(act)
+                old_logp_list.append(old_logp); adv_list.append(adv); ret_list.append(ret)
+                head_list.append(torch.full((o.shape[0],), agent_idx[a], dtype=torch.long))
 
-                        value_pred = critic(jo[b])[:, agent_idx[a]]
-                        critic_loss = ((value_pred - ret[b]) ** 2).mean()
+            o = torch.cat(o_list).to(DEVICE)
+            jo = torch.cat(jo_list).to(DEVICE)
+            act = torch.cat(act_list).to(DEVICE)
+            old_logp = torch.cat(old_logp_list).to(DEVICE)
+            adv = torch.cat(adv_list).to(DEVICE)
+            ret = torch.cat(ret_list).to(DEVICE)
+            head_idx = torch.cat(head_list).to(DEVICE)
 
-                        opt_actors[a].zero_grad()
-                        actor_loss.backward(retain_graph=True)
-                        opt_actors[a].step()
+            n = o.shape[0]
+            for _ in range(EPOCHS):
+                idx = torch.randperm(n)
+                epoch_kls = []
+                for start in range(0, n, BATCH_SIZE):
+                    b = idx[start:start + BATCH_SIZE]
+                    logp, entropy = actor.evaluate(o[b], act[b])
+                    ratio = torch.exp(logp - old_logp[b])
+                    s1 = ratio * adv[b]
+                    s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[b]
+                    actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean()
 
-                        opt_critic.zero_grad()
-                        critic_loss.backward()
-                        opt_critic.step()
+                    value_pred = critic(jo[b])[torch.arange(len(b)), head_idx[b]]
+                    critic_loss = ((value_pred - ret[b]) ** 2).mean()
 
-                        with torch.no_grad():
-                            last_approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
-                            last_clip_frac = (torch.abs(ratio - 1) > CLIP).float().mean().item()
-                        epoch_kls.append(last_approx_kl)
-                        last_actor_loss = actor_loss.item()
-                        last_critic_loss = critic_loss.item()
-                        last_entropy = entropy.mean().item()
+                    opt_actor.zero_grad()
+                    actor_loss.backward(retain_graph=True)
+                    opt_actor.step()
 
-                    if np.mean(epoch_kls) > TARGET_KL:
-                        break
+                    opt_critic.zero_grad()
+                    critic_loss.backward()
+                    opt_critic.step()
+
+                    with torch.no_grad():
+                        last_approx_kl = ((ratio - 1) - torch.log(ratio)).mean().item()
+                        last_clip_frac = (torch.abs(ratio - 1) > CLIP).float().mean().item()
+                    epoch_kls.append(last_approx_kl)
+                    last_actor_loss = actor_loss.item()
+                    last_critic_loss = critic_loss.item()
+                    last_entropy = entropy.mean().item()
+
+                if np.mean(epoch_kls) > TARGET_KL:
+                    break
 
             train_elapsed = time.time() - train_start
             total_elapsed = rollout_elapsed + train_elapsed
@@ -263,7 +291,6 @@ def main():
             collect_sps = ROLLOUT_LEN / rollout_elapsed if rollout_elapsed > 0 else 0.0
 
             avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
-            collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
             avg_min_dist = float(np.mean(recent_min_dist)) if recent_min_dist else 0.0
             avg_ep_len = float(np.mean(recent_ep_len)) if recent_ep_len else 0.0
             mean_pw = float(np.mean(recent_mean_pw)) if recent_mean_pw else 0.0
@@ -275,7 +302,8 @@ def main():
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
-                  f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} lr={lr_now:.2e} "
+                  f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
+                  f"lr={lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
                   f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
@@ -288,21 +316,25 @@ def main():
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
                      approx_kl=last_approx_kl, clip_frac=last_clip_frac,
                      steps_per_sec=steps_per_sec, collect_steps_per_sec=collect_sps,
+                     ent_coef=ent_coef, entropy_recovery=int(entropy_recovery),
                      mean_pairwise=mean_pw, std_pairwise=std_pw, swarm_diameter=diameter,
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
                      r_joint=comp_avgs['joint'])
 
-        save_checkpoint(actors, critic, opt_actors, opt_critic, total_steps, ep_count, RUN_ID)
+        save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 
     if _stop_requested:
         print(f"Stopped early by interrupt at steps={total_steps}. Checkpoint saved.")
     else:
         os.makedirs("models", exist_ok=True)
+        suffix = f"_{RUN_ID}" if RUN_ID else ""
+        # Same shared weights saved once per agent-name file, so evaluate.py
+        # (and anything else expecting one file per drone) doesn't need to
+        # change at all -- it just happens to load identical weights each time.
         for a in AGENTS:
-            suffix = f"_{RUN_ID}" if RUN_ID else ""
-            torch.save(actors[a].state_dict(), f"models/actor_{a}{suffix}.pt")
+            torch.save(actor.state_dict(), f"models/actor_{a}{suffix}.pt")
         print("Training done. Final models saved to models/")
 
 

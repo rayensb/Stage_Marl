@@ -24,7 +24,7 @@ LOG_PATH = f"logs/training_log_{run_id}.csv" if run_id else "logs/training_log.c
 OUT_PATH = f"logs/training_curves_{run_id}.png" if run_id else "logs/training_curves.png"
 
 df = pd.read_csv(LOG_PATH)
-fig, axes = plt.subplots(6, 2, figsize=(12, 24))
+fig, axes = plt.subplots(7, 2, figsize=(12, 28))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
 axes[0,1].plot(df.total_steps, df.collision_rate, color='red')
@@ -49,7 +49,11 @@ axes[4,1].plot(df.total_steps, df.clip_frac, color='magenta'); axes[4,1].set_tit
 axes[5,0].plot(df.total_steps, df.steps_per_sec, label="total", color='darkgreen')
 axes[5,0].plot(df.total_steps, df.collect_steps_per_sec, label="rollout collection only", color='olive')
 axes[5,0].set_title("Throughput (steps/sec)"); axes[5,0].legend(fontsize=7)
-axes[5,1].axis('off')
+axes[5,1].plot(df.total_steps, df.ent_coef, color='indigo')
+axes[5,1].set_title("Entropy Coefficient (watch for recovery spikes)")
+axes[6,0].plot(df.total_steps, df.entropy_recovery, color='crimson', drawstyle='steps-post')
+axes[6,0].set_title("Entropy Recovery Active (1=triggered)")
+axes[6,1].axis('off')
 
 plt.tight_layout()
 plt.savefig(OUT_PATH, dpi=120)

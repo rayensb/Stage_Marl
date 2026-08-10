@@ -47,8 +47,10 @@ def load_actors(model_dir, run_id, device):
             )
         print(f"[eval] final models/ files not found (run likely interrupted) -- loading from checkpoint {ckpt_path} instead")
         state = torch.load(ckpt_path, map_location=device)
+        # Shared actor -- one set of weights, same state dict loaded into
+        # every agent's slot (matches how train.py saves models/actor_*.pt).
         for a in AGENTS:
-            actors[a].load_state_dict(state["actors"][a])
+            actors[a].load_state_dict(state["actor"])
 
     for a in AGENTS:
         actors[a].eval()
