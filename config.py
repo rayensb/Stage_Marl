@@ -118,15 +118,17 @@ COHESION_WEIGHT = -0.05
 JOINT_TRACK_TOL = REACTION_DIST   # ~1.20
 JOINT_BONUS     = 3.0
 
-# Was hardcoded (-0.05) directly in formation_env.py -- pulled out here so
-# it can be swept like everything else. At realistic velocity errors this
-# contributes roughly -0.03 to -0.05 per step, versus -2 to -6 for r_track
-# and up to -30 for r_safety -- functionally zero influence on the learned
-# policy. This is the likely reason tracking_rmse plateaus around 3 (against
-# TARGET_DIST ~3.9-4.8) instead of converging tighter: r_track only scores
-# radial distance to the target, nothing scores whether a drone holds a
-# stable position/bearing as the target moves, and velocity-matching (which
-# would implicitly reward smooth co-movement without hardcoding a specific
-# formation angle) barely factors into the reward. Env-var overridable for
-# a parallel sweep against the current value.
-VELOCITY_WEIGHT = float(os.environ.get("VELOCITY_WEIGHT", -0.05))
+# Was hardcoded (-0.05) directly in formation_env.py; a 3-way parallel sweep
+# at NUM_AGENTS=2 (-0.05 / -0.5 / -2.0, 100-episode deterministic eval each)
+# measured a real, monotonic trade-off: tracking_rmse improved 3.23 -> 2.07
+# -> 1.91 as the weight strengthened, but collision_rate got worse in lock
+# step, 0.07 -> 0.15 -> 0.24 -- pushing drones to match the target's
+# velocity competes with the small evasive corrections collision avoidance
+# needs. Returns were also diminishing (-0.5 -> -2.0 bought only 8% more
+# RMSE improvement for another 9 points of collision rate). Settled on
+# -0.15: a modest, lower-risk pull toward the -0.5 result without chasing
+# tracking precision at real cost to collision safety, which is still the
+# thing that hasn't been proven reliable at higher NUM_AGENTS. Revisit this
+# trade-off after collision avoidance is solid at full agent count, not
+# before. Env-var overridable for further sweeps.
+VELOCITY_WEIGHT = float(os.environ.get("VELOCITY_WEIGHT", -0.15))
