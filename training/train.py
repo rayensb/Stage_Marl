@@ -27,18 +27,28 @@ TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
                      # range ~0.01-0.03) -- stop an agent's epoch loop early if
                      # an update has already moved the policy this far, instead
                      # of blindly running all EPOCHS regardless of update size.
-TOTAL_STEPS = 600_000
+TOTAL_STEPS = 2_000_000   # was 600k -- eval on the SEED=1/600k model showed a
+                            # fully converged (entropy -1.29), non-exploring
+                            # policy that still collided 56% of the time in
+                            # deterministic eval, with two flawed modes (tight
+                            # formation that crashes fast, or spread formation
+                            # with worse tracking) instead of the "both good"
+                            # solution the reward geometry allows. ENT_COEF and
+                            # LR both anneal as a fraction of TOTAL_STEPS with
+                            # no awareness of whether a good policy was actually
+                            # found -- this tests whether 600k was cutting off
+                            # exploration before convergence, not after it.
+                            # ~1.7h at the measured 330 steps/sec CPU throughput.
 
 # Rollout collection is ~2048 sequential batch-1 forward passes per step
-# (4 actors + 1 critic, not vectorized) -- likely host/device-transfer-bound
-# on GPU rather than compute-bound, since the network itself is tiny. Only
-# the EPOCHS/BATCH_SIZE=256 minibatch training phase is a real batched
-# workload that GPU can actually accelerate. Falls back to CPU automatically
-# if no CUDA device is visible. DEVICE env var forces a choice regardless
-# (e.g. DEVICE=cpu to skip CUDA even if a GPU is attached, without touching
-# Kaggle's accelerator setting) -- steps_per_sec is now logged so this is a
-# measured decision instead of a guess.
-DEVICE = os.environ.get("DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu")
+# (4 actors + 1 critic, not vectorized) -- measured on Kaggle: CPU sustains
+# ~330 steps/sec, CUDA only ~190 steps/sec (~40% slower) -- the network is
+# tiny enough that per-call GPU overhead dominates over any compute benefit.
+# Defaults to CPU because of that measurement, not a guess. DEVICE env var
+# overrides (e.g. DEVICE=cuda to opt back in, if e.g. the network gets
+# meaningfully bigger later) -- steps_per_sec stays logged either way so any
+# future default change is also a measured decision.
+DEVICE = os.environ.get("DEVICE", "cpu")
 
 # SEED env var enables reproducible, non-colliding parallel runs (e.g. one
 # Kaggle session per seed): set SEED=1/2/3 per session and each gets its own

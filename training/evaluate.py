@@ -91,7 +91,7 @@ def main():
     parser.add_argument("--model-dir", default="models")
     parser.add_argument("--run-id", default=os.environ.get("SEED", ""))
     parser.add_argument("--seed", type=int, default=0, help="Eval-scenario base seed, independent of the training seed")
-    parser.add_argument("--device", default=os.environ.get("DEVICE") or ("cuda" if torch.cuda.is_available() else "cpu"))
+    parser.add_argument("--device", default=os.environ.get("DEVICE", "cpu"))
     parser.add_argument("--save-trajectory", default=None, help="Optional path to save episode 0's position history as .npz, for a future 3D replay viewer")
     args = parser.parse_args()
 
