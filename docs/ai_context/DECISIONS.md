@@ -108,6 +108,17 @@ collision-rate-based version). Missed a real regression — an `NUM_AGENTS=3` sh
 relapsed (`collision_rate` 0.02 → 0.25+) without entropy ever going negative, so that
 trigger never fired when it should have.
 
+**Follow-up fix (2026-08-14): `RECOVERY_MAX_TRIGGERS` raised 5 → 20.** The mechanism design
+above was correct but underpowered for `TOTAL_STEPS=600_000`: a full `NUM_AGENTS=3`, 3-seed
+run showed all 5 triggers spent by rollout ~110-125 (`5 * (RECOVERY_PATIENCE=15 +
+RECOVERY_COOLDOWN=10)` = 125 of ~293 total rollouts), after which entropy annealed
+unprotected for the remaining ~60% of training and `collision_rate` relapsed to 26-46% by the
+end in every seed — the exact collapse `63274b1` was meant to fix, still present, just moved
+later in training. `--best` checkpoints (2-8% collision_rate) proved the policy itself was
+fine; it just wasn't protected long enough. See `KNOWN_ISSUES.md` item 1 and
+`EXPERIMENT_LOG.md`'s N=3 3-seed analysis for the full evidence. This fix is itself
+**unverified** as of this writing — pending a single-seed `NUM_AGENTS=3` rerun.
+
 ## Two decoupled "best" trackers (collision-rate-only patience signal vs. lexicographic checkpoint save)
 
 **Decision**: `best_collision_rate` (drives only entropy-recovery patience) is tracked

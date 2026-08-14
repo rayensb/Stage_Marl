@@ -58,10 +58,28 @@ TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
 # RECOVERY_MAX_TRIGGERS caps total interventions so a run that's simply
 # stuck can't loop forever -- it lets the schedule finish normally after
 # that many honest attempts instead.
+#
+# Raised 5 -> 20 after the NUM_AGENTS=3, 3-seed validation run (eval_n3_*.csv
+# / eval_best_n3_*.csv, all 3 seeds) showed the budget was the actual failure
+# mode, not the reward balance the a40db9b..63274b1 chain retuned: every
+# seed's collision_rate held near 0 while recovery was still firing, then
+# climbed back to 26-46% by TOTAL_STEPS once all 5 triggers were spent
+# (~rollout 110-125, i.e. ~step 220-250k -- 5 * (RECOVERY_PATIENCE +
+# RECOVERY_COOLDOWN) = 125 rollouts, matching the plots exactly) and the
+# entropy-coefficient schedule was left to decay unprotected for the
+# remaining ~60% of training. The --best checkpoint from mid-run (2-8%
+# collision_rate) confirms the policy the recovery mechanism produces is
+# fine; it just isn't allowed to keep protecting it long enough. 20 * 25
+# rollouts = 500 rollouts of headroom, comfortably more than the ~293
+# rollouts a full 600k-step run has, so the cap stops being the binding
+# constraint here while still being finite (not an infinite-loop risk --
+# TOTAL_STEPS bounds the outer loop regardless). Unverified against a
+# completed run as of this comment -- next single-seed N=3 run is the check.
 BEST_MIN_DELTA = 0.01        # min collision_rate improvement to count as real progress, not noise
 RECOVERY_PATIENCE = 15        # rollouts (~30k steps) without a new best before boosting
 RECOVERY_COOLDOWN = 10        # rollouts (~20k steps) to hold the boost before re-judging
-RECOVERY_MAX_TRIGGERS = 5     # safety cap on total interventions per run
+RECOVERY_MAX_TRIGGERS = 20    # was 5 -- too low a budget for a 600k-step/293-rollout
+                                # run, see comment above
 ENTROPY_RECOVERY_ENT_COEF = ENT_COEF_START
 
 # Rollout collection is ~2048 sequential steps -- measured on Kaggle: CPU

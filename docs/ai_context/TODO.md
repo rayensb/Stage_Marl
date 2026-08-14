@@ -6,12 +6,15 @@ speculative scope, not committed work.
 
 ## Critical
 
-- **Get and analyze the pending `NUM_AGENTS=4`, 3-seed Kaggle results.** This validates the
-  entire current fix chain (see `EXPERIMENT_LOG.md` — "NUM_AGENTS=4, 3-seed validation run").
-  Until this lands, it's unknown whether the `63274b1` cohesion/safety fix actually resolved
-  the collision-rate collapse it targeted. This is the explicit next step the user flagged
-  before this documentation task was created — check `SESSION_HANDOFF.md` first, results may
-  have already arrived by the time this is read.
+- **Commit and push the `RECOVERY_MAX_TRIGGERS` fix** (`training/train.py`, 5 → 20) — applied
+  locally 2026-08-14, not yet confirmed committed/pushed. See `SESSION_HANDOFF.md`.
+- **Verify the fix with a single-seed `NUM_AGENTS=3` rerun** before launching the prepared
+  `NUM_AGENTS=4`, 3-seed Kaggle run — confirm `collision_rate` doesn't relapse past rollout
+  ~125 (where the old 5-trigger budget used to run out). See `KNOWN_ISSUES.md` item 1 and
+  `EXPERIMENT_LOG.md` for the full diagnosis this fix is based on.
+- **Once verified, launch the `NUM_AGENTS=4`, 3-seed Kaggle run** (launcher script already
+  reviewed and structurally confirmed correct this session) — deliberately deferred, not
+  abandoned. This validates the full fix chain at the actual target agent count.
 - **Confirm `test_env.py` still passes after the `a40db9b`..`63274b1` commit chain.** Simple,
   fast, and hasn't been confirmed re-run since those commits per this session's information.
 
@@ -20,13 +23,15 @@ speculative scope, not committed work.
 - **Reconcile reward-component logging scale change** (`63274b1`'s per-step vs. per-episode-
   sum switch, see `KNOWN_ISSUES.md` item 3) before doing any cross-run comparison of
   `r_track`/`r_safety`/etc. magnitudes between pre- and post-`63274b1` logs.
-- **Properly analyze the `NUM_AGENTS=3` evaluation CSVs** (`eval_best_n3_2.csv`,
-  `eval_best_n3_3.csv` in `~/Downloads/`, see `EXPERIMENT_LOG.md`) rather than relying on the
-  informal skim already done — locate the matching training logs too, not just the
-  evaluation output.
 - **Update or replace `readme.txt`** (see `KNOWN_ISSUES.md` item 2) — it currently describes
   a removed per-drone-file architecture and will mislead anyone who reads it instead of
   `docs/ai_context/`.
+- **Fix `envs/formation_env.py`'s stale module docstring** — claims `TARGET_DIST` is "not a
+  general-N formula" / "a 4-agent study," but `config.py` has generalized it to
+  `NUM_AGENTS ∈ {2,3,4}` since commit `2576f92`. Found 2026-08-14, not yet fixed.
+
+~~Properly analyze the `NUM_AGENTS=3` evaluation CSVs~~ — **done 2026-08-14**, full 3-seed
+analysis in `EXPERIMENT_LOG.md`, root cause identified and fixed (see Critical, above).
 
 ## Medium
 

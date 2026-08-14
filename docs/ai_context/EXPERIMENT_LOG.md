@@ -73,38 +73,72 @@ in depth.
 `63274b1` (see `KNOWN_ISSUES.md` item 1 — that follow-up fix's effect on a real run is
 unverified as of this writing).
 
-## `NUM_AGENTS=3` shared-actor curriculum run(s) — evaluation data present, full training log not reviewed this session
+## `NUM_AGENTS=3` shared-actor curriculum run, 3 seeds — full analysis (supersedes the earlier skim below)
 
 **Objective**: validate the shared-actor CTDE-PPO architecture and reward config at
-`NUM_AGENTS=3`, as the middle stage of the 2→3→4 curriculum.
-**Evidence available this session**: two deterministic-evaluation CSVs were present in
-`~/Downloads/` on the local machine — `eval_best_n3_2.csv` and `eval_best_n3_3.csv` (100
-episodes each, columns: `episode, collided, episode_len, min_dist, tracking_rmse,
-avg_spacing_std, avg_diameter, avg_speed`), evidently from `evaluate.py --best` for two
-different seeds (`_2`, `_3`) of an `NUM_AGENTS=3` run.
+`NUM_AGENTS=3`, as the middle stage of the 2→3→4 curriculum, using the full
+`a40db9b`..`63274b1` fix chain.
+**Evidence**: complete 3-seed dataset (`training_log_n3_{1,2,3}.csv`,
+`training_curves_n3_{1,2,3}.png`, `eval_n3_{1,2,3}.csv`, `eval_best_n3_{1,2,3}.csv`, all 100
+episodes) — a fuller set than what an earlier version of this entry recorded (that version
+only found 2 of the 6 eval CSVs; all 6 plus all 3 training logs turned out to be present).
+**Final-model results (deterministic eval, 100 ep, `evaluate.py` without `--best`)**:
+
+| seed | collision_rate | avg collision step | tracking_rmse | swarm_diameter |
+|---|---|---|---|---|
+| 1 | 30% (30/100) | 39.5 | 2.36 | 10.31 |
+| 2 | 26% (26/100) | 51.4 | 2.00 | 9.65 |
+| 3 | 46% (46/100) | 67.2 | 2.00 | 9.57 |
+
+**Best-checkpoint results (`evaluate.py --best`)**:
+
+| seed | collision_rate | tracking_rmse | swarm_diameter |
+|---|---|---|---|
+| 1 | 8% (8/100) | 3.81 | 12.48 |
+| 2 | 4% (4/100) | 3.69 | 12.70 |
+| 3 | 2% (2/100) | 3.74 | 12.15 |
+
+**Training-curve pattern (identical across all 3 seeds)**: `collision_rate` drops near 0 by
+~step 100-150k, holds through ~step 220-250k, then climbs steadily back to 26-46% by
+`TOTAL_STEPS=600k`. This is a **confirmed relapse of the exact failure `63274b1` targeted**,
+not noise — see `KNOWN_ISSUES.md` item 1 for the root-cause diagnosis (entropy-recovery
+budget exhaustion, `RECOVERY_MAX_TRIGGERS=5` spent by rollout ~110-125 in every seed,
+matching precisely where each seed's recovery-active window ends and collision_rate starts
+climbing) and the fix applied (`RECOVERY_MAX_TRIGGERS` 5 → 20 in `training/train.py`).
+**Conclusion**: the `a40db9b`..`63274b1` chain did not fix the collapse; it's an
+entropy-recovery scheduling bug, not a reward-balance problem. `--best` checkpointing works
+exactly as designed as a safety net (rescues collision_rate to 2-8%) but at a real
+tracking/diameter cost, which is what motivated fixing the underlying budget instead of
+relying on `--best` alone.
+**Status**: analysis complete; the `RECOVERY_MAX_TRIGGERS` fix is applied but itself
+**unverified** — needs a fresh single-seed `NUM_AGENTS=3` run to confirm before spending a
+3-seed `NUM_AGENTS=4` Kaggle batch on it.
+
+## `NUM_AGENTS=3` shared-actor curriculum run(s) — earlier informal skim (superseded above)
+
+**Evidence available in an earlier session**: two deterministic-evaluation CSVs —
+`eval_best_n3_2.csv` and `eval_best_n3_3.csv`.
 **Quick skim (not a full analysis)**:
 - `eval_best_n3_2.csv`: 4 collisions out of 100 episodes (episodes 47, 82, 83, 97), each
   terminating well before `MAX_STEPS=200` (lengths 18-37) — genuine early collisions.
 - `eval_best_n3_3.csv`: 2 collisions out of 100 episodes (episodes 83, 89), lengths 25 each.
-- Non-collision episodes run the full 200 steps in both files; `min_dist` values on
-  non-collision episodes stay comfortably above `COLLISION_DIST=4.20` in the rows skimmed.
-**Status**: **UNVERIFIED / informal** — this is a skim of two CSVs present in this session,
-not a rigorous statistical comparison, and the corresponding *training* logs (not just
-these evaluation CSVs) were not located or reviewed this session. If asked to properly
-characterize the `NUM_AGENTS=3` results, locate the actual training CSV log(s)
-(`logs/training_log_n3_*.csv` naming convention per `logger.py`) and the full evaluation
-data, and compute proper aggregate statistics (mean/median `tracking_rmse`, collision rate
-with confidence interval, etc.) rather than relying on this skim.
+**Status**: superseded by the full 3-seed analysis above — kept here only as a record that
+the earlier skim's numbers (4/100 and 2/100 for seeds 2/3) match the rigorous best-checkpoint
+results above (4% and 2%), i.e. the skim wasn't wrong, just incomplete (missing seed 1, the
+non-best evals, and the training logs).
 
-## `NUM_AGENTS=4`, 3-seed validation run — status pending
+## `NUM_AGENTS=4`, 3-seed validation run — deliberately deferred, not launched
 
-**Objective**: validate the full current fix chain (shared actor + best-checkpoint +
-entropy-recovery + credit-fix + gradient-clipping + lexicographic-best-criterion +
-the `a40db9b`..`63274b1` reward/stability chain) at the target `NUM_AGENTS=4`, across 3
+**Objective**: validate the full current fix chain at the target `NUM_AGENTS=4`, across 3
 seeds for robustness.
-**Configuration**: reportedly launched on Kaggle using parallel `subprocess.Popen` per seed
-with `OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1`/`NUMEXPR_NUM_THREADS=1` pinning to avoid CPU
-contention between the parallel seed runs.
-**Result**: **PENDING** — not yet received as of the last known state of this project. This
-is the single most important open item — see `SESSION_HANDOFF.md`.
-**Status**: in progress / awaiting results.
+**Configuration**: a Kaggle launcher script (parallel `subprocess.Popen` per seed,
+`OMP_NUM_THREADS=1`/`MKL_NUM_THREADS=1`/`NUMEXPR_NUM_THREADS=1` pinning, `NUM_AGENTS` left
+unset so `config.py`'s default of 4 applies) was prepared and ready to run.
+**Decision**: **not launched** on the pre-fix code. The `NUM_AGENTS=3` 3-seed analysis above
+found the collision-rate collapse is caused by `RECOVERY_MAX_TRIGGERS` exhaustion, a bug that
+would very likely reproduce (probably worse, given `NUM_AGENTS=4`'s tighter Tammes-packing
+margin and noisier collision-credit attribution per `DECISIONS.md`) at `NUM_AGENTS=4` too.
+Launching the 3-seed batch pre-fix would have spent Kaggle compute reconfirming a known
+issue instead of testing something new.
+**Status**: queued behind a single-seed `NUM_AGENTS=3` verification of the
+`RECOVERY_MAX_TRIGGERS` fix (see entry above).

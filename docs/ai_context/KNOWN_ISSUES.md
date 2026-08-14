@@ -3,19 +3,34 @@
 Open problems as of commit `b14fe48`, 2026-08-14. For issues that were investigated and
 resolved, see `EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues).
 
-## 1. Latest reward/stability fix chain is unverified end-to-end
+## 1. Collision-rate collapse recurs late in training -- CONFIRMED, root cause identified
 
-**Symptom / status**: commits `a40db9b` through `63274b1` (log_std clamp, per-component
-reward logging, reward reweighting, diverge→cohesion replacement, entropy-annealing fix,
-and the `63274b1` fix for "cohesion/safety conflict causing collision-rate collapse") landed
-as a chain of fixes but, as of the last known state of this project, had **not** been
-confirmed against a completed training run.
-**What's already been done**: an `NUM_AGENTS=4`, 3-seed Kaggle training run was reportedly
-launched specifically to validate this chain.
-**What's still needed**: check `SESSION_HANDOFF.md` for whether results have arrived; if so,
-analyze `collision_rate`, `r_cohesion`, `r_safety` trends over training and confirm the
-collision-rate collapse described in `63274b1`'s own commit message doesn't recur. If
-results haven't arrived yet, this is the top-priority thing to follow up on.
+**Status update (2026-08-14, this session)**: the `a40db9b`..`63274b1` reward/stability chain
+did **not** fix the collapse. Confirmed against a completed `NUM_AGENTS=3`, 3-seed run
+(`eval_n3_*.csv` / `eval_best_n3_*.csv` / `training_log_n3_*.csv`, all local in `~/Downloads/`
+at the time of this analysis) -- all 3 seeds show the identical pattern: `collision_rate`
+drops near 0 by ~step 100-150k, stays low through ~step 220-250k, then climbs back to
+**26-46%** by `TOTAL_STEPS=600k` on the final model. `--best` checkpoints (saved mid-run,
+during the good window) stay at 2-8% collision_rate, at the cost of ~1.8x worse
+`tracking_rmse` and ~25% larger `swarm_diameter` -- confirming the underlying policy the run
+finds is fine, it just isn't preserved past the point it started degrading.
+
+**Root cause (verified, not hypothesis)**: `RECOVERY_MAX_TRIGGERS=5` was exhausted in every
+seed by rollout ~110-125 (`5 * (RECOVERY_PATIENCE=15 + RECOVERY_COOLDOWN=10)` = 125 rollouts
+= ~step 220-250k at `ROLLOUT_LEN=2048`) -- matching exactly where each seed's
+`entropy_coefficient` plot stops showing recovery spikes and collision_rate starts climbing.
+For the remaining ~60% of the 600k-step run, entropy anneals unprotected toward its floor,
+the policy converges harder onto the tight target formation (see `config.py`'s `TARGET_DIST`
+comment on the razor-thin safety margin at the mathematical optimum), and safety erodes.
+**Fix applied this session**: `RECOVERY_MAX_TRIGGERS` raised 5 -> 20 in `training/train.py`
+(see the inline comment there for the full derivation) -- gives ~500 rollouts of recovery
+budget, comfortably more than the ~293 rollouts in a full run, so the cap stops binding
+before `TOTAL_STEPS` is reached.
+**Still needed**: this fix is itself unverified against a completed run -- the next
+single-seed `NUM_AGENTS=3` run (before spending a 3-seed `NUM_AGENTS=4` Kaggle batch on it)
+should confirm `collision_rate` no longer relapses in the back half of training. The pending
+`NUM_AGENTS=4`, 3-seed Kaggle run referenced in earlier versions of this doc was deliberately
+**not** launched on the pre-fix code -- see `SESSION_HANDOFF.md`.
 
 ## 2. `readme.txt` is stale and describes a removed architecture
 
