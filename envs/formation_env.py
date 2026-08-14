@@ -45,7 +45,8 @@ from config import (
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
     OBS_MAX_DIST, OBS_MAX_VEL,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF, EDGE_TARGET,
-    COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
+    COHESION_LIMIT, COHESION_WEIGHT, MIN_DIAMETER, DIAMETER_FLOOR_WEIGHT,
+    JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
 )
 
 
@@ -383,6 +384,12 @@ class FormationEnv3D(ParallelEnv):
         # Cannot be evaded by relocking onto a nearer neighbor (unlike the old
         # per-locked-neighbor diverge penalty).
         r_cohesion = COHESION_WEIGHT * max(0.0, self._current_diameter - COHESION_LIMIT)
+        # Diameter floor (2026-08-14): symmetric counter-pressure against the
+        # swarm getting too TIGHT, not just too loose -- see MIN_DIAMETER's
+        # comment in config.py for why. Additive with the excess-diameter term
+        # above; the two can never both be active at once (MIN_DIAMETER <
+        # COHESION_LIMIT).
+        r_cohesion += DIAMETER_FLOOR_WEIGHT * max(0.0, MIN_DIAMETER - self._current_diameter)
 
         r_collision_global = -300.0 if agent_collided else 0.0
 

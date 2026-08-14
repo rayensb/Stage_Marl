@@ -122,6 +122,30 @@ COHESION_MARGIN = 2.7
 COHESION_LIMIT   = COHESION_MARGIN * EDGE_TARGET   # ~21.1
 COHESION_WEIGHT = -0.05
 
+# Diameter floor (2026-08-14) -- COHESION_LIMIT/COHESION_WEIGHT above only ever
+# penalize the swarm being too LOOSE; nothing penalized it being too TIGHT, so
+# there was no counter-pressure against diameter shrinking as r_track pulled
+# harder over training (confirmed across every NUM_AGENTS=3 run so far:
+# avg_min_dist/swarm_diameter trend down from a mid-run peak toward the
+# collision boundary as entropy collapses). MIN_DIAMETER is a user-specified
+# value, not physically re-derived like COHESION_LIMIT -- picked to sit where
+# every --best checkpoint across every run so far has actually landed (11-13
+# diameter, 2-8% collision_rate), comfortably above the collapsed-regime
+# diameters (~8.5-9.5) seen whenever collision_rate climbed, and above
+# EDGE_TARGET=7.80 (the theoretical ideal-packing edge) -- so this will pull
+# somewhat against r_track's individual radial pull by design; that tension is
+# expected, not a bug, and is the whole point of testing this. Explicitly a
+# "confirm the hypothesis" value, not a derived one.
+MIN_DIAMETER = 10.0
+# Deliberately NOT reusing COHESION_WEIGHT (-0.05) for the floor -- that
+# weight is why the existing upper-bound cohesion term never mattered (it
+# never got the chance to be tested against a real diameter excursion, but
+# -0.05 * a few units of violation is negligible next to TRACK_WEIGHT=-2.0's
+# pull). Sized to be roughly comparable to TRACK_WEIGHT so it can actually
+# compete instead of being dominated by it. Starting guess, not derived --
+# first thing to retune if this doesn't move the needle.
+DIAMETER_FLOOR_WEIGHT = -1.0
+
 # Joint track+safety bonus. Additive reward composition (the terms above)
 # lets the policy bank "good enough" total reward from tracking OR safety
 # alone -- confirmed in eval.py results (100 deterministic episodes on the

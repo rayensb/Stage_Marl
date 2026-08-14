@@ -38,8 +38,22 @@ TARGET_KL = 0.02   # standard PPO trust-region safety net (SB3/CleanRL default
                      # range ~0.01-0.03) -- stop the epoch loop early if an
                      # update has already moved the policy this far, instead
                      # of blindly running all EPOCHS regardless of update size.
-TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
-                          # entropy floor above, not a new baseline.
+TOTAL_STEPS = int(os.environ.get("TOTAL_STEPS", 600_000))
+# Was a flat 600_000 -- made env-var overridable (2026-08-14) so a longer-
+# training test (e.g. TOTAL_STEPS=1200000) can be run from the same commit
+# instead of a hardcode-then-revert cycle, matching how SEED/DEVICE/NUM_AGENTS
+# already work. Note this reruns the earlier-rejected "more steps" experiment
+# under a materially different setup than the one that failed (see the
+# ENT_COEF_END comment above): that 3M-step run also raised the entropy floor
+# at the same time, so it was never a clean isolated test of duration alone.
+# This time only TOTAL_STEPS changes. Caveat: RECOVERY_PATIENCE/MAX_TRIGGERS
+# below are calibrated for a 600k-step run's rollout count -- at 1.2M steps
+# recovery coverage will still only span roughly the first half, so a bad
+# result on that variant doesn't cleanly isolate "duration alone doesn't
+# help" from "recovery still ran out." Flagged, not silently fixed, since
+# rescaling those too would be a bigger decision than what was asked for.
+# Default 600k -- 3M was only ever a test of the entropy floor above, not a
+# new baseline.
 
 # Plateau-triggered entropy recovery (same idea as ReduceLROnPlateau, but
 # boosting exploration instead of cutting LR): the entropy<0 trigger tried
@@ -59,26 +73,33 @@ TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
 # stuck can't loop forever -- it lets the schedule finish normally after
 # that many honest attempts instead.
 #
-# Was raised 5 -> 20 (2026-08-14) on the hypothesis that the recovery budget
-# running out mid-training (~rollout 110-125) was the cause of a NUM_AGENTS=3
-# collision-rate relapse. Tested with a 3-seed re-run: collision_rate at
-# TOTAL_STEPS was 27%/25%/66% -- essentially unchanged or worse than the
-# pre-fix 30%/26%/46%, even though the entropy-coefficient trace confirmed
-# recovery was now firing across the whole run, not just the first ~250k.
-# That falsified the hypothesis -- the raw policy entropy trace barely moved
-# despite far more frequent coefficient boosts, meaning the entropy
-# coefficient isn't the binding lever here (matches the earlier rejected
-# ENT_COEF_END=0.004 experiment reaching the same dead end a different way).
-# Reverted back to 5. The actual driver, per a supervisor review + rereading
-# _get_reward, looks like where r_safety's bonus zone sits relative to the
-# designed-safe formation edge -- see EDGE_TARGET / the r_safety comment in
-# envs/formation_env.py, which is the thing actually being tested next.
-# Reverting this alongside that change keeps this run an isolated test of
-# one variable instead of two.
+# History: raised 5 -> 20 (2026-08-14), tested, falsified -- 3-seed re-run
+# gave 27%/25%/66% collision_rate at TOTAL_STEPS, no better than pre-fix
+# 30%/26%/46%, even though recovery visibly fired across the whole run.
+# Reverted to 5, then tested the r_safety-reshape hypothesis instead (also
+# didn't fix it -- see envs/formation_env.py's r_safety comment and
+# KNOWN_ISSUES.md). Current leading picture: r_track has no saturation, so it
+# keeps rewarding more precision (= lower entropy) for the entire run
+# regardless of what the entropy-coefficient side does -- see MIN_DIAMETER in
+# config.py for the fix aimed at that directly, on a different axis.
+#
+# RECOVERY_PATIENCE retimed 15 -> 29 (2026-08-14) for a different reason: once
+# best_collision_rate locks at its floor (observed happening by rollout ~40 in
+# every run so far, since collision_rate can't improve past 0), since_best
+# stops ever resetting except at a trigger, so the mechanism free-runs
+# periodically with period == RECOVERY_PATIENCE (confirmed exactly: the last
+# run's 5 triggers landed at rollouts 24/39/54/69/84 -- each exactly 15 apart,
+# matching the old RECOVERY_PATIENCE=15 precisely; RECOVERY_COOLDOWN doesn't
+# extend the period because since_best keeps incrementing during cooldown
+# too). A 600k-step run is ~293 rollouts (600_000/ROLLOUT_LEN); to get ~10
+# roughly uniform triggers spanning the whole run instead of 5 clustered in
+# the first third, period should be ~293/10 ~= 29 rollouts, so
+# RECOVERY_PATIENCE=29 with RECOVERY_MAX_TRIGGERS=10. Unverified against a
+# completed run as of this comment.
 BEST_MIN_DELTA = 0.01        # min collision_rate improvement to count as real progress, not noise
-RECOVERY_PATIENCE = 15        # rollouts (~30k steps) without a new best before boosting
+RECOVERY_PATIENCE = 29        # rollouts -- retimed for ~10 uniform triggers over a 600k-step run, see comment above
 RECOVERY_COOLDOWN = 10        # rollouts (~20k steps) to hold the boost before re-judging
-RECOVERY_MAX_TRIGGERS = 5     # back to 5, see comment above
+RECOVERY_MAX_TRIGGERS = 10    # was 5 -- see comment above
 ENTROPY_RECOVERY_ENT_COEF = ENT_COEF_START
 
 # Rollout collection is ~2048 sequential steps -- measured on Kaggle: CPU
