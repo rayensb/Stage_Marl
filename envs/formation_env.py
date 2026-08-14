@@ -44,7 +44,7 @@ from config import (
     NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
     OBS_MAX_DIST, OBS_MAX_VEL,
-    TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF,
+    TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF, EDGE_TARGET,
     COHESION_LIMIT, COHESION_WEIGHT, JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
 )
 
@@ -340,6 +340,27 @@ class FormationEnv3D(ParallelEnv):
         # neighbors -- collision termination is global (any pair, anywhere),
         # so a drone closing on an unlocked neighbor previously got zero
         # warning gradient until the episode ended under it.
+        #
+        # Bonus zone reshaped (2026-08-14, supervisor review): the old version
+        # peaked at (SAFE_DIST_ENTER+SAFE_DIST_EXIT)/2 = 6.0 and hit exactly 0
+        # at SAFE_DIST_EXIT = 6.60 -- below the actual designed-safe formation
+        # edge (EDGE_TARGET = 7.80, one full REACTION_DIST beyond
+        # SAFE_DIST_EXIT by design, see config.py). That meant the only
+        # positive per-pair reward anywhere on this axis sat in a tighter,
+        # riskier band than the formation was ever meant to converge to, with
+        # nothing rewarding the actual intended equilibrium -- confirmed as
+        # the likely driver of the NUM_AGENTS=3 collision-rate relapse
+        # (avg_min_dist trended toward ~6-7, i.e. into the old bonus band,
+        # not the designed-safe 7.80, as entropy collapsed and the policy got
+        # precise enough to reliably hold that tighter spacing). Now a single
+        # triangular ramp: 0 at SAFE_DIST_ENTER -> SAFETY_MAX_BONUS at
+        # EDGE_TARGET (the actual ideal edge) -> back to 0 one more
+        # REACTION_DIST beyond it, so "arbitrarily far" still reads as
+        # neutral rather than staying rewarded forever. Also incidentally
+        # fixes two discontinuities the old shape had: 0 from the urgent
+        # branch vs. 1.0 from the bonus branch right at SAFE_DIST_ENTER, and
+        # a hard cliff to 0 at SAFE_DIST_EXIT. Unverified against a completed
+        # run as of this comment -- next single-seed N=3 run is the check.
         r_safety = 0.0
         all_clear = True
         for n in self.agents:
@@ -353,10 +374,10 @@ class FormationEnv3D(ParallelEnv):
                 # gradient before termination instead of a flat bonus up to the cliff.
                 span = SAFE_DIST_ENTER - COLLISION_DIST
                 r_safety += SAFETY_URGENT_COEF * min(1.0, (SAFE_DIST_ENTER - d) / span)
-            elif d < SAFE_DIST_EXIT:
-                center = (SAFE_DIST_ENTER + SAFE_DIST_EXIT) / 2.0
-                err = abs(d - center) / (SAFE_DIST_EXIT - SAFE_DIST_ENTER)
-                r_safety += SAFETY_MAX_BONUS * (1.0 - err)
+            elif d < EDGE_TARGET:
+                r_safety += SAFETY_MAX_BONUS * (d - SAFE_DIST_ENTER) / (EDGE_TARGET - SAFE_DIST_ENTER)
+            elif d < EDGE_TARGET + REACTION_DIST:
+                r_safety += SAFETY_MAX_BONUS * (1.0 - (d - EDGE_TARGET) / REACTION_DIST)
 
         # GLOBAL cohesion penalty -- based on swarm_diameter, shared by all agents.
         # Cannot be evaded by relocking onto a nearer neighbor (unlike the old

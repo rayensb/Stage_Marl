@@ -7,7 +7,23 @@ import os
 # curriculum-learning starting point, or different N_REACT values to compare
 # safety-margin assumptions -- without hand-editing this file each time.
 NUM_AGENTS  = int(os.environ.get("NUM_AGENTS", 4))
-K_NEIGHBORS = 2
+# Was a flat 2 -- supervisor review (2026-08-14) pointed out r_safety in
+# formation_env.py checks every other agent (collision termination is
+# global, so it has to), but the observation only ever included the
+# K_NEIGHBORS locked ones -- an agent could take the -300 collision penalty,
+# or the ramping urgent-safety penalty, for a drone it never observed. At
+# NUM_AGENTS<=3 this was accidentally a non-issue (there are <=2 "others",
+# so k=2 already locked everyone -- verified by reading _relock_all: with
+# only 2 candidates and k=2, mutual reciprocity is guaranteed). It only
+# bites at NUM_AGENTS=4, where the old k=2 left exactly one other agent
+# permanently unobserved. Locking everyone (K_NEIGHBORS = NUM_AGENTS-1)
+# closes that gap for the agent counts this project actually supports
+# ({2,3,4}) without a variable-neighbor encoder -- free at this scale, not
+# something that scales past NUM_AGENTS=4 (that's a real architecture
+# change, not this one). Also makes the mutual-kNN/relock-staleness concern
+# moot here: "locked" now always equals "everyone," so there's nothing
+# stale to relock.
+K_NEIGHBORS = NUM_AGENTS - 1
 
 # Single source of truth for network I/O shapes -- train.py and evaluate.py
 # both need these to match exactly (evaluate.py loads weights saved by
@@ -79,8 +95,11 @@ if NUM_AGENTS not in _PACKING_RATIO:
         f"-- add it to _PACKING_RATIO in config.py (see the Tammes problem) "
         f"before running with this many agents."
     )
-_EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST                    # = 7.80, independent of N
-TARGET_DIST  = _EDGE_TARGET / _PACKING_RATIO[NUM_AGENTS]          # ~4.78 at N=4
+# No longer just an internal derivation step -- envs/formation_env.py now
+# imports this directly too (the reshaped r_safety bonus ramps up to it),
+# so it lost its leading underscore.
+EDGE_TARGET  = SAFE_DIST_EXIT + REACTION_DIST                    # = 7.80, independent of N
+TARGET_DIST  = EDGE_TARGET / _PACKING_RATIO[NUM_AGENTS]          # ~4.78 at N=4
 
 OBS_MAX_DIST      = 15.0
 OBS_MAX_VEL        = 2.0
@@ -90,7 +109,7 @@ TRACK_WEIGHT      = -2.0    # was -0.5, too weak vs safety magnitude
 SAFETY_MAX_BONUS  = 2.0     # was 5.0, reduce dominance
 SAFETY_URGENT_COEF = -30.0  # was -50.0
 
-# Kept proportional to the ideal formation edge (_EDGE_TARGET) rather than a
+# Kept proportional to the ideal formation edge (EDGE_TARGET) rather than a
 # fixed absolute, so it automatically stays meaningful if TARGET_DIST
 # changes. Tried tightening this from ~2.7x to 1.6x on the theory that the
 # swarm was defaulting to "just stay very loose" as a cheap safety strategy
@@ -100,7 +119,7 @@ SAFETY_URGENT_COEF = -30.0  # was -50.0
 # margin, not laziness; removing it made things more dangerous. Reverted to
 # the value that was actually measured to work.
 COHESION_MARGIN = 2.7
-COHESION_LIMIT   = COHESION_MARGIN * _EDGE_TARGET   # ~21.1
+COHESION_LIMIT   = COHESION_MARGIN * EDGE_TARGET   # ~21.1
 COHESION_WEIGHT = -0.05
 
 # Joint track+safety bonus. Additive reward composition (the terms above)

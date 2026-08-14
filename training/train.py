@@ -59,27 +59,26 @@ TOTAL_STEPS = 600_000   # back to 600k -- 3M was only ever a test of the
 # stuck can't loop forever -- it lets the schedule finish normally after
 # that many honest attempts instead.
 #
-# Raised 5 -> 20 after the NUM_AGENTS=3, 3-seed validation run (eval_n3_*.csv
-# / eval_best_n3_*.csv, all 3 seeds) showed the budget was the actual failure
-# mode, not the reward balance the a40db9b..63274b1 chain retuned: every
-# seed's collision_rate held near 0 while recovery was still firing, then
-# climbed back to 26-46% by TOTAL_STEPS once all 5 triggers were spent
-# (~rollout 110-125, i.e. ~step 220-250k -- 5 * (RECOVERY_PATIENCE +
-# RECOVERY_COOLDOWN) = 125 rollouts, matching the plots exactly) and the
-# entropy-coefficient schedule was left to decay unprotected for the
-# remaining ~60% of training. The --best checkpoint from mid-run (2-8%
-# collision_rate) confirms the policy the recovery mechanism produces is
-# fine; it just isn't allowed to keep protecting it long enough. 20 * 25
-# rollouts = 500 rollouts of headroom, comfortably more than the ~293
-# rollouts a full 600k-step run has, so the cap stops being the binding
-# constraint here while still being finite (not an infinite-loop risk --
-# TOTAL_STEPS bounds the outer loop regardless). Unverified against a
-# completed run as of this comment -- next single-seed N=3 run is the check.
+# Was raised 5 -> 20 (2026-08-14) on the hypothesis that the recovery budget
+# running out mid-training (~rollout 110-125) was the cause of a NUM_AGENTS=3
+# collision-rate relapse. Tested with a 3-seed re-run: collision_rate at
+# TOTAL_STEPS was 27%/25%/66% -- essentially unchanged or worse than the
+# pre-fix 30%/26%/46%, even though the entropy-coefficient trace confirmed
+# recovery was now firing across the whole run, not just the first ~250k.
+# That falsified the hypothesis -- the raw policy entropy trace barely moved
+# despite far more frequent coefficient boosts, meaning the entropy
+# coefficient isn't the binding lever here (matches the earlier rejected
+# ENT_COEF_END=0.004 experiment reaching the same dead end a different way).
+# Reverted back to 5. The actual driver, per a supervisor review + rereading
+# _get_reward, looks like where r_safety's bonus zone sits relative to the
+# designed-safe formation edge -- see EDGE_TARGET / the r_safety comment in
+# envs/formation_env.py, which is the thing actually being tested next.
+# Reverting this alongside that change keeps this run an isolated test of
+# one variable instead of two.
 BEST_MIN_DELTA = 0.01        # min collision_rate improvement to count as real progress, not noise
 RECOVERY_PATIENCE = 15        # rollouts (~30k steps) without a new best before boosting
 RECOVERY_COOLDOWN = 10        # rollouts (~20k steps) to hold the boost before re-judging
-RECOVERY_MAX_TRIGGERS = 20    # was 5 -- too low a budget for a 600k-step/293-rollout
-                                # run, see comment above
+RECOVERY_MAX_TRIGGERS = 5     # back to 5, see comment above
 ENTROPY_RECOVERY_ENT_COEF = ENT_COEF_START
 
 # Rollout collection is ~2048 sequential steps -- measured on Kaggle: CPU
