@@ -8,7 +8,7 @@ FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate",
           "ent_coef", "entropy_recovery", "best_collision_rate",
           "mean_pairwise", "std_pairwise", "swarm_diameter",
           "r_track", "r_spread", "r_safety", "r_cohesion", "r_collision", "r_velocity", "r_joint",
-          "log_std_mean", "mean_action_abs"]
+          "log_std_mean", "mean_action_abs", "mean_brake_reduction"]
 
 def init_logger(run_id=""):
     """run_id suffixes the log filename so parallel runs (e.g. different

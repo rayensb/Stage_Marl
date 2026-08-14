@@ -201,6 +201,7 @@ def main():
         buf.reset()
         action_abs_sum = 0.0
         action_count = 0
+        brake_sum = 0.0
         for t in range(ROLLOUT_LEN):
             with torch.no_grad():
                 agents_now = env.agents
@@ -237,6 +238,14 @@ def main():
                     rewards[a] = rewards[a] + GAMMA * boot_values[agent_idx[a]].item()
 
             buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict)
+            # Sum across whichever agents were alive this step -- same
+            # agent-step denominator as action_count, so mean_brake_reduction
+            # (below) is directly comparable to mean_action_abs: how much of
+            # the commanded speed the closing-speed brake actually removed,
+            # averaged per agent per step. Zero for an entire rollout would
+            # mean the brake never engaged -- worth checking before reading
+            # anything into whether it changed collision_rate.
+            brake_sum += sum(infos.get(a, {}).get("brake_reduction", 0.0) for a in agents_now)
             for a in AGENTS:
                 ep_rewards[a] += rewards.get(a, 0.0)
             if env.agents:
@@ -412,11 +421,13 @@ def main():
 
             log_std_mean = actor.get_log_std().mean().item()
             mean_action_abs = action_abs_sum / action_count if action_count > 0 else 0.0
+            mean_brake_reduction = brake_sum / action_count if action_count > 0 else 0.0
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} log_std={log_std_mean:.3f} act_abs={mean_action_abs:.3f} "
+                  f"brake={mean_brake_reduction:.4f} "
                   f"kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
                   f"lr={lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
                   f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
@@ -438,7 +449,8 @@ def main():
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
                      r_joint=comp_avgs['joint'],
-                     log_std_mean=log_std_mean, mean_action_abs=mean_action_abs)
+                     log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
+                     mean_brake_reduction=mean_brake_reduction)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 

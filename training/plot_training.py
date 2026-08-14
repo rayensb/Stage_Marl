@@ -73,7 +73,11 @@ if "mean_action_abs" in df.columns:
     axes[7,0].legend(fontsize=7)
 else:
     axes[7,0].axis('off')
-axes[7,1].axis('off')
+if "mean_brake_reduction" in df.columns:
+    axes[7,1].plot(df.total_steps, df.mean_brake_reduction, color='crimson')
+    axes[7,1].set_title("Closing-speed brake (mean speed removed/agent/step)")
+else:
+    axes[7,1].axis('off')
 
 plt.tight_layout()
 plt.savefig(OUT_PATH, dpi=120)

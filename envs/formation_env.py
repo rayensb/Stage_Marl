@@ -212,9 +212,53 @@ class FormationEnv3D(ParallelEnv):
     def step(self, actions):
         self.step_count += 1
 
+        # Closing-speed brake (2026-08-14): deterministic action-space safety
+        # layer, not a reward incentive -- five reward-shape attempts (entropy-
+        # recovery budget/timing, r_safety zone reshape, diameter floor, longer
+        # training) all failed to stop collision_rate climbing over training,
+        # and instrumentation (log_std_mean, mean_action_abs) showed why: the
+        # policy wasn't losing exploration noise (log_std barely moved), it was
+        # committing to increasingly large-magnitude actions over training --
+        # a drone closing at high commanded speed has less room to back out of
+        # a close encounter than one making smaller corrections, independent
+        # of how much stochastic noise sits on top. This caps only the CLOSING
+        # component of velocity (the part actually shrinking the gap to a
+        # given other agent), once already inside SAFE_DIST_ENTER -- the
+        # already-documented "urgent backoff" boundary -- ramping linearly to
+        # zero exactly at COLLISION_DIST. Lateral/evasive motion is untouched;
+        # outside SAFE_DIST_ENTER this is a no-op. Reuses only already-derived
+        # constants, no new ones. Uses pre-step positions for every agent
+        # (computed before any position is updated) so this reflects
+        # simultaneous action, not sequential. Doesn't touch the reward --
+        # r_safety's urgent penalty below still applies in full, so the policy
+        # still has every incentive to avoid the zone in the first place; this
+        # is a safety net for once it's already there, not a replacement for
+        # learning to avoid it. brake_reduction (logged via infos) is how much
+        # speed this actually removed, for verifying it's doing something
+        # rather than staying dormant.
+        raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED).astype(np.float32)
+                   for a in self.agents}
+        brake_reduction = {a: 0.0 for a in self.agents}
         for a in self.agents:
-            act = np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED
-            self.vel[a] = act.astype(np.float32)
+            v = raw_vel[a].copy()
+            for b in self.agents:
+                if b == a:
+                    continue
+                diff = self.pos[b] - self.pos[a]
+                d = float(np.linalg.norm(diff))
+                if d < SAFE_DIST_ENTER and d > 1e-6:
+                    dir_to_b = diff / d
+                    v_closing = float(np.dot(v, dir_to_b))
+                    if v_closing > 0:
+                        max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
+                        if v_closing > max_closing:
+                            excess = v_closing - max_closing
+                            v = v - excess * dir_to_b
+                            brake_reduction[a] += excess
+            raw_vel[a] = v.astype(np.float32)
+
+        for a in self.agents:
+            self.vel[a] = raw_vel[a]
             self.pos[a] = (self.pos[a] + self.vel[a] * DT).astype(np.float32)
 
         self.pos_t = (self.pos_t + self._target_dir * self._target_speed * DT).astype(np.float32)
@@ -260,7 +304,8 @@ class FormationEnv3D(ParallelEnv):
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {"min_dist": self._min_dist(a),
-                       "reward_components": reward_components[a]} for a in self.agents}
+                       "reward_components": reward_components[a],
+                       "brake_reduction": brake_reduction[a]} for a in self.agents}
 
         if collision or truncated:
             self.agents = []
