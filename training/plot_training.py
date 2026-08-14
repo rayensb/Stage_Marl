@@ -24,7 +24,7 @@ LOG_PATH = f"logs/training_log_{run_id}.csv" if run_id else "logs/training_log.c
 OUT_PATH = f"logs/training_curves_{run_id}.png" if run_id else "logs/training_curves.png"
 
 df = pd.read_csv(LOG_PATH)
-fig, axes = plt.subplots(7, 2, figsize=(12, 28))
+fig, axes = plt.subplots(8, 2, figsize=(12, 32))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
 axes[0,1].plot(df.total_steps, df.collision_rate, color='red', label='current')
@@ -55,7 +55,25 @@ axes[5,1].plot(df.total_steps, df.ent_coef, color='indigo')
 axes[5,1].set_title("Entropy Coefficient (watch for recovery spikes)")
 axes[6,0].plot(df.total_steps, df.entropy_recovery, color='crimson', drawstyle='steps-post')
 axes[6,0].set_title("Entropy Recovery Active (1=triggered)")
-axes[6,1].axis('off')
+# log_std_mean vs mean_action_abs: distinguishes exploration noise actually
+# shrinking (log_std declining, until it hits LOG_STD_MIN) from the mean
+# action increasingly saturating near tanh's +-1 boundary while log_std stays
+# flat -- see Actor.get_log_std()'s docstring in training/networks.py.
+if "log_std_mean" in df.columns:
+    axes[6,1].plot(df.total_steps, df.log_std_mean, color='darkcyan')
+    axes[6,1].axhline(-2.0, color='red', ls='--', alpha=0.5, label='LOG_STD_MIN floor')
+    axes[6,1].set_title("Mean log_std (watch for pinning at the floor)")
+    axes[6,1].legend(fontsize=7)
+else:
+    axes[6,1].axis('off')
+if "mean_action_abs" in df.columns:
+    axes[7,0].plot(df.total_steps, df.mean_action_abs, color='saddlebrown')
+    axes[7,0].axhline(1.0, color='red', ls='--', alpha=0.5, label='fully saturated')
+    axes[7,0].set_title("Mean |action| (tanh saturation, 0-1)")
+    axes[7,0].legend(fontsize=7)
+else:
+    axes[7,0].axis('off')
+axes[7,1].axis('off')
 
 plt.tight_layout()
 plt.savefig(OUT_PATH, dpi=120)

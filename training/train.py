@@ -199,11 +199,19 @@ def main():
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
         buf.reset()
+        action_abs_sum = 0.0
+        action_count = 0
         for t in range(ROLLOUT_LEN):
             with torch.no_grad():
                 agents_now = env.agents
                 obs_batch = torch.as_tensor(np.stack([obs[a] for a in agents_now])).to(DEVICE)
                 act_batch, logp_batch = actor.get_action(obs_batch)
+                # Mean |action| this rollout -- how close to tanh's +-1
+                # saturation the policy's actual commanded actions sit, as
+                # distinct from log_std (exploration noise around the mean).
+                # See Actor.get_log_std()'s docstring for why both are logged.
+                action_abs_sum += act_batch.abs().sum().item()
+                action_count += act_batch.numel()
                 act_dict = {a: act_batch[i].cpu().numpy() for i, a in enumerate(agents_now)}
                 logp_dict = {a: logp_batch[i].item() for i, a in enumerate(agents_now)}
 
@@ -402,10 +410,14 @@ def main():
                     best_score = current_score
                     save_best_actor(actor, RUN_ID)
 
+            log_std_mean = actor.get_log_std().mean().item()
+            mean_action_abs = action_abs_sum / action_count if action_count > 0 else 0.0
+
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
-                  f"entropy={last_entropy:.2f} kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
+                  f"entropy={last_entropy:.2f} log_std={log_std_mean:.3f} act_abs={mean_action_abs:.3f} "
+                  f"kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
                   f"lr={lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
                   f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
@@ -425,7 +437,8 @@ def main():
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
-                     r_joint=comp_avgs['joint'])
+                     r_joint=comp_avgs['joint'],
+                     log_std_mean=log_std_mean, mean_action_abs=mean_action_abs)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 

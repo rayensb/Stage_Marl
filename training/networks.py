@@ -22,6 +22,18 @@ class Actor(nn.Module):
         std = torch.exp(log_std)
         return mu, std
 
+    def get_log_std(self):
+        """log_std is a single obs-independent nn.Parameter (not a function of
+        state), so this is cheap to call anytime for logging -- added
+        (2026-08-14) to distinguish two different possible causes of the
+        `entropy` metric declining over training: log_std actually still
+        shrinking (exploration noise itself dropping, until it hits
+        LOG_STD_MIN) vs. log_std already pinned at its floor while the mean
+        action increasingly saturates near tanh's +-1 boundary (which also
+        drives -logp more negative via the squashing-Jacobian term, with no
+        further change in log_std at all). Those need different fixes."""
+        return torch.clamp(self.log_std, LOG_STD_MIN, LOG_STD_MAX)
+
     def get_action(self, obs, deterministic=False):
         mu, std = self.forward(obs)
         if deterministic:
