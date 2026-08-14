@@ -248,9 +248,20 @@ def main():
             brake_sum += sum(infos.get(a, {}).get("brake_reduction", 0.0) for a in agents_now)
             for a in AGENTS:
                 ep_rewards[a] += rewards.get(a, 0.0)
-            if env.agents:
-                any_agent = env.agents[0]
-                comps = infos.get(any_agent, {}).get("reward_components", {})
+            # Use infos (populated by env.step() before it internally clears
+            # self.agents on a terminal step), not env.agents (checked here
+            # AFTER step() already returned, so it's empty on exactly the
+            # step that just ended). Bug found 2026-08-14: the old `if
+            # env.agents:` gate meant every episode's terminal step -- the
+            # ONLY step r_collision (-300) is ever nonzero -- never got
+            # accumulated, so the logged r_collision column was silently 0.0
+            # in every rollout of every run so far, 100% of the time.
+            # Training itself was unaffected (buf.store above already has the
+            # real reward), and collision_rate is computed independently from
+            # terms -- this only blinded that one logged component.
+            if infos:
+                any_agent = next(iter(infos))
+                comps = infos[any_agent].get("reward_components", {})
                 for k in COMPONENT_KEYS:
                     ep_components[k] += comps.get(k, 0.0)
             ep_len += 1
