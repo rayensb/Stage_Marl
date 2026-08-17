@@ -27,11 +27,13 @@ df = pd.read_csv(LOG_PATH)
 fig, axes = plt.subplots(8, 2, figsize=(12, 32))
 
 axes[0,0].plot(df.total_steps, df.avg_reward); axes[0,0].set_title("Avg Reward")
-axes[0,1].plot(df.total_steps, df.collision_rate, color='red', label='current')
-axes[0,1].plot(df.total_steps, df.best_collision_rate, color='darkred', ls='--', label='best (checkpointed)')
-axes[0,1].set_title("Collision Rate (should trend -> 0)")
+axes[0,1].plot(df.total_steps, df.collision_rate, color='red', label='collision')
+axes[0,1].plot(df.total_steps, df.best_collision_rate, color='darkred', ls='--', label='best collision (checkpointed)')
+if "target_lost_rate" in df.columns:
+    axes[0,1].plot(df.total_steps, df.target_lost_rate, color='darkorange', label='target lost')
+axes[0,1].set_title("Failure Rates (should trend -> 0)")
 axes[0,1].axhline(0, color='green', ls='--', alpha=0.5)
-axes[0,1].legend(fontsize=7)
+axes[0,1].legend(fontsize=6)
 axes[1,0].plot(df.total_steps, df.avg_min_dist); axes[1,0].set_title("Avg Min Dist")
 axes[1,1].plot(df.total_steps, df.entropy, color='purple')
 axes[1,1].set_title("Entropy (should trend DOWN, not up)")
@@ -42,8 +44,9 @@ axes[2,1].plot(df.total_steps, df.swarm_diameter, color='brown')
 axes[2,1].set_title("Swarm Diameter")
 for k, c in [("r_track","blue"),("r_spread","green"),("r_safety","orange"),
              ("r_cohesion","red"),("r_collision","black"),("r_velocity","gray"),
-             ("r_joint","purple")]:
-    axes[3,0].plot(df.total_steps, df[k], label=k, color=c)
+             ("r_joint","purple"),("r_contact","darkorange")]:
+    if k in df.columns:
+        axes[3,0].plot(df.total_steps, df[k], label=k, color=c)
 axes[3,0].set_title("Reward Components"); axes[3,0].legend(fontsize=7)
 axes[3,1].plot(df.total_steps, df.critic_loss, color='orange'); axes[3,1].set_title("Critic Loss")
 axes[4,0].plot(df.total_steps, df.approx_kl, color='teal'); axes[4,0].set_title("Approx KL (watch for spikes)")

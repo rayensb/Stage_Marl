@@ -60,7 +60,13 @@ def run_episode(env, actors, device, seed, record=False):
     obs, _ = env.reset(seed=seed)
     step = 0
     collided = False
-    track_errors, spacing_stds, diameters, speeds = [], [], [], []
+    target_lost = False
+    # Ground truth (env.pos_t), deliberately NOT the swarm's own tracked
+    # estimate -- this is the objective "how well did it actually do"
+    # measure, independent of what the swarm could or couldn't perceive at
+    # the time (which is what the reward, not the eval metric, is scored
+    # against). See envs/formation_env.py's module docstring.
+    track_errors, spacing_stds, diameters, speeds, confidences = [], [], [], [], []
     min_dist_ever = float("inf")
     trajectory = [] if record else None
 
@@ -83,19 +89,24 @@ def run_episode(env, actors, device, seed, record=False):
             trajectory.append({"target": env.pos_t.copy(), **{a: env.pos[a].copy() for a in AGENTS}})
 
         obs, rewards, terms, truncs, infos = env.step(act_dict)
+        confidences.append(env._track_confidence)
         step += 1
-        collided = any(terms.values())
-        if collided or any(truncs.values()):
+        any_info = next(iter(infos.values()), {})
+        collided = bool(any_info.get("collision", False))
+        target_lost = bool(any_info.get("target_lost", False))
+        if collided or target_lost or any(truncs.values()):
             break
 
     metrics = {
         "collided": collided,
+        "target_lost": target_lost,
         "episode_len": step,
         "min_dist": min_dist_ever,
         "tracking_rmse": float(np.sqrt(np.mean(np.square(track_errors)))) if track_errors else 0.0,
         "avg_spacing_std": float(np.mean(spacing_stds)) if spacing_stds else 0.0,
         "avg_diameter": float(np.mean(diameters)) if diameters else 0.0,
         "avg_speed": float(np.mean(speeds)) if speeds else 0.0,
+        "avg_confidence": float(np.mean(confidences)) if confidences else 0.0,
     }
     return metrics, trajectory
 
@@ -137,17 +148,20 @@ def main():
             print(f"[eval] saved episode 0 trajectory -> {args.save_trajectory}")
 
     collided = np.array([r["collided"] for r in rows], dtype=float)
+    target_lost = np.array([r["target_lost"] for r in rows], dtype=float)
     ep_lens = np.array([r["episode_len"] for r in rows], dtype=float)
     min_dists = np.array([r["min_dist"] for r in rows], dtype=float)
     tracking_rmses = np.array([r["tracking_rmse"] for r in rows], dtype=float)
     spacing_stds = np.array([r["avg_spacing_std"] for r in rows], dtype=float)
     diameters = np.array([r["avg_diameter"] for r in rows], dtype=float)
     speeds = np.array([r["avg_speed"] for r in rows], dtype=float)
+    confidences = np.array([r["avg_confidence"] for r in rows], dtype=float)
 
     summary = {
         "episodes": args.episodes,
-        "success_rate": float(1.0 - collided.mean()),
+        "success_rate": float(1.0 - collided.mean() - target_lost.mean()),
         "collision_rate": float(collided.mean()),
+        "target_lost_rate": float(target_lost.mean()),
         "avg_episode_len": float(ep_lens.mean()),
         "avg_min_dist": float(min_dists.mean()),
         "worst_min_dist": float(min_dists.min()),
@@ -155,6 +169,7 @@ def main():
         "avg_spacing_std": float(spacing_stds.mean()),
         "avg_swarm_diameter": float(diameters.mean()),
         "avg_speed": float(speeds.mean()),
+        "avg_track_confidence": float(confidences.mean()),
     }
 
     print("\n=== Evaluation summary (deterministic, no exploration) ===")

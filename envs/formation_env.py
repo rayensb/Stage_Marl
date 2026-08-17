@@ -29,6 +29,26 @@ true 3D angular separation -- a drone directly above/below a neighbor barely
 registers here. Distance-based terms (r_track, r_safety) still constrain
 vertical separation, so this isn't a safety gap, but it means "spread" is a
 horizontal-angular-distribution objective, not a full 3D geometric one.
+
+VISION-BASED COOPERATIVE TARGET TRACKING (2026-08-14): the target is no
+longer ground-truth telemetry every drone knows regardless of distance. Each
+drone gets a direct reading only when the target is within SENSOR_RANGE
+(omnidirectional -- no heading/FOV-cone state exists in this sim, see
+config.py), shared instantly across the swarm whenever any drone has
+contact, and dead-reckoned (last known position + last known velocity x
+elapsed time) for up to LOST_TIMEOUT_STEPS if no one currently does --
+_update_target_track() computes this once per step and _get_obs/_get_reward
+both read the result, never self.pos_t directly (the one exception:
+_dist_to_target() stays ground-truth on purpose, as a diagnostic-only
+"true_track_err" in infos, to check the estimate against reality -- it is
+NOT used anywhere in the reward or observation). Beyond LOST_TIMEOUT_STEPS
+the episode terminates (target_lost) -- a swarm with no trusted estimate has
+nothing left to learn from, same reasoning as collision termination.
+Deliberately NOT included yet, to keep this one controlled change: UWB-
+realistic (noisy, range-only) neighbor sensing, sensing noise/occlusion for
+the target reading itself, a directional FOV cone, or non-constant-velocity
+target motion -- see config.py's SENSOR_RANGE/LOST_TIMEOUT comments for why
+each is deferred rather than skipped.
 """
 
 import math
@@ -43,10 +63,11 @@ sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 from config import (
     NUM_AGENTS, K_NEIGHBORS, TARGET_DIST, SAFE_DIST_ENTER, SAFE_DIST_EXIT,
     COLLISION_DIST, DIVERGE_DIST, MAX_STEPS, DT, MAX_ACTION_SPEED, REACTION_DIST,
-    OBS_MAX_DIST, OBS_MAX_VEL,
+    OBS_MAX_DIST, OBS_MAX_VEL, OBS_OWN_DIM,
     TRACK_WEIGHT, SAFETY_MAX_BONUS, SAFETY_URGENT_COEF, EDGE_TARGET,
     COHESION_LIMIT, COHESION_WEIGHT, MIN_DIAMETER, DIAMETER_FLOOR_WEIGHT,
     JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
+    SENSOR_RANGE, LOST_TIMEOUT_STEPS, CONTACT_URGENT_COEF, TARGET_LOST_PENALTY,
 )
 
 
@@ -58,7 +79,7 @@ class FormationEnv3D(ParallelEnv):
         self.agents = self.possible_agents[:]
         self.k = min(k_neighbors, num_agents - 1)
 
-        self._obs_dim = 10 + 7 * self.k
+        self._obs_dim = OBS_OWN_DIM + 7 * self.k
         self._act_dim = 3
 
         self.pos, self.vel = {}, {}
@@ -67,6 +88,23 @@ class FormationEnv3D(ParallelEnv):
         self.step_count = 0
         self._current_diameter = 0.0
         self.np_random = np.random.default_rng()
+
+        # Vision-tracking state -- see _update_target_track() and the module
+        # docstring. Defensive zero-init only; _update_target_track() always
+        # runs (from reset()) before any of this is read, and the initial
+        # spawn is constructed to guarantee direct contact at t=0 (spawn
+        # radius's upper bound == SENSOR_RANGE, see config.py), so the
+        # "no contact yet" branch below never actually fires on a fresh env.
+        self._last_known_pos = np.zeros(3, np.float32)
+        self._last_known_vel = np.zeros(3, np.float32)
+        self._track_pos_est = np.zeros(3, np.float32)
+        self._track_vel_est = np.zeros(3, np.float32)
+        self._steps_since_contact = 0
+        self._track_confidence = 0.0
+        self._target_lost = False
+        self._observer_count = 0
+        self._direct_contact = {}
+        self._contact_centroid = None
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
@@ -104,6 +142,13 @@ class FormationEnv3D(ParallelEnv):
 
         self._relock_all()
         self._current_diameter = self.get_swarm_stats()["swarm_diameter"]
+
+        # Spawn radius's upper bound equals SENSOR_RANGE by construction (see
+        # config.py's SENSOR_RANGE comment), so every drone starts in direct
+        # contact -- steps_since_contact resets to 0 here regardless of
+        # whatever it was at the end of the previous episode.
+        self._steps_since_contact = 0
+        self._update_target_track()
 
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {} for a in self.agents}
@@ -209,6 +254,50 @@ class FormationEnv3D(ParallelEnv):
                     locked[x].append(y)
             union(a, b)
 
+    def _update_target_track(self):
+        """Vision-based cooperative target tracking -- see the module
+        docstring. Computes, once per step (using current positions), which
+        drones currently have the target within SENSOR_RANGE, the swarm's
+        shared best estimate of target position/velocity (direct if anyone
+        has contact, dead-reckoned otherwise), how long it's been since
+        anyone last did, and the resulting confidence/target_lost state.
+        Must run after self.pos/self.pos_t are updated for this step (or,
+        from reset(), after the initial spawn) and before _get_obs/
+        _get_reward, which both read the results as instance attributes
+        rather than recomputing them per agent.
+        """
+        self._direct_contact = {
+            a: float(np.linalg.norm(self.pos[a] - self.pos_t)) <= SENSOR_RANGE
+            for a in self.agents
+        }
+        contacts = [a for a in self.agents if self._direct_contact[a]]
+        self._observer_count = len(contacts)
+
+        if contacts:
+            # Every in-contact drone reads the identical true position/
+            # velocity in this noiseless iteration (no per-drone sensing
+            # error modeled yet -- deliberately deferred, see the module
+            # docstring), so "average the observers' readings" is a no-op
+            # today but the structurally correct thing to do once per-drone
+            # noise exists.
+            self._last_known_pos = self.pos_t.copy()
+            self._last_known_vel = (self._target_dir * self._target_speed).astype(np.float32)
+            self._steps_since_contact = 0
+        else:
+            self._steps_since_contact += 1
+
+        self._track_confidence = max(0.0, 1.0 - self._steps_since_contact / LOST_TIMEOUT_STEPS)
+        self._target_lost = self._steps_since_contact > LOST_TIMEOUT_STEPS
+
+        elapsed = self._steps_since_contact * DT
+        self._track_pos_est = (self._last_known_pos + self._last_known_vel * elapsed).astype(np.float32)
+        self._track_vel_est = self._last_known_vel
+
+        self._contact_centroid = (
+            np.mean([self.pos[a] for a in contacts], axis=0).astype(np.float32)
+            if contacts else None
+        )
+
     def step(self, actions):
         self.step_count += 1
 
@@ -262,6 +351,7 @@ class FormationEnv3D(ParallelEnv):
             self.pos[a] = (self.pos[a] + self.vel[a] * DT).astype(np.float32)
 
         self.pos_t = (self.pos_t + self._target_dir * self._target_speed * DT).astype(np.float32)
+        self._update_target_track()
 
         needs_relock = any(
             max((np.linalg.norm(self.pos[a] - self.pos[n]) for n in self.locked[a]), default=0.0)
@@ -300,14 +390,27 @@ class FormationEnv3D(ParallelEnv):
         rewards = {a: reward_tuples[a][0] for a in self.agents}
         reward_components = {a: reward_tuples[a][1] for a in self.agents}
 
-        terminations = {a: bool(collision) for a in self.agents}
+        # target_lost (self._update_target_track() above) is a second real
+        # terminal condition alongside collision -- a swarm with no trusted
+        # target estimate left has nothing to learn from by continuing, same
+        # reasoning as collision termination. Kept as its own info flag (not
+        # folded into "collided") so callers can log/attribute the two
+        # failure modes separately rather than conflating them.
+        terminations = {a: bool(collision or self._target_lost) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {"min_dist": self._min_dist(a),
                        "reward_components": reward_components[a],
-                       "brake_reduction": brake_reduction[a]} for a in self.agents}
+                       "brake_reduction": brake_reduction[a],
+                       "collision": collision,
+                       "target_lost": self._target_lost,
+                       # Ground-truth track error, NOT used by the reward or
+                       # observation (both use the estimate) -- diagnostic
+                       # only, to check how far the estimate-based reward
+                       # ever actually diverges from reality.
+                       "true_track_err": abs(self._dist_to_target(a) - TARGET_DIST)} for a in self.agents}
 
-        if collision or truncated:
+        if collision or truncated or self._target_lost:
             self.agents = []
 
         return obs, rewards, terminations, truncations, infos
@@ -332,15 +435,33 @@ class FormationEnv3D(ParallelEnv):
         }
 
     def _get_obs(self, agent):
-        p, v, t = self.pos[agent], self.vel[agent], self.pos_t
-        rel_t = (t - p) / OBS_MAX_DIST
-        dist_t = self._dist_to_target(agent) / OBS_MAX_DIST
-        target_vel = self._target_dir * self._target_speed
-        rel_target_vel = (target_vel - v) / OBS_MAX_VEL
+        p, v = self.pos[agent], self.vel[agent]
+        # Sourced from the swarm's tracked estimate (_update_target_track()),
+        # never self.pos_t directly -- see the module docstring. Identical
+        # slots/normalization to the old ground-truth version, so this is a
+        # drop-in swap from the network's point of view, not a new feature
+        # per se, except for the estimate being imperfect during a dead-
+        # reckoning coast (never during direct contact, since the estimate
+        # equals ground truth exactly whenever any drone currently has it).
+        rel_t = (self._track_pos_est - p) / OBS_MAX_DIST
+        dist_t = float(np.linalg.norm(self._track_pos_est - p)) / OBS_MAX_DIST
+        rel_target_vel = (self._track_vel_est - v) / OBS_MAX_VEL
+
+        has_contact = 1.0 if self._direct_contact.get(agent, False) else 0.0
+        age_norm = min(1.0, self._steps_since_contact / LOST_TIMEOUT_STEPS)
+        observer_norm = self._observer_count / len(self.possible_agents)
+        if self._contact_centroid is not None:
+            rel_centroid = (self._contact_centroid - p) / OBS_MAX_DIST
+            centroid_valid = 1.0
+        else:
+            rel_centroid = np.zeros(3, np.float32)
+            centroid_valid = 0.0
 
         feats = [v[0] / OBS_MAX_VEL, v[1] / OBS_MAX_VEL, v[2] / OBS_MAX_VEL,
                   rel_t[0], rel_t[1], rel_t[2], dist_t,
-                  rel_target_vel[0], rel_target_vel[1], rel_target_vel[2]]
+                  rel_target_vel[0], rel_target_vel[1], rel_target_vel[2],
+                  has_contact, self._track_confidence, age_norm, observer_norm,
+                  rel_centroid[0], rel_centroid[1], rel_centroid[2], centroid_valid]
 
         neighbors = self.locked[agent]
         for i in range(self.k):
@@ -363,11 +484,21 @@ class FormationEnv3D(ParallelEnv):
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
-        track_err = abs(self._dist_to_target(agent) - TARGET_DIST)
+        # Both computed against the swarm's tracked ESTIMATE, not ground
+        # truth (self.pos_t) -- an agent can only be rewarded for what it
+        # (or the swarm, via shared contact) can actually know. Using ground
+        # truth here while the observation uses the estimate would be
+        # exactly the same class of observation/reward mismatch a supervisor
+        # review caught for r_safety earlier (see config.py's K_NEIGHBORS
+        # comment) -- not repeating that. In this noiseless iteration the
+        # estimate equals ground truth whenever anyone has direct contact,
+        # and is exact dead-reckoning otherwise (constant-velocity target),
+        # so this is numerically a no-op today; it's still the structurally
+        # correct thing to compute once sensing noise exists.
+        track_err = abs(float(np.linalg.norm(p - self._track_pos_est)) - TARGET_DIST)
         r_track = TRACK_WEIGHT * track_err
 
-        target_vel = self._target_dir * self._target_speed
-        r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - target_vel))
+        r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - self._track_vel_est))
 
         r_spread = 0.0
         if len(neighbors) >= 2:
@@ -438,6 +569,20 @@ class FormationEnv3D(ParallelEnv):
 
         r_collision_global = -300.0 if agent_collided else 0.0
 
+        # Contact-loss urgency (2026-08-14, vision-based tracking): ramps 0
+        # (swarm currently has direct contact) -> CONTACT_URGENT_COEF (right
+        # at LOST_TIMEOUT_STEPS, where target_lost termination fires next),
+        # same shape as r_safety's urgent ramp. Identical for every agent --
+        # this is about swarm-wide contact, not individual blame, which is
+        # what makes "someone else regaining contact helps everyone's
+        # reward" a genuinely cooperative signal instead of a per-agent one.
+        # Combined with TARGET_LOST_PENALTY on the terminating step itself,
+        # mirroring the r_safety-ramp + r_collision-terminal two-tier pattern
+        # already validated in this file.
+        r_contact = CONTACT_URGENT_COEF * min(1.0, self._steps_since_contact / LOST_TIMEOUT_STEPS)
+        if self._target_lost:
+            r_contact += TARGET_LOST_PENALTY
+
         # Joint bonus: an ADDITIVE reward composition lets the policy bank
         # "good enough" reward from tracking OR safety alone, which is
         # exactly the two-mode failure eval.py measured -- tight formation
@@ -450,11 +595,12 @@ class FormationEnv3D(ParallelEnv):
         # an isolated addition, not a re-balance of what's already there.
         r_joint = JOINT_BONUS if (track_err < JOINT_TRACK_TOL and all_clear) else 0.0
 
-        total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global + r_velocity + r_joint)
+        total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global
+                      + r_velocity + r_joint + r_contact)
         components = {
             "track": float(r_track), "spread": float(r_spread),
             "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
-            "joint": float(r_joint),
+            "joint": float(r_joint), "contact": float(r_contact),
         }
         return total, components

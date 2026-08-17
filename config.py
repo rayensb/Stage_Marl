@@ -34,7 +34,16 @@ K_NEIGHBORS = NUM_AGENTS - 1
 # gives the env k=1 while the network would still expect k=2 -- a shape
 # mismatch that only surfaces once anyone actually tries fewer agents.
 EFFECTIVE_K = min(K_NEIGHBORS, NUM_AGENTS - 1)
-OBS_DIM = 10 + 7 * EFFECTIVE_K
+# Own-state block grew 10 -> 18 with vision-based tracking (2026-08-14): own
+# velocity (3), relative position/distance/velocity to the current best
+# target estimate (3+1+3=7, same slots as before but now sourced from the
+# track rather than ground truth), has_direct_contact (1), track confidence
+# (1), track age normalized by LOST_TIMEOUT (1), observer_count normalized
+# by NUM_AGENTS (1), relative direction to the centroid of currently
+# in-contact teammates (3), centroid_valid (1) -- see _get_obs() in
+# envs/formation_env.py for the exact layout.
+OBS_OWN_DIM = 18
+OBS_DIM = OBS_OWN_DIM + 7 * EFFECTIVE_K
 ACT_DIM = 3
 
 COLLISION_DIST   = 4.20     # hard physical clearance radius (rotor/frame safety)
@@ -175,3 +184,53 @@ JOINT_BONUS     = 3.0
 # trade-off after collision avoidance is solid at full agent count, not
 # before. Env-var overridable for further sweeps.
 VELOCITY_WEIGHT = float(os.environ.get("VELOCITY_WEIGHT", -0.15))
+
+# Vision-based cooperative target tracking (2026-08-14) -- replaces the old
+# ground-truth target telemetry (every drone knew the target's exact
+# position/velocity every step, no matter how far away) with a scenario
+# where each drone must have the target within an omnidirectional,
+# range-limited sensor to get a direct reading, shares that reading with the
+# swarm, and falls back to short-term dead-reckoning (then eventual mission
+# failure) if no one currently has contact. See envs/formation_env.py for
+# the mechanism; these are just the tunable/derived constants.
+#
+# SENSOR_RANGE reuses the exact spawn-radius formula from reset()
+# (TARGET_DIST + 2*REACTION_DIST) rather than inventing a new number --
+# drones start each episode at the edge of sensor range by construction (a
+# "just detected it, closing in" narrative), and if tracking stays near
+# TARGET_DIST they remain comfortably inside it. N-dependent, like
+# TARGET_DIST itself.
+SENSOR_RANGE = TARGET_DIST + 2 * REACTION_DIST
+
+# 2 seconds, per explicit design discussion -- worth being honest about what
+# this does and doesn't protect against in the current sim: the target moves
+# at constant velocity for the whole episode (fixed direction/speed at
+# reset, never updated), so dead-reckoning from a last-known reading is
+# mathematically exact here, not an approximation. This timeout isn't
+# currently protecting against real estimate drift -- it's the honest
+# engineering assumption (real systems don't trust dead-reckoning forever,
+# regardless of whether this particular target happens to cooperate), and it
+# sets the mechanism up correctly for when target motion is made less
+# trivial later (occasional direction/speed changes mid-episode -- a natural
+# next step, not attempted here).
+LOST_TIMEOUT_SEC   = 2.0
+LOST_TIMEOUT_STEPS = int(LOST_TIMEOUT_SEC / DT)   # = 40 at DT=0.05
+
+# Ramps 0 (swarm just lost contact) -> CONTACT_URGENT_COEF (right at the
+# LOST_TIMEOUT_STEPS boundary, where target_lost termination fires) --
+# same shape as SAFETY_URGENT_COEF's ramp toward COLLISION_DIST, reusing an
+# already-validated idiom rather than inventing a new penalty shape. Applies
+# identically to every agent (it's about swarm-wide contact, not individual
+# blame), which is what makes "someone else regaining contact helps
+# everyone's reward" a genuinely cooperative signal rather than a per-agent
+# one. Starting guess at the same order of magnitude as SAFETY_URGENT_COEF,
+# not derived -- first thing to retune if this doesn't move the needle.
+CONTACT_URGENT_COEF = -30.0
+
+# Terminal penalty on the step target_lost fires, same idea as
+# r_collision_global's -300 -- smaller magnitude than collision on purpose:
+# both are mission failures, but a real drone-drone collision risks hardware
+# damage in a way that losing visual on a target (recoverable in principle,
+# e.g. by returning to base) doesn't, so collision should stay the higher
+# priority if the two ever trade off against each other. Starting guess.
+TARGET_LOST_PENALTY = -200.0

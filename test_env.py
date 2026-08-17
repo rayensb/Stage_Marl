@@ -11,9 +11,12 @@ for step in range(200):
     obs, rewards, terms, truncs, infos = env.step(actions)
     if step % 20 == 0:
         min_d = min(infos[a]["min_dist"] for a in env.agents)
-        print(f"step={step} min_dist={min_d:.2f} rew_d1={rewards.get('drone1', 0):.2f}")
+        any_a = next(iter(infos))
+        print(f"step={step} min_dist={min_d:.2f} rew_d1={rewards.get('drone1', 0):.2f} "
+              f"contact={infos[any_a].get('target_lost', '?')==False} conf={env._track_confidence:.2f}")
     if not env.agents:
-        print("ended at", step, "terms:", terms)
+        any_a = next(iter(infos))
+        print("ended at", step, "terms:", terms, "target_lost:", infos[any_a]["target_lost"])
         break
 else:
     print("reached max steps OK")

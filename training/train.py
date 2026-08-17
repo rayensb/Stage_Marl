@@ -136,7 +136,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint"]
+COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -173,6 +173,7 @@ def main():
 
     recent_rewards = deque(maxlen=50)
     recent_collisions = deque(maxlen=50)
+    recent_target_lost = deque(maxlen=50)
     recent_min_dist = deque(maxlen=50)
     recent_ep_len = deque(maxlen=50)
     recent_mean_pw = deque(maxlen=50)
@@ -194,7 +195,7 @@ def main():
     # together so tracking quality (comp_avgs['track'], less negative is
     # better) breaks ties within that group -- a genuinely safer policy
     # still always wins outright on the primary criterion.
-    best_score = (float("inf"), float("inf"))
+    best_score = (float("inf"), float("inf"), float("inf"))
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
@@ -222,9 +223,19 @@ def main():
 
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
             done = any(terms.values()) or any(truncs.values())
-            collided = any(terms.values())
+            # any(terms.values()) is true for EITHER a real collision or a
+            # target_lost failure (both are real terminal states, see
+            # formation_env.py) -- correct for the bootstrap-skip decision
+            # below (neither should be bootstrapped, same as before), but
+            # NOT the same thing as "collided" for metrics purposes. Read
+            # the two apart explicitly via infos so collision_rate doesn't
+            # silently start counting target_lost episodes as collisions.
+            real_terminal = any(terms.values())
+            any_info = next(iter(infos.values()), {})
+            collided = bool(any_info.get("collision", False))
+            target_lost_now = bool(any_info.get("target_lost", False))
 
-            if done and not collided:
+            if done and not real_terminal:
                 # Time-limit cutoff, not a true terminal state -- fold the
                 # critic's estimate of the actual next observation into this
                 # transition's reward so GAE doesn't treat "ran out of steps"
@@ -274,6 +285,7 @@ def main():
 
                 recent_rewards.append(np.mean(list(ep_rewards.values())) / max(ep_len, 1))
                 recent_collisions.append(1.0 if collided else 0.0)
+                recent_target_lost.append(1.0 if target_lost_now else 0.0)
                 recent_min_dist.append(min_d)
                 recent_ep_len.append(ep_len)
                 recent_mean_pw.append(swarm["mean_pairwise"])
@@ -301,6 +313,7 @@ def main():
             last_value_dict = {a: last_values[agent_idx[a]].item() for a in AGENTS}
 
         collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
+        target_lost_rate = float(np.mean(recent_target_lost)) if recent_target_lost else 0.0
 
         # Best-checkpoint tracking and entropy recovery share this signal:
         # only judge once the rolling window has real episodes in it, and
@@ -425,7 +438,13 @@ def main():
                           for k in COMPONENT_KEYS}
 
             if recent_collisions:
-                current_score = (round(collision_rate, 2), -comp_avgs['track'])
+                # Extended (2026-08-14) with target_lost_rate as a second
+                # safety-tier criterion, between collision_rate and the
+                # track tie-breaker -- a checkpoint that's collision-free but
+                # frequently loses the target isn't actually the best one,
+                # same lexicographic-safety-first reasoning as collision_rate
+                # itself (see the original comment below/DECISIONS.md).
+                current_score = (round(collision_rate, 2), round(target_lost_rate, 2), -comp_avgs['track'])
                 if current_score < best_score:
                     best_score = current_score
                     save_best_actor(actor, RUN_ID)
@@ -436,6 +455,7 @@ def main():
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
+                  f"lost_rate={target_lost_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} log_std={log_std_mean:.3f} act_abs={mean_action_abs:.3f} "
                   f"brake={mean_brake_reduction:.4f} "
@@ -445,10 +465,11 @@ def main():
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f} "
-                  f"joint={comp_avgs['joint']:.1f}]")
+                  f"joint={comp_avgs['joint']:.1f} contact={comp_avgs['contact']:.1f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
-                     collision_rate=collision_rate, avg_min_dist=avg_min_dist,
+                     collision_rate=collision_rate, target_lost_rate=target_lost_rate,
+                     avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
                      approx_kl=last_approx_kl, clip_frac=last_clip_frac, early_stop_kl=int(stop_early),
@@ -459,7 +480,7 @@ def main():
                      r_track=comp_avgs['track'], r_spread=comp_avgs['spread'],
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
-                     r_joint=comp_avgs['joint'],
+                     r_joint=comp_avgs['joint'], r_contact=comp_avgs['contact'],
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
                      mean_brake_reduction=mean_brake_reduction)
 

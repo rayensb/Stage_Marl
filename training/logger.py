@@ -2,12 +2,12 @@ import os
 import csv
 
 LOG_PATH = "logs/training_log.csv"
-FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate",
+FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate", "target_lost_rate",
           "avg_min_dist", "avg_ep_len", "entropy", "actor_loss", "critic_loss",
           "approx_kl", "clip_frac", "early_stop_kl", "steps_per_sec", "collect_steps_per_sec",
           "ent_coef", "entropy_recovery", "best_collision_rate",
           "mean_pairwise", "std_pairwise", "swarm_diameter",
-          "r_track", "r_spread", "r_safety", "r_cohesion", "r_collision", "r_velocity", "r_joint",
+          "r_track", "r_spread", "r_safety", "r_cohesion", "r_collision", "r_velocity", "r_joint", "r_contact",
           "log_std_mean", "mean_action_abs", "mean_brake_reduction"]
 
 def init_logger(run_id=""):
