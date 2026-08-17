@@ -185,3 +185,89 @@ reasoning): it exists to fix a spawn-time artifact, not as an in-episode collisi
 mechanism — collision avoidance during the episode is the policy's job via the safety
 reward term, and having the simulator silently teleport/adjust agents mid-episode to resolve
 overlaps would undermine training the policy to avoid the situation in the first place.
+
+## Closing-speed brake: a deterministic action-space safety layer, not another reward term
+
+**Decision**: cap the *closing* component of an agent's commanded velocity (the part actually
+shrinking the gap to a specific other agent) once already inside `SAFE_DIST_ENTER`, ramping
+linearly to zero exactly at `COLLISION_DIST`. Lives in `envs/formation_env.py:step()`, applied
+to every agent-pair using pre-step positions (so it reflects simultaneous action). Doesn't
+touch the reward at all.
+**Rejected alternatives, with data (see `EXPERIMENT_LOG.md` for full numbers)**: raising
+`RECOVERY_MAX_TRIGGERS` 5→20 (falsified — entropy barely moved despite far more frequent
+boosts), reshaping `r_safety`'s bonus zone to peak at `EDGE_TARGET` (falsified — 40% collision
+rate, no better than before), adding a diameter floor (insufficient — engaged but overwhelmed
+by `r_track`'s pull). **Six consecutive reward-shape/schedule interventions failed** across
+commits `78e1feb` through `67ccfd7` before this.
+**Why a structural change instead of another reward guess**: instrumentation
+(`log_std_mean`/`mean_action_abs`, see `EXPERIMENT_LOG.md`) showed the actual driver of the
+collision-rate collapse was never entropy/exploration-noise collapsing — `log_std` stayed
+nowhere near its floor. The policy was learning to commit to larger-magnitude actions over
+training, and a drone closing at high commanded speed has less room to recover from a close
+encounter than one making smaller corrections, regardless of how much stochastic noise sits on
+top. No amount of reward shaping had addressed *that* variable, because none of the prior
+fixes had ever measured it. This also matches an independent recommendation from a supervisor
+review earlier in the project's history ("I strongly prefer a learned nominal controller +
+deterministic safety layer... rather than expecting PPO to discover collision avoidance purely
+from a `-300` reward").
+**Result**: `collision_rate=0.000` across every seed/duration tested since (6/6 configurations
+at exactly 0%, later 8/9 across 3M-step 3-seed replication, one isolated exception below).
+**Known limitation, found later, not swept under the rug**: the no-crossing property was
+proven algebraically for two agents at a time (given the current constants, the worst-case
+per-step gap reduction is a fixed fraction of the remaining gap, never reaching zero in finite
+steps) — it was never separately proven for an agent braking against two simultaneous threats
+from different directions. A 3M-step run produced exactly one isolated collision event (and a
+separate 1/100 eval-episode reading elsewhere), consistent with this gap, not a regression.
+See `KNOWN_ISSUES.md`.
+
+## Vision-based cooperative target tracking, replacing ground-truth telemetry
+
+**Decision**: every drone previously received the target's exact position/velocity every
+step, regardless of distance — flagged from the start (`docs/ai_context`'s original writeup)
+as a deliberate but unexamined simplification. Replaced with a sensing model: each drone gets
+a direct reading only when the target is within `SENSOR_RANGE`; the swarm shares any drone's
+current reading instantly; if nobody currently has contact, the swarm dead-reckons from the
+last known position/velocity for up to `LOST_TIMEOUT_STEPS` (2s), after which the episode
+terminates (`target_lost`) — a second real mission-failure mode alongside collision.
+**Why omnidirectional range-limited, not a directional FOV cone**: the simulation has no
+heading/orientation state anywhere — drones are point masses with position and velocity only.
+A true camera-FOV cone needs heading added as a new state dimension (plus how it's actuated),
+a materially bigger change. An omnidirectional multi-camera rig is a realistic enough
+approximation for a small quadrotor and was the explicitly scoped-down choice for this pass.
+**Why `SENSOR_RANGE = TARGET_DIST + 2*REACTION_DIST`**: reuses the *exact* formula the env
+already uses for initial spawn radius (`reset()`), rather than inventing a new constant —
+drones start every episode in direct contact by construction (spawn distance's upper bound
+equals `SENSOR_RANGE`), a "just detected it, closing in" narrative for free.
+**Why UWB-realistic neighbor sensing was explicitly deferred, not bundled in**: UWB is the
+right technology for *inter-drone* sensing (works without GPS or line-of-sight — the
+presumed real scenario is GPS-denied), but gives clean range, not clean bearing or velocity —
+modeling that honestly would touch the neighbor observation too, on top of everything already
+changing for the target. Given a fresh, sharp lesson this session about bundling too many
+changes into one untested commit, this was deliberately scoped out as a separate, future
+design pass.
+**Why `r_track`/`r_velocity` score against the tracked estimate, not `self.pos_t` directly**:
+using ground truth in the reward while the observation uses the estimate would reproduce
+exactly the observation/reward mismatch class a supervisor review already caught once for
+`r_safety` (see the `K_NEIGHBORS = NUM_AGENTS - 1` decision above) — not repeating it here.
+`_dist_to_target()` (ground truth) is kept only as a diagnostic (`true_track_err` in `infos`,
+and `evaluate.py`'s `tracking_rmse`, which is deliberately ground-truth-based since evaluation
+should measure objective performance, not what the policy could excuse itself for not
+knowing) — never fed into the reward or observation.
+**Why the diameter floor (added in the collision-fix chain above) was disabled, not
+recalibrated**: it was built to stop dangerous tight convergence *before the brake existed*.
+With the brake handling that deterministically and independent of diameter, the floor was
+found to be actively counterproductive for the new task — pulling the swarm's diameter up
+toward/above `MIN_DIAMETER=10` geometrically implies a larger individual radius from the
+target for evenly-spaced agents, pushing drones past `SENSOR_RANGE` more than necessary.
+Measured: disabling it (`DIAMETER_FLOOR_WEIGHT` 1.0→0.0, not deleted) roughly halved
+`target_lost_rate` (31-40%→18-14% at matched 600k steps) with no tracking regression. See
+`EXPERIMENT_LOG.md` for the full before/after data.
+**Result** (3-seed, 3M steps, no diameter floor): 0-3% `target_lost_rate`, 0-1%
+`collision_rate` (the same rare brake edge case, not new), best tracking accuracy seen all
+session (1.52-2.99 RMSE). Merged to `main` (`b59c139`).
+**Deliberately deferred beyond this change** (not attempted, not forgotten): sensing
+noise/occlusion on the target reading itself, a directional FOV cone (needs heading), and
+non-constant-velocity target motion (the 2s dead-reckoning grace period is currently
+*mathematically exact*, not an approximation, since the target moves at constant velocity for
+the whole episode — this only becomes a real approximation once target motion is made less
+trivial, which is itself a natural next step, not yet taken).

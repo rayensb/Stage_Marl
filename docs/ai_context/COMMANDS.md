@@ -48,6 +48,14 @@ sandbox):
 DEVICE=cuda SEED=1 python training/train.py
 ```
 
+Longer training run (`TOTAL_STEPS` env var, added 2026-08-17 — default `600_000`; this
+session validated up to `3_000_000` for the vision-tracking system, where it made a real
+difference — see `EXPERIMENT_LOG.md`):
+
+```bash
+TOTAL_STEPS=3000000 NUM_AGENTS=3 SEED=1 python training/train.py
+```
+
 Parallel multi-seed runs (the pattern used on Kaggle — run from separate processes/sessions,
 each with its own `SEED`, pinning single-threaded math libs to avoid CPU contention):
 
@@ -84,11 +92,31 @@ prefix) — pass the run explicitly if not relying on env vars:
 python training/plot_training.py n3_1
 ```
 
-Produces a 7x2 diagnostic subplot grid (collision rate w/ best-collision-rate overlay,
-entropy, pairwise distance, swarm diameter, reward components, critic loss, approx KL, clip
-fraction, throughput, entropy coefficient, entropy-recovery activity). Exact output
-path/display behavior: check `training/plot_training.py` directly (not re-verified line-by-
-line in this doc — UNVERIFIED whether it saves to a file or only displays interactively).
+Produces an **8x2** diagnostic subplot grid (grew from 7x2 on 2026-08-17): collision rate +
+target_lost rate overlay (was collision-only), entropy, pairwise distance, swarm diameter,
+reward components (now 8, includes `r_contact`), critic loss, approx KL, clip fraction,
+throughput, entropy coefficient, entropy-recovery activity, `log_std_mean`, `mean_action_abs`,
+and the closing-speed brake's mean speed removed. Saves to
+`logs/training_curves[_<run_id>].png` (confirmed — `plt.savefig`, not just interactive
+display).
+
+## Kaggle runs, driven from this machine via the API
+
+See `ENVIRONMENT.md` for the `~/.kaggle-venv` setup. The pattern used throughout the
+2026-08-17 session: write `verify.py` (clones the repo, optionally a specific branch via
+`git clone --branch <name>`, installs `pettingzoo`/`gymnasium`, runs train → evaluate (final)
+→ evaluate `--best` → plot) plus a matching `kernel-metadata.json`
+(`kernel_type: "script"`, `enable_internet: true`, `enable_gpu: false`), then:
+
+```bash
+~/.kaggle-venv/bin/kaggle kernels push -p <dir-containing-verify.py-and-metadata>
+~/.kaggle-venv/bin/kaggle kernels status <ref-from-push-output>
+~/.kaggle-venv/bin/kaggle kernels output <ref> -p <download-dir>
+```
+
+Multiple seeds/configs can run as separate kernels in parallel (each is an independent Kaggle
+session — no `OMP_NUM_THREADS`-style contention between separate kernels the way there is
+between `subprocess.Popen`-launched processes *within* one kernel).
 
 ## Evaluate a trained model (deterministic rollout)
 

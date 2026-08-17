@@ -5,9 +5,13 @@ project across sessions. **The actual code in the repo root is the source of tru
 documents explain, contextualize, and preserve reasoning that isn't visible from the code
 alone (why a value is what it is, what was tried and rejected, what's still open).
 
-Written 2026-08-14, reflecting commit `b14fe48` on `main`. If the repo has moved on
-significantly since then, treat anything here that contradicts the current code as stale —
-the code wins, and the discrepancy is worth noting back into `KNOWN_ISSUES.md` or `CURRENT_STATE.md`.
+Written 2026-08-14, reflecting commit `b14fe48` on `main`; substantially updated 2026-08-17
+to reflect commit `b59c139` — a session that solved the collision problem (a deterministic
+action-space safety layer, not reward shaping) and separately replaced ground-truth target
+sensing with a vision-based cooperative tracking system, both validated at `NUM_AGENTS=3`.
+If the repo has moved on significantly since then, treat anything here that contradicts the
+current code as stale — the code wins, and the discrepancy is worth noting back into
+`KNOWN_ISSUES.md` or `CURRENT_STATE.md`.
 
 ## Read order for a new session
 

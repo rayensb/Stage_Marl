@@ -1,36 +1,23 @@
 # Known Issues
 
-Open problems as of commit `b14fe48`, 2026-08-14. For issues that were investigated and
-resolved, see `EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues).
+Open problems as of commit `b59c139`, 2026-08-17 (vision-tracking merged to `main`). For
+issues that were investigated and resolved, see `EXPERIMENT_LOG.md` (they're experiments with
+a conclusion, not open issues).
 
-## 1. Collision-rate collapse recurs late in training -- CONFIRMED, root cause identified
+## 1. [RESOLVED] Collision-rate collapse recurred late in training
 
-**Status update (2026-08-14, this session)**: the `a40db9b`..`63274b1` reward/stability chain
-did **not** fix the collapse. Confirmed against a completed `NUM_AGENTS=3`, 3-seed run
-(`eval_n3_*.csv` / `eval_best_n3_*.csv` / `training_log_n3_*.csv`, all local in `~/Downloads/`
-at the time of this analysis) -- all 3 seeds show the identical pattern: `collision_rate`
-drops near 0 by ~step 100-150k, stays low through ~step 220-250k, then climbs back to
-**26-46%** by `TOTAL_STEPS=600k` on the final model. `--best` checkpoints (saved mid-run,
-during the good window) stay at 2-8% collision_rate, at the cost of ~1.8x worse
-`tracking_rmse` and ~25% larger `swarm_diameter` -- confirming the underlying policy the run
-finds is fine, it just isn't preserved past the point it started degrading.
-
-**Root cause (verified, not hypothesis)**: `RECOVERY_MAX_TRIGGERS=5` was exhausted in every
-seed by rollout ~110-125 (`5 * (RECOVERY_PATIENCE=15 + RECOVERY_COOLDOWN=10)` = 125 rollouts
-= ~step 220-250k at `ROLLOUT_LEN=2048`) -- matching exactly where each seed's
-`entropy_coefficient` plot stops showing recovery spikes and collision_rate starts climbing.
-For the remaining ~60% of the 600k-step run, entropy anneals unprotected toward its floor,
-the policy converges harder onto the tight target formation (see `config.py`'s `TARGET_DIST`
-comment on the razor-thin safety margin at the mathematical optimum), and safety erodes.
-**Fix applied this session**: `RECOVERY_MAX_TRIGGERS` raised 5 -> 20 in `training/train.py`
-(see the inline comment there for the full derivation) -- gives ~500 rollouts of recovery
-budget, comfortably more than the ~293 rollouts in a full run, so the cap stops binding
-before `TOTAL_STEPS` is reached.
-**Still needed**: this fix is itself unverified against a completed run -- the next
-single-seed `NUM_AGENTS=3` run (before spending a 3-seed `NUM_AGENTS=4` Kaggle batch on it)
-should confirm `collision_rate` no longer relapses in the back half of training. The pending
-`NUM_AGENTS=4`, 3-seed Kaggle run referenced in earlier versions of this doc was deliberately
-**not** launched on the pre-fix code -- see `SESSION_HANDOFF.md`.
+**Resolved 2026-08-17.** This item went through several wrong diagnoses before the real one:
+`RECOVERY_MAX_TRIGGERS` raised 5→20 (falsified — entropy barely moved), `r_safety`'s bonus
+zone reshaped to peak at `EDGE_TARGET` (falsified — no better), a diameter floor added
+(insufficient — engaged but overwhelmed). Direct instrumentation (`log_std_mean` vs.
+`mean_action_abs`) finally showed the real driver: the policy was learning to commit to
+larger-magnitude actions over training, not losing exploration noise — `log_std` never
+approached its floor in any of these runs. The actual fix was a **deterministic action-space
+safety layer** (the closing-speed brake, `envs/formation_env.py:step()`), not a reward change
+at all — see `DECISIONS.md` and `EXPERIMENT_LOG.md` for the full chain and data.
+**Current status**: `collision_rate=0.000` across 6/6 tested configurations at the time the
+brake landed, and 8/9 across a later 3-seed, 3M-step replication (one isolated exception, see
+item 8 below). Not revisited further as an open issue — see item 8 for the one known caveat.
 
 ## 2. `readme.txt` is stale and describes a removed architecture
 
@@ -38,8 +25,10 @@ should confirm `collision_rate` no longer relapses in the back half of training.
 (`models/actor_droneN[_SEED].pt`) that no longer exists — `train.py` saves one shared file.
 It's silent on the shared-actor architecture, best-checkpoint tracking, entropy recovery,
 `evaluate.py --best`, several env vars (`NUM_AGENTS`, `N_REACT`, `VELOCITY_WEIGHT`, `SEED`,
-`DEVICE`), and the more recent training-loop fixes (gradient clipping, per-agent-involved
-collision attribution, per-minibatch KL early stop).
+`DEVICE`, and now `TOTAL_STEPS`), and every fix/feature from this session: the closing-speed
+brake, vision-based cooperative target tracking (`SENSOR_RANGE`/`LOST_TIMEOUT`/confidence
+tracking), `target_lost` as a second failure mode, and the `r_collision` logging fix. Gap has
+only grown since this item was first written.
 **Cause**: normal doc drift — the file wasn't updated as the architecture evolved from
 per-drone actors to a shared actor.
 **Status**: confirmed, not fixed (out of scope for the documentation task that created this
@@ -101,3 +90,57 @@ measured-optimal default anyway (see `DECISIONS.md`). Documented so a future ses
 waste time debugging what looks like a CUDA failure but is just this machine's driver.
 **Impact**: no local run can validate GPU-path behavior specifically, if that ever becomes
 relevant (e.g. if the network grows enough that CUDA becomes faster again).
+
+## 8. Closing-speed brake's no-crossing property is unproven for simultaneous multi-threat braking
+
+**Symptom**: the brake's algebraic no-crossing guarantee (worst-case per-step gap reduction is
+a fixed fraction of the remaining gap, never reaching `COLLISION_DIST` in finite steps) was
+derived for two agents at a time. It was never separately proven for an agent braking against
+two or more simultaneous threats from different directions — the per-pair velocity correction
+is applied sequentially in `step()`, and the combined effect in that case isn't covered by the
+same proof.
+**Status**: not hypothetical — a 3-seed, 3M-step `NUM_AGENTS=3` run produced exactly one
+isolated collision event during training (of ~586 rollouts) and a separate 1/100 eval-episode
+collision reading (a different seed's best checkpoint). Rate is low (~1%), consistent with a
+rare edge case, not a systemic failure — every other tested configuration (8/9 total) showed
+exactly 0%.
+**Next step, if this matters more at higher `NUM_AGENTS`**: work out (or empirically stress-
+test) the simultaneous-multi-threat case specifically — more agents means more opportunities
+for one drone to be braking against two neighbors at once, so this is worth re-checking before
+trusting the brake's guarantee as tightly at `NUM_AGENTS=4` as it's held at `NUM_AGENTS=3`.
+
+## 9. Target motion is still constant-velocity, so the vision-tracking dead-reckoning grace period is currently exact, not approximate
+
+**Symptom**: `_target_dir`/`_target_speed` are sampled once in `reset()` and never updated —
+the target moves in a straight line at constant speed for the whole episode. This means the
+2-second dead-reckoning grace period (`LOST_TIMEOUT_STEPS`, see `config.py`) is currently
+mathematically *exact* whenever it's used, not a real approximation of an uncertain estimate.
+**Status**: not a bug — a deliberate, explicitly-flagged scope decision (see `DECISIONS.md`'s
+vision-tracking entry) made to keep that one change controlled. Documented here so a future
+session doesn't mistake "the dead-reckoning grace period isn't really being tested" for "the
+mechanism doesn't work" — it works, it just hasn't been tested under real estimate
+uncertainty yet.
+**Next step**: making the target occasionally change direction/speed mid-episode is the
+natural follow-up — it would make the grace period's confidence-decay behavior actually
+matter, and is a good candidate for the next controlled, single-variable test in this area.
+
+## 10. UWB-realistic neighbor sensing still deferred
+
+**Symptom**: neighbor observations (`rel_p`, `rel_v`, `d` to locked neighbors in `_get_obs`)
+are still exact ground truth, unlike the target, which now goes through the vision-tracking
+system. `DECISIONS.md` explains why this was deliberately scoped out of the vision-tracking
+change rather than bundled in.
+**Status**: not started. Real UWB gives clean range, not clean bearing/velocity — this would
+be a comparably-sized design change to the vision-tracking one, deserving its own careful pass
+(sensing model, what's observable, how it interacts with the existing mutual-k-NN neighbor
+lock graph) rather than a quick patch.
+
+## 11. Sensing noise, occlusion, and a directional FOV cone are all still deferred
+
+**Symptom**: the vision-tracking system's target reading is noiseless whenever a drone is in
+range (exact ground truth), has no occlusion model (a drone directly between another drone and
+the target doesn't block detection), and detection is omnidirectional (no heading state exists
+in this sim to support a directional camera cone).
+**Status**: explicitly out of scope for the change that added vision-tracking, not forgotten —
+see `DECISIONS.md`. A FOV cone specifically requires adding heading/orientation as a new state
+dimension first, which is a bigger prerequisite change than the other two.

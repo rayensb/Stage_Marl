@@ -6,50 +6,62 @@ speculative scope, not committed work.
 
 ## Critical
 
-- **Commit and push the `RECOVERY_MAX_TRIGGERS` fix** (`training/train.py`, 5 → 20) — applied
-  locally 2026-08-14, not yet confirmed committed/pushed. See `SESSION_HANDOFF.md`.
-- **Verify the fix with a single-seed `NUM_AGENTS=3` rerun** before launching the prepared
-  `NUM_AGENTS=4`, 3-seed Kaggle run — confirm `collision_rate` doesn't relapse past rollout
-  ~125 (where the old 5-trigger budget used to run out). See `KNOWN_ISSUES.md` item 1 and
-  `EXPERIMENT_LOG.md` for the full diagnosis this fix is based on.
-- **Once verified, launch the `NUM_AGENTS=4`, 3-seed Kaggle run** (launcher script already
-  reviewed and structurally confirmed correct this session) — deliberately deferred, not
-  abandoned. This validates the full fix chain at the actual target agent count.
-- **Confirm `test_env.py` still passes after the `a40db9b`..`63274b1` commit chain.** Simple,
-  fast, and hasn't been confirmed re-run since those commits per this session's information.
+- **Run `NUM_AGENTS=4`, 3-seed validation on the current `main` (`b59c139` or later).** This
+  is the actual target agent count and the whole reason the collision and tracking problems
+  needed solving. Both problems are now resolved and validated at `NUM_AGENTS=3` — this is
+  the first time in the project's history that an N=4 run would be testing something
+  genuinely ready, rather than a known-broken baseline. Use the same launcher pattern
+  (parallel per-seed Kaggle kernels) established throughout this session — see `COMMANDS.md`.
+- **Specifically check the closing-speed brake's rare multi-agent collision edge case at
+  N=4.** ~1% collision rate showed up at `NUM_AGENTS=3` over long/replicated runs, consistent
+  with a known gap in the brake's proof (verified for two agents at a time, not simultaneous
+  multi-threat braking). More agents means more chances for this — worth explicit attention,
+  not just a passive check of the aggregate `collision_rate` number.
 
 ## High
 
+- **Update or replace `readme.txt`** — more stale than ever after this session (see
+  `KNOWN_ISSUES.md` item 2).
+- **Fix `envs/formation_env.py`'s remaining stale docstring paragraph** (the old "4-agent
+  study, not general-N" SCOPE note — contradicted by `config.py`'s actual generalized
+  `_PACKING_RATIO` since before this session). A new, accurate docstring paragraph was added
+  for vision-tracking without touching this pre-existing one.
 - **Reconcile reward-component logging scale change** (`63274b1`'s per-step vs. per-episode-
-  sum switch, see `KNOWN_ISSUES.md` item 3) before doing any cross-run comparison of
-  `r_track`/`r_safety`/etc. magnitudes between pre- and post-`63274b1` logs.
-- **Update or replace `readme.txt`** (see `KNOWN_ISSUES.md` item 2) — it currently describes
-  a removed per-drone-file architecture and will mislead anyone who reads it instead of
-  `docs/ai_context/`.
-- **Fix `envs/formation_env.py`'s stale module docstring** — claims `TARGET_DIST` is "not a
-  general-N formula" / "a 4-agent study," but `config.py` has generalized it to
-  `NUM_AGENTS ∈ {2,3,4}` since commit `2576f92`. Found 2026-08-14, not yet fixed.
-
-~~Properly analyze the `NUM_AGENTS=3` evaluation CSVs~~ — **done 2026-08-14**, full 3-seed
-analysis in `EXPERIMENT_LOG.md`, root cause identified and fixed (see Critical, above).
+  sum switch) before comparing `r_track`/`r_safety`/etc. magnitudes between logs from before
+  and after that commit — still relevant for anyone comparing very old logs to current ones.
 
 ## Medium
 
-- Once `NUM_AGENTS=4` results are in, decide whether the curriculum is "done" (2→3→4 all
-  validated) or whether another iteration of reward tuning is needed at N=4 specifically —
-  the previous conflicts (relock loophole, cohesion/safety collapse) were all discovered at
-  higher agent counts, so N=4 is the most likely place for a new one to surface.
-- Consider whether `r_spread`'s horizontal-only limitation (`KNOWN_ISSUES.md` item 5) is
-  actually causing any exploitable behavior, now that there's more training data across
-  agent counts to check against.
+- **UWB-realistic neighbor sensing**, replacing the still-exact-ground-truth neighbor
+  observations (`rel_p`/`rel_v`/`d`). Deliberately deferred when vision-tracking was built
+  (see `DECISIONS.md`) — real UWB gives clean range, not clean bearing/velocity, so this
+  deserves its own careful design pass, not a quick patch. Natural next realism step now that
+  target-sensing is done.
+- **Make target motion non-constant-velocity** (occasional direction/speed changes
+  mid-episode). Currently the 2-second dead-reckoning grace period in the vision-tracking
+  system is mathematically exact, not a real approximation, precisely because the target
+  never maneuvers — this change would make that part of the system actually get tested under
+  real uncertainty. See `KNOWN_ISSUES.md` item 9.
+- **Sensing noise/occlusion on the target reading itself**, and a directional FOV cone
+  (needs heading/orientation added as a new state dimension first — a bigger prerequisite
+  change than the noise/occlusion pieces). See `KNOWN_ISSUES.md` item 11.
+- Consider whether `r_spread`'s horizontal-only limitation is actually causing any
+  exploitable behavior, now that there's much more training data to check against.
 
 ## Research / Future (not committed, exploratory)
 
-- A genuinely decentralized neighbor-discovery mechanism, if the project ever needs to move
-  beyond the current centralized mutual-k-NN simulator shortcut (`DECISIONS.md`) — e.g. for
-  real-hardware or ROS2/Gazebo/PX4 integration. No such integration exists in this repo
-  today; this would be new scope, not a bug fix.
+- A genuinely decentralized neighbor-discovery mechanism for the *graph maintenance* itself
+  (separate from UWB-realistic sensing above) — `_repair_connectivity` still uses centralized
+  ground-truth position knowledge to maintain the lock graph, which is a simulator-level
+  shortcut, not just an observation-realism question.
 - An actor architecture that's agent-count-invariant (e.g. attention over a variable number
   of neighbors instead of a fixed `EFFECTIVE_K`-sized observation), which would enable actual
   weight transfer across the `NUM_AGENTS` curriculum stages instead of the current
   from-scratch comparative validation at each stage (`DECISIONS.md`).
+- Real drone dynamics (inertia/acceleration limits, actuator delay) instead of the current
+  direct-velocity-command kinematic model — flagged as a "not okay for claiming realistic
+  drone collision avoidance" simplification by an earlier supervisor review, still true.
+- A learned nominal controller + safety-filter architecture more broadly (the closing-speed
+  brake is a first, narrow instance of this pattern for one specific failure mode — a
+  supervisor review's broader recommendation for "control barrier functions"/"action
+  projection" as a general design philosophy is only partially adopted so far).

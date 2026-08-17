@@ -50,20 +50,52 @@ Verified via direct inspection this session:
 - Default branch: `main`.
 - This session's push access was already established in prior sessions (multiple successful
   pushes) — treat as configured/working unless a push actually fails.
+- **Feature-branch workflow used this session for a large, exploratory change** (the
+  vision-tracking redesign): pushed to a separate branch (`vision-tracking`), validated there
+  with multiple Kaggle runs, then merged to `main` via a fast-forward push
+  (`git push origin vision-tracking:main`) once validated — not a `git merge`/local checkout
+  of `main`, since the working session was in an isolated git worktree at the time. Worth
+  reusing this pattern for the next similarly-large, unproven change rather than committing
+  straight to `main`.
+
+## Kaggle API access from this machine (set up 2026-08-17)
+
+- A dedicated venv at `~/.kaggle-venv` has the `kaggle` CLI installed (`pip install kaggle`
+  failed directly into the system Python — externally-managed-environment — hence the venv).
+- Credentials (`~/.kaggle/kaggle.json`) were placed directly on this machine by the user,
+  outside the chat — the assistant never saw the actual key content, only verified the file
+  existed with correct permissions (`600`) and that `kaggle kernels list` authenticated
+  successfully.
+- Workflow used throughout this session: write a small script-type kernel (`kernel-
+  metadata.json` + a `.py` file that `git clone`s the repo — optionally a specific branch via
+  `--branch` — installs deps, runs `training/train.py`/`evaluate.py`/`plot_training.py`),
+  `kaggle kernels push -p <dir>` to start it, poll `kaggle kernels status <ref>` until
+  `COMPLETE`, then `kaggle kernels output <ref> -p <dir>` to download logs/CSVs/models. This
+  fully replaced the manual "copy script into a Kaggle notebook cell, run, download via the
+  Output panel" workflow described below for prior sessions — both still work, but the API
+  path is faster and lets an AI session drive it directly.
+- **Gotcha confirmed this session**: transient local network errors when polling status can
+  look like remote kernel failures — e.g. `NameResolutionError` contains the substring
+  "Error", so a naive case-insensitive error-detection grep in a polling loop can mistake a
+  local DNS hiccup for the kernel itself failing. Always re-check the specific kernel's status
+  directly (`kaggle kernels status <ref>`) rather than trusting a polling script's classification
+  when something looks off.
+- Kaggle kernel titles that don't closely match their `id` slug get auto-resolved to a
+  derived slug (a warning, not an error) — the actual resulting URL/ref can differ slightly
+  from what was requested; always confirm the real slug from the push output before polling.
 
 ## Environment variables the project reads (all in `config.py` / `training/train.py`)
 
 | Variable | Default | Purpose |
 |---|---|---|
-| `NUM_AGENTS` | `4` | Number of drones; drives `OBS_DIM`, `TARGET_DIST`, etc. Supported values: `2, 3, 4` (others raise `ValueError` in `config.py`). |
+| `NUM_AGENTS` | `4` | Number of drones; drives `OBS_DIM`, `TARGET_DIST`, `SENSOR_RANGE`, etc. Supported values: `2, 3, 4` (others raise `ValueError` in `config.py`). |
 | `N_REACT` | `10` | Reaction-time budget (steps) used to derive `REACTION_DIST`/safety margins. |
 | `VELOCITY_WEIGHT` | `-0.15` | Reward weight for the velocity component. |
 | `SEED` | unset (random) | Sets a reproducible seed and enables `RUN_ID` filename suffixing for parallel multi-seed runs. |
 | `DEVICE` | `cpu` | Training device (`cpu` or `cuda`); CPU is the measured-optimal default on Kaggle. |
+| `TOTAL_STEPS` | `600_000` | **New 2026-08-17.** Total training steps; made env-var overridable so longer-training tests (this session used up to 3,000,000) don't need a hardcode-then-revert commit cycle. |
 
-No other env vars are read by the training/eval code as of this writing (based on a full
-read of `config.py` and `training/train.py`) — if new ones are added later, update this
-table.
+No other env vars are read by the training/eval code as of this writing.
 
 ## What is NOT part of this environment (as of this writing)
 
