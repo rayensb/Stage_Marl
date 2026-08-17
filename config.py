@@ -153,7 +153,26 @@ MIN_DIAMETER = 10.0
 # pull). Sized to be roughly comparable to TRACK_WEIGHT so it can actually
 # compete instead of being dominated by it. Starting guess, not derived --
 # first thing to retune if this doesn't move the needle.
-DIAMETER_FLOOR_WEIGHT = -1.0
+#
+# Disabled -- set to 0.0 (2026-08-17), not deleted, so this is a one-line
+# revert if the test below is wrong. This floor was built to stop dangerous
+# tight convergence before the closing-speed brake existed; the brake now
+# handles that deterministically, independent of diameter. With vision-based
+# tracking added on top, this floor looks like it's now actively
+# counterproductive rather than merely redundant: a single-seed N3 run with
+# it active showed swarm_diameter pinned at 12-15 (vs the pre-floor/pre-brake
+# 10-13) and target_lost_rate oscillating 15-40% with no improving trend
+# across the full 600k steps, while r_track sat notably worse (-4 to -6.5)
+# than earlier runs. Hypothesis: a wider ring geometrically implies a larger
+# individual radius from the target for evenly-spaced agents (same relation
+# TARGET_DIST/EDGE_TARGET already uses), so pulling diameter up toward/above
+# MIN_DIAMETER=10 was plausibly pushing individual drones past SENSOR_RANGE
+# (~6.9-7.2) more often than necessary. COHESION_LIMIT/COHESION_WEIGHT above
+# (the upper-bound loose-formation penalty) are untouched -- that's a
+# separate concern from the floor and isn't implicated by this data.
+# Unverified as of this comment -- next single-seed N3 run on this same
+# branch is the check.
+DIAMETER_FLOOR_WEIGHT = 0.0
 
 # Joint track+safety bonus. Additive reward composition (the terms above)
 # lets the policy bank "good enough" total reward from tracking OR safety
