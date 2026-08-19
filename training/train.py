@@ -136,7 +136,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact"]
+COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact", "brake"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -465,7 +465,8 @@ def main():
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f} "
-                  f"joint={comp_avgs['joint']:.1f} contact={comp_avgs['contact']:.1f}]")
+                  f"joint={comp_avgs['joint']:.1f} contact={comp_avgs['contact']:.1f} "
+                  f"brake_pen={comp_avgs['brake']:.1f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, target_lost_rate=target_lost_rate,
@@ -481,6 +482,7 @@ def main():
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
                      r_joint=comp_avgs['joint'], r_contact=comp_avgs['contact'],
+                     r_brake=comp_avgs['brake'],
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
                      mean_brake_reduction=mean_brake_reduction)
 

@@ -68,6 +68,7 @@ from config import (
     COHESION_LIMIT, COHESION_WEIGHT, MIN_DIAMETER, DIAMETER_FLOOR_WEIGHT,
     JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
     SENSOR_RANGE, LOST_TIMEOUT_STEPS, CONTACT_URGENT_COEF, TARGET_LOST_PENALTY,
+    BRAKE_PENALTY_COEF,
 )
 
 
@@ -318,33 +319,57 @@ class FormationEnv3D(ParallelEnv):
         # outside SAFE_DIST_ENTER this is a no-op. Reuses only already-derived
         # constants, no new ones. Uses pre-step positions for every agent
         # (computed before any position is updated) so this reflects
-        # simultaneous action, not sequential. Doesn't touch the reward --
-        # r_safety's urgent penalty below still applies in full, so the policy
-        # still has every incentive to avoid the zone in the first place; this
-        # is a safety net for once it's already there, not a replacement for
-        # learning to avoid it. brake_reduction (logged via infos) is how much
-        # speed this actually removed, for verifying it's doing something
-        # rather than staying dormant.
+        # simultaneous action, not sequential. Doesn't touch the reward directly
+        # -- r_safety's urgent penalty below still applies in full, and
+        # brake_reduction now also feeds r_brake (see _get_reward) -- so the
+        # policy has every incentive to avoid needing this, not just a safety
+        # net once it's already there.
+        #
+        # Multi-pass convergence (2026-08-19): each per-neighbor closing-speed
+        # cap is a halfspace constraint on velocity (dot(v, dir_to_b) <=
+        # max_closing), and the correction below is exactly the Euclidean
+        # projection onto that halfspace. A single sequential sweep (the
+        # original version) applies each projection once and stops -- fine
+        # with only one other agent in range, but with two or more
+        # simultaneous threats, correcting for a later neighbor can reintroduce
+        # a violation of an earlier one's constraint, since it's never
+        # re-checked. Confirmed this mattered at NUM_AGENTS=4 (each agent has
+        # 3 simultaneous "others" vs NUM_AGENTS=3's 2): training-time
+        # collision_rate stayed nonzero and scattered across an entire 3M-step
+        # run instead of converging, unlike every NUM_AGENTS=3 run (see
+        # EXPERIMENT_LOG.md). Repeating the sweep until no neighbor needs
+        # further correction is POCS (projection onto an intersection of
+        # convex sets) -- provably convergent whenever the intersection is
+        # nonempty, which it always is here physically (v=0 satisfies every
+        # constraint, since max_closing is never negative). NUM_AGENTS passes
+        # is a cheap, small upper bound (this project supports at most 4
+        # agents, so at most 3 simultaneous constraints); the early-exit below
+        # is what actually terminates it in practice.
         raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED).astype(np.float32)
                    for a in self.agents}
         brake_reduction = {a: 0.0 for a in self.agents}
-        for a in self.agents:
-            v = raw_vel[a].copy()
-            for b in self.agents:
-                if b == a:
-                    continue
-                diff = self.pos[b] - self.pos[a]
-                d = float(np.linalg.norm(diff))
-                if d < SAFE_DIST_ENTER and d > 1e-6:
-                    dir_to_b = diff / d
-                    v_closing = float(np.dot(v, dir_to_b))
-                    if v_closing > 0:
-                        max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
-                        if v_closing > max_closing:
-                            excess = v_closing - max_closing
-                            v = v - excess * dir_to_b
-                            brake_reduction[a] += excess
-            raw_vel[a] = v.astype(np.float32)
+        for _ in range(NUM_AGENTS):
+            any_correction = False
+            for a in self.agents:
+                v = raw_vel[a]
+                for b in self.agents:
+                    if b == a:
+                        continue
+                    diff = self.pos[b] - self.pos[a]
+                    d = float(np.linalg.norm(diff))
+                    if d < SAFE_DIST_ENTER and d > 1e-6:
+                        dir_to_b = diff / d
+                        v_closing = float(np.dot(v, dir_to_b))
+                        if v_closing > 0:
+                            max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
+                            if v_closing > max_closing:
+                                excess = v_closing - max_closing
+                                v = v - excess * dir_to_b
+                                brake_reduction[a] += excess
+                                any_correction = True
+                raw_vel[a] = v.astype(np.float32)
+            if not any_correction:
+                break
 
         for a in self.agents:
             self.vel[a] = raw_vel[a]
@@ -386,7 +411,7 @@ class FormationEnv3D(ParallelEnv):
         collision = len(colliding_agents) > 0
         truncated = self.step_count >= MAX_STEPS
 
-        reward_tuples = {a: self._get_reward(a, a in colliding_agents) for a in self.agents}
+        reward_tuples = {a: self._get_reward(a, a in colliding_agents, brake_reduction[a]) for a in self.agents}
         rewards = {a: reward_tuples[a][0] for a in self.agents}
         reward_components = {a: reward_tuples[a][1] for a in self.agents}
 
@@ -477,10 +502,12 @@ class FormationEnv3D(ParallelEnv):
 
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
-    def _get_reward(self, agent, agent_collided):
+    def _get_reward(self, agent, agent_collided, brake_reduction):
         """Returns (total_reward, components_dict). agent_collided is True
         only if this specific agent is within COLLISION_DIST of another
-        agent, not just whether the episode is ending in collision."""
+        agent, not just whether the episode is ending in collision.
+        brake_reduction is this agent's total closing speed the brake removed
+        this step (see step()), fed back below as r_brake."""
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
@@ -595,12 +622,21 @@ class FormationEnv3D(ParallelEnv):
         # an isolated addition, not a re-balance of what's already there.
         r_joint = JOINT_BONUS if (track_err < JOINT_TRACK_TOL and all_clear) else 0.0
 
+        # Direct brake-engagement penalty (2026-08-19) -- see config.py's
+        # BRAKE_PENALTY_COEF comment for why: r_safety's urgent-zone penalty
+        # above is proximity-based, not action-based, so it doesn't
+        # specifically penalize *needing* the brake to intervene, only being
+        # close. This closes that gap with a direct, precise signal on the
+        # actual over-commitment.
+        r_brake = BRAKE_PENALTY_COEF * brake_reduction
+
         total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global
-                      + r_velocity + r_joint + r_contact)
+                      + r_velocity + r_joint + r_contact + r_brake)
         components = {
             "track": float(r_track), "spread": float(r_spread),
             "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
             "joint": float(r_joint), "contact": float(r_contact),
+            "brake": float(r_brake),
         }
         return total, components

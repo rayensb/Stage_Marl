@@ -253,3 +253,20 @@ CONTACT_URGENT_COEF = -30.0
 # e.g. by returning to base) doesn't, so collision should stay the higher
 # priority if the two ever trade off against each other. Starting guess.
 TARGET_LOST_PENALTY = -200.0
+
+# Direct reward penalty on brake engagement itself (2026-08-19) -- until now,
+# the only pressure against needing the closing-speed brake was indirect:
+# r_safety's urgent-zone penalty shares the brake's trigger threshold
+# (SAFE_DIST_ENTER), but is proximity-based, not action-based, so a policy
+# could keep commanding more-than-safe closing speed without anything
+# specifically penalizing that choice beyond ambient proximity. Confirmed
+# this mattered at NUM_AGENTS=4: brake engagement was continuous and
+# substantial throughout a whole 3M-step run (0.002-0.016 mean speed
+# removed/agent/step), not the rare, sparse engagement seen at NUM_AGENTS=3
+# (0.0001-0.0069) -- "a good driver rarely triggers ABS" was the design
+# goal, and nothing in the reward enforced it. brake_reduction (already
+# computed every step in envs/formation_env.py's step(), previously only
+# logged) is now also fed back as r_brake = BRAKE_PENALTY_COEF *
+# brake_reduction. Starting guess, not derived -- first thing to retune if
+# this doesn't move the needle.
+BRAKE_PENALTY_COEF = -10.0
