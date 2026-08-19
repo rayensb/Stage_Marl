@@ -71,6 +71,17 @@ from config import (
     BRAKE_PENALTY_COEF, BRAKE_PENALTY_THRESHOLD,
 )
 
+# XYZ r_spread (hypothesis, 2026-08-19, xyz-spread branch): ideal pairwise
+# angular separation between neighbor direction vectors, for however many
+# locked neighbors a drone has -- the same Tammes-problem logic config.py's
+# _PACKING_RATIO already uses for TARGET_DIST (maximally-spread points on a
+# sphere), applied locally around each drone instead of globally around the
+# target. Only K in {2, 3} ever occurs (EFFECTIVE_K at NUM_AGENTS in {3, 4};
+# NUM_AGENTS=2 gives K=1, which r_spread already skips entirely below).
+# K=2 -> antipodal (180 deg), K=3 -> equilateral triangle on a great circle
+# (120 deg) -- exact closed-form optimal packings, not guesses.
+_IDEAL_NEIGHBOR_ANGLE = {2: math.pi, 3: 2 * math.pi / 3}
+
 
 class FormationEnv3D(ParallelEnv):
     metadata = {"name": "formation_env_3d_v2"}
@@ -539,18 +550,29 @@ class FormationEnv3D(ParallelEnv):
 
         r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - self._track_vel_est))
 
+        # True 3D angular separation (was horizontal/XY-bearing-only) -- see
+        # _IDEAL_NEIGHBOR_ANGLE above. For each pair of locked neighbors,
+        # the angle between their direction vectors from this drone; penalize
+        # the minimum pairwise angle's deviation from the Tammes-ideal for
+        # that neighbor count, same "penalize how far the tightest gap is
+        # from even spacing" shape the old 2D version used, just measured on
+        # the sphere instead of the horizontal plane.
         r_spread = 0.0
         if len(neighbors) >= 2:
-            bearings = []
+            dirs = []
             for n in neighbors:
                 d = self.pos[n] - p
-                bearings.append(math.atan2(d[1], d[0]))
-            bearings.sort()
-            gaps = [(bearings[(i + 1) % len(bearings)] - bearings[i]) % (2 * math.pi)
-                    for i in range(len(bearings))]
-            min_gap = min(gaps)
-            ideal_gap = 2 * math.pi / len(neighbors)
-            r_spread = -0.3 * abs(min_gap - ideal_gap)
+                norm = np.linalg.norm(d)
+                if norm > 1e-6:
+                    dirs.append(d / norm)
+            if len(dirs) >= 2:
+                pairwise_angles = [
+                    math.acos(float(np.clip(np.dot(dirs[i], dirs[j]), -1.0, 1.0)))
+                    for i in range(len(dirs)) for j in range(i + 1, len(dirs))
+                ]
+                min_angle = min(pairwise_angles)
+                ideal_angle = _IDEAL_NEIGHBOR_ANGLE.get(len(dirs), math.pi)
+                r_spread = -0.3 * abs(min_angle - ideal_angle)
 
         # Safety is checked against ALL other agents, not just locked
         # neighbors -- collision termination is global (any pair, anywhere),
