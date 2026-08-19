@@ -61,14 +61,38 @@ bug — flagged here only because if the project's goals ever require genuinely 
 sensing (e.g. moving toward real hardware or ROS2/Gazebo integration), this is a real
 architecture item, not a quick fix. See `TODO.md` research/future section.
 
-## 5. `r_spread` formation-spread metric is horizontal-only
+## 5. `r_spread` formation-spread metric is horizontal-only — now a plausible, mechanistically-grounded contributor to the `N=4` difficulty, not just an unverified limitation
 
 **Symptom**: documented directly in the `envs/formation_env.py` module docstring — the
 spread reward component only considers horizontal (x/y) spacing, not vertical (z) spread.
-**Status**: documented limitation, unresolved. Whether this matters depends on whether the
-target formation is expected to have meaningful vertical structure; UNVERIFIED whether this
-has caused any observed training artifact (e.g. agents exploiting vertical separation to
-avoid the spread penalty while remaining close in 3D).
+**Geometric feasibility check (2026-08-19, verified)**: it was raised whether `TARGET_DIST`
+(~4.78 at `N=4`) and `EDGE_TARGET` (7.80, fixed regardless of `N`) are even simultaneously
+satisfiable — can every drone really be 4.78 from the target *and* 7.80 from every other drone
+at once? Checked directly: yes, exactly. `_PACKING_RATIO[4] = (8/3)**0.5` is the
+circumradius-to-edge ratio of a **regular tetrahedron**, and `TARGET_DIST` is solved backward
+from `EDGE_TARGET` using exactly that ratio (`config.py`) — a real regular tetrahedron with
+circumradius 4.78 and edge 7.80 satisfies both constraints exactly, no contradiction (same
+check for `N=3`: equilateral triangle on a great circle, also exact). **The target geometry
+itself is not infeasible.**
+**What's actually different at `N=4`, and why this item now matters more**: a triangle (`N=3`'s
+exact solution) is trivially planar — consistent with what `r_spread` can already see and
+shape. A regular tetrahedron (`N=4`'s exact solution) is inherently **non-planar** — no 4
+points can be simultaneously center-equidistant and pairwise-equidistant while coplanar.
+`r_track` and `r_safety` jointly imply the tetrahedron as a reward optimum in principle, but
+`r_spread` — the only term with any angular-arrangement shaping — is blind to the one axis
+(vertical) where reaching that optimum actually requires structure at `N=4`. The swarm has to
+stumble onto the correct out-of-plane arrangement through pairwise-distance terms alone, with
+no active shaping toward it, unlike `N=3` where the correct arrangement is exactly what the
+existing horizontal-only shaping already rewards.
+**Status**: not confirmed as *the* cause of the `N=4` collision persistence (item 8 above has
+its own independently-sufficient mechanism), but plausible as a contributing factor and worth
+fixing regardless.
+**Proposed fix (not yet implemented, queued in `TODO.md` Phase 2)**: replace the 2D bearing-sort
+construction with pairwise 3D angular separation between neighbor direction vectors
+(`arccos(dot(dir_i, dir_j))`), penalizing when the minimum pairwise angle is below the
+Tammes-ideal angle for that neighbor count (180° for 2 neighbors, 120° for 3 — reusing the same
+spherical-packing logic `_PACKING_RATIO` already uses for `TARGET_DIST`, applied locally around
+each drone instead of globally around the target).
 
 ## 6. Curriculum can't literally transfer weights across `NUM_AGENTS`
 
@@ -91,23 +115,41 @@ waste time debugging what looks like a CUDA failure but is just this machine's d
 **Impact**: no local run can validate GPU-path behavior specifically, if that ever becomes
 relevant (e.g. if the network grows enough that CUDA becomes faster again).
 
-## 8. Closing-speed brake's no-crossing property is unproven for simultaneous multi-threat braking
+## 8. Closing-speed brake's no-crossing property fails under simultaneous multi-threat braking — now confirmed at `NUM_AGENTS=4`, not just a theoretical gap
 
 **Symptom**: the brake's algebraic no-crossing guarantee (worst-case per-step gap reduction is
 a fixed fraction of the remaining gap, never reaching `COLLISION_DIST` in finite steps) was
-derived for two agents at a time. It was never separately proven for an agent braking against
-two or more simultaneous threats from different directions — the per-pair velocity correction
-is applied sequentially in `step()`, and the combined effect in that case isn't covered by the
-same proof.
-**Status**: not hypothetical — a 3-seed, 3M-step `NUM_AGENTS=3` run produced exactly one
-isolated collision event during training (of ~586 rollouts) and a separate 1/100 eval-episode
-collision reading (a different seed's best checkpoint). Rate is low (~1%), consistent with a
-rare edge case, not a systemic failure — every other tested configuration (8/9 total) showed
-exactly 0%.
-**Next step, if this matters more at higher `NUM_AGENTS`**: work out (or empirically stress-
-test) the simultaneous-multi-threat case specifically — more agents means more opportunities
-for one drone to be braking against two neighbors at once, so this is worth re-checking before
-trusting the brake's guarantee as tightly at `NUM_AGENTS=4` as it's held at `NUM_AGENTS=3`.
+derived for two agents at a time. The per-pair velocity correction in `step()` is applied
+sequentially — correcting for neighbor B, then neighbor C using the already-B-corrected
+velocity, without re-checking that C's correction didn't reintroduce a violation of B's
+constraint. At `NUM_AGENTS=3` each agent already has 2 simultaneous "others" (`K_NEIGHBORS =
+NUM_AGENTS-1` is full connectivity) and this rarely mattered; at `NUM_AGENTS=4` each agent has
+3.
+**Status**: **confirmed, not just theoretical**, by a 3-seed, 3M-step `NUM_AGENTS=4` validation
+(2026-08-19). Eval-time numbers look fine in isolation (0-2% collision rate, 100 episodes), but
+the training-time rolling-window data (50-episode window, ~1465 logged rollouts per seed — a
+much larger sample) tells a different story: 88/1465 (seed1), 59/1465 (seed2), and 269/1465
+(seed3) rollouts showed nonzero `collision_rate`, scattered across the *entire* 3M-step run in
+every seed, not converging to zero the way `NUM_AGENTS=3` did. Seed3 still showed nonzero
+`collision_rate` (0.02-0.04) in its last 10 logged rollouts, through step 3,000,320 — not
+resolved by the end of training. `mean_brake_reduction` confirms why: continuous, substantial
+engagement throughout the whole run (0.002-0.016) at `N=4`, vs. `N=3`'s sparse, occasional
+engagement (0.0001-0.0069) — more simultaneous neighbors means the brake is doing real,
+constant work instead of sitting mostly dormant. Separately: the reward gives no *direct*
+penalty on brake engagement itself, only an indirect one (`r_safety`'s urgent-zone penalty
+shares the brake's trigger threshold, `SAFE_DIST_ENTER`, but is proximity-based, not
+action-based — a policy can keep commanding more-than-safe closing speed without anything
+specifically penalizing that choice beyond ambient proximity). See `EXPERIMENT_LOG.md` for the
+full run data.
+**Proposed fixes (not yet implemented, queued in `TODO.md` Phase 1)**: (1) sweep the per-pair
+brake correction to convergence — repeat the pass across all neighbors until no further
+correction is needed, instead of one sequential pass. Each per-neighbor constraint is a
+halfspace in velocity space, and repeated projection onto an intersection of halfspaces
+(POCS/alternating-projections) is a standard, provably-convergent technique for exactly this
+situation. (2) Add a direct reward penalty proportional to `brake_reduction` (already computed
+every step, currently only logged) so the policy is penalized specifically for *needing* the
+brake, not just for proximity. Both target the same confirmed mechanism; proposed to test
+together.
 
 ## 9. Target motion is still constant-velocity, so the vision-tracking dead-reckoning grace period is currently exact, not approximate
 

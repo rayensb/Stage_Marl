@@ -23,11 +23,12 @@ project's history.
 Train a policy that, at `NUM_AGENTS=4` (the target agent count), maintains tight target
 tracking and formation cohesion while avoiding both collisions and losing sensor contact with
 the target, via a curriculum first validated at `NUM_AGENTS=2`, then `3`. **As of this
-writing, both the collision problem and the tracking problem have been solved and validated
-at `NUM_AGENTS=3` — `NUM_AGENTS=4` has not yet been run against the current code. This is the
-clear next step.** See `TODO.md`/`SESSION_HANDOFF.md`.
+writing, `NUM_AGENTS=4` has been run (3 seeds, 3M steps, 2026-08-19): tracking generalized
+cleanly with no changes needed, but collision avoidance did not — see below. This is now the
+project's headline open problem**, with two fixes proposed but not yet implemented. See
+`TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` item 8.
 
-## Current status (as of commit `b59c139`, 2026-08-17)
+## Current status (code as of commit `45b42a2`, 2026-08-17; findings as of 2026-08-19)
 
 - **Collision avoidance is solved via a deterministic mechanism, not reward shaping.** After
   six consecutive reward-shape/schedule fixes failed to stop a long-standing collision-rate
@@ -51,6 +52,14 @@ clear next step.** See `TODO.md`/`SESSION_HANDOFF.md`.
   relevant (much of the very old N=2/N=3 data predates the collision fix and vision-tracking,
   and shouldn't be compared directly against current results without checking which commit
   produced it).
+- **`NUM_AGENTS=4` has now been run (3 seeds, 3M steps) — mixed result.** Tracking transfers
+  zero-shot, matching `N=3` quality (0-5% `target_lost_rate`). Collision avoidance does not:
+  eval-time numbers look fine (0-2%) but training-time data shows scattered, non-converging
+  collision events across the full run in all 3 seeds — the brake's no-crossing guarantee
+  (proven for two simultaneous agents, not three) is being exercised harder at `N=4`, where
+  every agent has 3 simultaneous "others" instead of 2. Not yet fixed — two fixes are proposed
+  (not implemented) in `TODO.md` Phase 1. See `KNOWN_ISSUES.md` item 8 and `EXPERIMENT_LOG.md`
+  for the full data.
 
 ## Important technologies / dependencies
 

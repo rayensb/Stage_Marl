@@ -317,3 +317,59 @@ result, for a related reason (both times, removing a stale safety-era constraint
 training time let a decoupled objective actually converge).
 **Status**: merged to `main` (`b59c139`) after this 3-seed validation. This is now the current
 state of the project — see `CURRENT_STATE.md`.
+
+## `NUM_AGENTS=4`, 3-seed, 3M-step validation — tracking generalizes cleanly, collision does not
+
+**Objective**: validate the full current fix chain (brake + vision-tracking) at the actual
+target agent count, `NUM_AGENTS=4`, now that both problems were resolved and validated at
+`N=3`.
+**Configuration**: same launcher pattern as the `N=3` 3-seed/3M run (parallel per-seed Kaggle
+kernels), `NUM_AGENTS=4` (config.py's default), commit `45b42a2`.
+**Eval-time results (100 ep, deterministic)**:
+
+| seed | collision (final/best) | target_lost (final/best) | tracking_rmse (final/best) |
+|---|---|---|---|
+| 1 | 0% / 1% | 1% / 2% | 2.25 / 2.37 |
+| 2 | 1% / 1% | 3% / 5% | 2.96 / 2.88 |
+| 3 | 2% / 0% | 0% / 0% | 1.98 / 1.89 |
+
+**Training-time rolling-window results (the real picture — 50-episode window, ~1465 logged
+rollouts per seed, a much larger sample than the 100-episode eval)**: 88/1465 (seed1), 59/1465
+(seed2), 269/1465 (seed3) rollouts showed nonzero `collision_rate`, scattered across the
+*entire* 3M-step run in every seed rather than converging — seed3 specifically still nonzero
+(0.02-0.04) in its last 10 logged rollouts, through step 3,000,320. `target_lost_rate` by
+contrast converges cleanly in the first ~0.7M-1M steps and stays at genuine zero for the
+remaining ~2M+ steps, in every seed — the same clean pattern `N=3` showed. `mean_brake_reduction`
+confirms the mechanism: continuous, substantial engagement throughout the whole `N=4` run
+(0.002-0.016) vs. `N=3`'s sparse, occasional engagement (0.0001-0.0069 on the same metric).
+**Conclusion**: the eval-time numbers (0-2% collision) understate the real severity — the
+brake's no-crossing guarantee (proven only for two agents at a time, see `KNOWN_ISSUES.md` item
+8) is being exercised much harder at `N=4`, where each agent has 3 simultaneous "others"
+(`K_NEIGHBORS=NUM_AGENTS-1`, full connectivity) instead of 2. Tracking, by contrast, transfers
+zero-shot with no changes needed — the vision-tracking design and reward generalize across `N`
+cleanly; only the deterministic safety layer's coverage does not.
+**Status**: not fixed yet. Two fixes proposed (multi-pass brake convergence, direct
+brake-engagement reward penalty) — see `TODO.md` Phase 1. **This is now the project's headline
+open problem** — see `CURRENT_STATE.md`.
+
+## Geometric feasibility check: is `N=4`'s target formation (`TARGET_DIST=4.78`, `EDGE_TARGET=7.80`) actually simultaneously satisfiable?
+
+**Objective**: raised directly — maybe the collision persistence at `N=4` is because the target
+numbers themselves are geometrically inconsistent (can't really have every drone 4.78 from the
+target *and* 7.80 from every other drone at once).
+**Check**: `_PACKING_RATIO[4] = (8/3)**0.5 ≈ 1.633` is exactly the circumradius-to-edge ratio of
+a **regular tetrahedron**, and `TARGET_DIST` is solved backward from `EDGE_TARGET` using that
+exact ratio (`config.py`). A regular tetrahedron with circumradius 4.78 and edge 7.80 is a real,
+exact geometric solid — both constraints hold simultaneously, no contradiction. Same check for
+`N=3` (equilateral triangle on a great circle): also exact.
+**Conclusion**: the target geometry is not infeasible. What's actually different at `N=4` is
+that its exact solution is inherently non-planar (no 4 points can be simultaneously
+center-equidistant and pairwise-equidistant while coplanar), while `r_spread` — the only reward
+term with any angular-arrangement shaping — is horizontal-only and can't see or reward the
+vertical structure that solution requires. `N=3`'s exact solution is planar, which is exactly
+what horizontal-only `r_spread` can already shape — so this asymmetry didn't matter until `N=4`.
+See `KNOWN_ISSUES.md` item 5 (updated) and `TODO.md` Phase 2 (XYZ `r_spread`, proposed, not yet
+implemented) for the follow-up.
+**Status**: verified finding, not yet acted on — a plausible contributing factor to the `N=4`
+collision problem, not confirmed as sufficient on its own (item 8's sequential-correction
+mechanism is independently sufficient to explain it).

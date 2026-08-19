@@ -13,6 +13,11 @@ If the repo has moved on significantly since then, treat anything here that cont
 current code as stale — the code wins, and the discrepancy is worth noting back into
 `KNOWN_ISSUES.md` or `CURRENT_STATE.md`.
 
+Updated again 2026-08-19 (still commit `45b42a2`, no code changed): `NUM_AGENTS=4` was
+validated and found to need more work — tracking generalizes, collision doesn't yet. See
+`SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` item 8 and `TODO.md`
+Phase 1/2 for the specifics.
+
 ## Read order for a new session
 
 1. **`AI_CONTEXT.md`** — start here. What this is, current status, what to read next.

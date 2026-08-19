@@ -6,17 +6,48 @@ speculative scope, not committed work.
 
 ## Critical
 
-- **Run `NUM_AGENTS=4`, 3-seed validation on the current `main` (`b59c139` or later).** This
-  is the actual target agent count and the whole reason the collision and tracking problems
-  needed solving. Both problems are now resolved and validated at `NUM_AGENTS=3` — this is
-  the first time in the project's history that an N=4 run would be testing something
-  genuinely ready, rather than a known-broken baseline. Use the same launcher pattern
-  (parallel per-seed Kaggle kernels) established throughout this session — see `COMMANDS.md`.
-- **Specifically check the closing-speed brake's rare multi-agent collision edge case at
-  N=4.** ~1% collision rate showed up at `NUM_AGENTS=3` over long/replicated runs, consistent
-  with a known gap in the brake's proof (verified for two agents at a time, not simultaneous
-  multi-threat braking). More agents means more chances for this — worth explicit attention,
-  not just a passive check of the aggregate `collision_rate` number.
+- **`NUM_AGENTS=4` collision persistence — current top-priority open problem.** A 3-seed,
+  3M-step validation (2026-08-19) confirmed tracking generalizes cleanly to `N=4` (0-5%
+  `target_lost_rate`, matching `N=3` quality, no changes needed) but collision avoidance does
+  not: training-time rolling-window data shows 88/1465, 59/1465, and 269/1465 rollouts per seed
+  with nonzero `collision_rate`, scattered across the full 3M-step run rather than converging,
+  worst in seed3 (still nonzero in the last 10 logged rollouts). Eval-time numbers alone (0-2%)
+  understate this. See `KNOWN_ISSUES.md` item 8 and `EXPERIMENT_LOG.md` for the full data.
+  Two fixes are proposed below (Phase 1) — **not yet implemented**, pending confirmation.
+
+### Phase 1 — directly targets the confirmed `N=4` collision mechanism (test together, before Phase 2)
+
+- **Multi-pass brake convergence.** The brake's per-pair correction loop in `step()` applies
+  sequentially and never re-checks that a later neighbor's correction didn't reintroduce a
+  violation of an earlier one. Sweep to convergence instead (repeat until no neighbor needs
+  further correction, or a fixed max iteration count) — a standard projection-onto-
+  intersection-of-halfspaces technique (POCS), provably convergent. See `KNOWN_ISSUES.md` item
+  8.
+- **Direct brake-engagement reward penalty.** Add `r_brake = BRAKE_PENALTY_COEF *
+  brake_reduction[agent]` (new reward component, negative coefficient) — `brake_reduction` is
+  already computed every step but only logged, never fed back into the reward. Closes the gap
+  where a policy can keep commanding more-than-safe closing speed without a penalty specific to
+  that choice (today's only pressure is `r_safety`'s proximity-based urgent zone, an indirect
+  signal that doesn't distinguish "close but not closing" from "close and still pushing
+  closer"). Starting coefficient is a guess to tune, like every other weight in `config.py`.
+
+### Phase 2 — formation-quality/generalization, not a bug fix; test separately after Phase 1 lands
+
+- **N-aware safety margin.** `EDGE_TARGET` is currently fixed regardless of `N`. Scale it by
+  how many simultaneous neighbors a drone actually has:
+  `EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST + max(0, K_NEIGHBORS - 2) * REACTION_DIST` —
+  unchanged at `N=3` (the validated case), one extra `REACTION_DIST` of margin at `N=4`. Targets
+  valence (simultaneous-neighbor count) directly rather than an arbitrary "make N=4 bigger"
+  fudge.
+- **3D (XYZ) `r_spread`.** Replace the horizontal-only bearing-sort with pairwise 3D angular
+  separation between neighbor direction vectors, penalizing the minimum pairwise angle against
+  the Tammes-ideal for that neighbor count (180° for 2, 120° for 3). See `KNOWN_ISSUES.md` item
+  5 for why this specifically matters more at `N=4` — its exact-consistent formation geometry
+  (verified, not contradictory — same item) is inherently non-planar, and nothing currently
+  shapes the swarm toward the vertical structure it requires.
+- Re-check the brake's multi-agent collision edge case again at whatever `NUM_AGENTS` is tested
+  next, after Phase 1 lands — don't assume a fix confirmed at `N=4` automatically holds beyond
+  it.
 
 ## High
 

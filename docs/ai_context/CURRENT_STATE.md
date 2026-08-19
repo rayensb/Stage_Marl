@@ -36,19 +36,13 @@ As of commit `b59c139` on `main`, 2026-08-17 (vision-tracking merged). Working t
 - **Evaluation**: `evaluate.py` now reports `target_lost`/`avg_confidence` alongside the
   original metrics; `tracking_rmse` remains deliberately ground-truth-based (see
   `ARCHITECTURE.md`) even though the reward now scores against the tracked estimate.
+- **Vision-based cooperative target tracking generalizes to `NUM_AGENTS=4` with no changes.** A
+  3-seed, 3M-step `N=4` validation (2026-08-19) matched `N=3`'s quality: `target_lost_rate`
+  0-5%, converging cleanly in the first ~0.7-1M steps and staying at genuine zero after. See
+  `EXPERIMENT_LOG.md`.
 
 ## Unverified (implemented, not yet confirmed by a completed run)
 
-- **`NUM_AGENTS=4`**. Everything above has only been validated at `NUM_AGENTS=3`. This is the
-  clear next step — see `TODO.md`. At `N=4`, `K_NEIGHBORS=NUM_AGENTS-1=3` means every agent
-  is still always locked/observed (the fix that mattered specifically at `N=4`, closing an
-  observation/reward mismatch — see `DECISIONS.md`), so there's reason to expect this
-  transfers, but it hasn't been run.
-- **The closing-speed brake's guarantee for simultaneous multi-threat braking.** Proven
-  algebraically for two agents at a time; not for an agent braking against two neighbors at
-  once. A rare (~1%) collision rate showed up at `N=3` with the brake active over long/
-  replicated runs — worth specifically re-checking at `N=4`, where more agents means more
-  opportunities for this case. See `KNOWN_ISSUES.md` item 8.
 - **UWB-realistic neighbor sensing, sensing noise/occlusion, a directional FOV cone, and
   non-constant-velocity target motion** — all deliberately deferred when vision-tracking was
   built, not attempted. See `KNOWN_ISSUES.md` items 9-11.
@@ -76,9 +70,19 @@ an old file.
 
 ## Known broken / open problems
 
-See `KNOWN_ISSUES.md` for the full current list. Headline items as of this writing: `N=4` is
-unvalidated (not broken, just untested — the actual next step), and the brake's rare
-multi-agent edge case (item 8) is worth watching as agent count increases.
+**Headline: collision avoidance is not solid at `NUM_AGENTS=4`.** A 3-seed, 3M-step validation
+(2026-08-19) confirmed target tracking generalizes cleanly to `N=4` (see above), but collision
+does not: eval-time numbers look fine (0-2%) but training-time rolling-window data shows
+scattered, non-converging collision events throughout the full 3M-step run in all 3 seeds
+(88/1465, 59/1465, 269/1465 rollouts affected), worst in seed3 (still occurring in the last
+logged rollouts). This empirically confirms what was previously only a theoretical gap
+(`KNOWN_ISSUES.md` item 8): the closing-speed brake's no-crossing proof only covers two agents
+at a time, and `N=4` gives every agent 3 simultaneous "others" instead of 2. Two fixes are
+proposed (not yet implemented) — see `TODO.md` Phase 1. Separately, a verified-but-unacted-on
+finding (`KNOWN_ISSUES.md` item 5): `r_spread`'s horizontal-only limitation may be a
+contributing factor, since `N=4`'s exact-consistent target formation (a regular tetrahedron,
+confirmed geometrically feasible — not a contradiction) is inherently non-planar in a way
+`N=3`'s isn't. See `KNOWN_ISSUES.md` and `EXPERIMENT_LOG.md` for full detail.
 
 ## Local environment caveat
 
