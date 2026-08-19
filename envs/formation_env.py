@@ -68,7 +68,7 @@ from config import (
     COHESION_LIMIT, COHESION_WEIGHT, MIN_DIAMETER, DIAMETER_FLOOR_WEIGHT,
     JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
     SENSOR_RANGE, LOST_TIMEOUT_STEPS, CONTACT_URGENT_COEF, TARGET_LOST_PENALTY,
-    BRAKE_PENALTY_COEF,
+    BRAKE_PENALTY_COEF, BRAKE_PENALTY_THRESHOLD,
 )
 
 
@@ -299,6 +299,40 @@ class FormationEnv3D(ParallelEnv):
             if contacts else None
         )
 
+    def _apply_brake(self, raw_vel):
+        """Extracted from step() (2026-08-19) so it's callable standalone --
+        e.g. from a real-vehicle deployment driving self.pos from live
+        telemetry instead of this env's own integrator. Reads self.pos/
+        self.agents; does not mutate them or self.vel, and does not advance
+        physics -- callers do that with the returned velocities. See step()
+        for the full multi-pass/POCS rationale. Returns (corrected_vel,
+        brake_reduction) dicts, one entry per agent in self.agents."""
+        raw_vel = {a: v.copy() for a, v in raw_vel.items()}
+        brake_reduction = {a: 0.0 for a in self.agents}
+        for _ in range(NUM_AGENTS):
+            any_correction = False
+            for a in self.agents:
+                v = raw_vel[a]
+                for b in self.agents:
+                    if b == a:
+                        continue
+                    diff = self.pos[b] - self.pos[a]
+                    d = float(np.linalg.norm(diff))
+                    if d < SAFE_DIST_ENTER and d > 1e-6:
+                        dir_to_b = diff / d
+                        v_closing = float(np.dot(v, dir_to_b))
+                        if v_closing > 0:
+                            max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
+                            if v_closing > max_closing:
+                                excess = v_closing - max_closing
+                                v = v - excess * dir_to_b
+                                brake_reduction[a] += excess
+                                any_correction = True
+                raw_vel[a] = v.astype(np.float32)
+            if not any_correction:
+                break
+        return raw_vel, brake_reduction
+
     def step(self, actions):
         self.step_count += 1
 
@@ -347,29 +381,7 @@ class FormationEnv3D(ParallelEnv):
         # is what actually terminates it in practice.
         raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED).astype(np.float32)
                    for a in self.agents}
-        brake_reduction = {a: 0.0 for a in self.agents}
-        for _ in range(NUM_AGENTS):
-            any_correction = False
-            for a in self.agents:
-                v = raw_vel[a]
-                for b in self.agents:
-                    if b == a:
-                        continue
-                    diff = self.pos[b] - self.pos[a]
-                    d = float(np.linalg.norm(diff))
-                    if d < SAFE_DIST_ENTER and d > 1e-6:
-                        dir_to_b = diff / d
-                        v_closing = float(np.dot(v, dir_to_b))
-                        if v_closing > 0:
-                            max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
-                            if v_closing > max_closing:
-                                excess = v_closing - max_closing
-                                v = v - excess * dir_to_b
-                                brake_reduction[a] += excess
-                                any_correction = True
-                raw_vel[a] = v.astype(np.float32)
-            if not any_correction:
-                break
+        raw_vel, brake_reduction = self._apply_brake(raw_vel)
 
         for a in self.agents:
             self.vel[a] = raw_vel[a]
@@ -627,8 +639,15 @@ class FormationEnv3D(ParallelEnv):
         # above is proximity-based, not action-based, so it doesn't
         # specifically penalize *needing* the brake to intervene, only being
         # close. This closes that gap with a direct, precise signal on the
-        # actual over-commitment.
-        r_brake = BRAKE_PENALTY_COEF * brake_reduction
+        # actual over-commitment. v2: only the excess above
+        # BRAKE_PENALTY_THRESHOLD is penalized -- a linear-from-zero v1
+        # measurably fixed collision_rate but also taxed trivial, routine
+        # engagement, not just aggressive corrections, which pushed the
+        # policy to avoid the brake's trigger zone altogether (wider
+        # formation, worse tracking) rather than just avoid needing a large
+        # correction once inside it. See config.py for the full before/after
+        # data and how the threshold was derived.
+        r_brake = BRAKE_PENALTY_COEF * max(0.0, brake_reduction - BRAKE_PENALTY_THRESHOLD)
 
         total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global
                       + r_velocity + r_joint + r_contact + r_brake)

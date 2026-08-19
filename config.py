@@ -266,7 +266,34 @@ TARGET_LOST_PENALTY = -200.0
 # (0.0001-0.0069) -- "a good driver rarely triggers ABS" was the design
 # goal, and nothing in the reward enforced it. brake_reduction (already
 # computed every step in envs/formation_env.py's step(), previously only
-# logged) is now also fed back as r_brake = BRAKE_PENALTY_COEF *
-# brake_reduction. Starting guess, not derived -- first thing to retune if
-# this doesn't move the needle.
+# logged) is now also fed back as reward.
+#
+# v1 (first Kaggle test, 2026-08-19) penalized brake_reduction linearly from
+# zero: r_brake = BRAKE_PENALTY_COEF * brake_reduction. Measured result:
+# collision_rate genuinely fixed (88/59/269 nonzero rollouts out of 1465
+# dropped to 14/10/15, all three seeds clean for their entire last 10
+# rollouts) -- but swarm_diameter/avg_min_dist both ran noticeably wider
+# than before and tracking_rmse worsened slightly. Diagnosis: a linear-from-
+# zero penalty can't distinguish a trivial, routine nudge (a fraction of a
+# percent of MAX_ACTION_SPEED) from a real emergency correction -- it taxes
+# both, so the policy's cheapest way to minimize the penalty is to avoid
+# entering the brake's trigger zone at all, i.e. spread out more than
+# necessary, exactly like "a good driver rarely triggers ABS" doesn't mean
+# a good driver's ABS light can never so much as flicker.
+#
+# v2: only penalize the excess above BRAKE_PENALTY_THRESHOLD, zero below it
+# -- r_brake = BRAKE_PENALTY_COEF * max(0, brake_reduction -
+# BRAKE_PENALTY_THRESHOLD), see envs/formation_env.py's _get_reward. Below
+# the threshold this is now a complete no-op (matches "normal braking" being
+# free), so it shouldn't create the same pressure to avoid the zone
+# altogether -- only to avoid needing a large correction once inside it.
+# BRAKE_PENALTY_THRESHOLD is derived from the brake's own geometry, not
+# picked independently: max_closing = MAX_ACTION_SPEED * (d-COLLISION_DIST)/
+# (SAFE_DIST_ENTER-COLLISION_DIST) means a brake_reduction of
+# 0.5*MAX_ACTION_SPEED corresponds to a full-speed closing approach already
+# halfway through the safety zone toward COLLISION_DIST -- a genuinely
+# aggressive, late correction, not a minor one. BRAKE_PENALTY_COEF itself
+# unchanged from v1 (only the zero-point moved) -- still a starting guess,
+# first thing to retune if this doesn't move the needle either.
 BRAKE_PENALTY_COEF = -10.0
+BRAKE_PENALTY_THRESHOLD = 0.5 * MAX_ACTION_SPEED   # = 0.60
