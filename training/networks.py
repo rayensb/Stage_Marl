@@ -6,7 +6,12 @@ LOG_STD_MAX = 0.5    # std ~= 1.65 (exploration ceiling)
 
 class Actor(nn.Module):
     """Per-agent policy: local obs -> tanh-squashed Gaussian action."""
-    def __init__(self, obs_dim, act_dim, hidden=64):
+    # hidden 64->128 (Phase 3, 2026-08-20): bundled into the sustained-flight
+    # resilience test alongside the longer horizon/ground/per-axis changes --
+    # a starting guess that more capacity helps the policy hold formation
+    # over a much longer episode than it saw at NUM_AGENTS=4's already-good
+    # 64-wide results at 200 steps, not a measured need.
+    def __init__(self, obs_dim, act_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
             nn.Linear(obs_dim, hidden), nn.Tanh(),
@@ -64,7 +69,7 @@ class CentralCritic(nn.Module):
     """Sees joint obs, outputs one value head per agent -- agents have
     different individual rewards, so a single shared scalar output would be
     trained against N conflicting regression targets per update."""
-    def __init__(self, joint_obs_dim, num_agents, hidden=128):
+    def __init__(self, joint_obs_dim, num_agents, hidden=256):
         super().__init__()
         self.trunk = nn.Sequential(
             nn.Linear(joint_obs_dim, hidden), nn.Tanh(),

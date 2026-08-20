@@ -12,10 +12,18 @@ from training.networks import Actor, CentralCritic
 from training.buffer import RolloutBuffer
 from training.checkpoint import save_checkpoint, load_checkpoint, save_best_actor
 from training.logger import init_logger, log_row
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_STEPS
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
-ROLLOUT_LEN = 2048
+# Phase 3 (2026-08-20): derived from MAX_STEPS instead of hardcoded
+# independently -- was a flat 2048, which gave ~10 episodes/rollout at the
+# old MAX_STEPS=200, but only ~1 at the new MAX_STEPS=1800, which would
+# have hurt PPO's per-update sample diversity (each rollout mostly one
+# long correlated trajectory instead of several independent resets).
+# ROLLOUT_EPISODES keeps that "episodes per rollout" ratio explicit and
+# self-maintaining across future MAX_STEPS changes.
+ROLLOUT_EPISODES = 8
+ROLLOUT_LEN = MAX_STEPS * ROLLOUT_EPISODES
 EPOCHS = 10
 BATCH_SIZE = 256
 LR = 3e-4
@@ -136,7 +144,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact", "brake"]
+COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact", "brake", "ground"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -174,6 +182,7 @@ def main():
     recent_rewards = deque(maxlen=50)
     recent_collisions = deque(maxlen=50)
     recent_target_lost = deque(maxlen=50)
+    recent_ground_strike = deque(maxlen=50)  # Phase 3, 2026-08-20
     recent_min_dist = deque(maxlen=50)
     recent_ep_len = deque(maxlen=50)
     recent_mean_pw = deque(maxlen=50)
@@ -195,7 +204,7 @@ def main():
     # together so tracking quality (comp_avgs['track'], less negative is
     # better) breaks ties within that group -- a genuinely safer policy
     # still always wins outright on the primary criterion.
-    best_score = (float("inf"), float("inf"), float("inf"))
+    best_score = (float("inf"), float("inf"), float("inf"), float("inf"))  # Phase 3: +ground_strike_rate
 
     while total_steps < TOTAL_STEPS and not _stop_requested:
         rollout_start = time.time()
@@ -248,6 +257,7 @@ def main():
             any_info = next(iter(infos.values()), {})
             collided = bool(any_info.get("collision", False))
             target_lost_now = bool(any_info.get("target_lost", False))
+            ground_strike_now = bool(any_info.get("ground_strike", False))  # Phase 3, 2026-08-20
 
             if done and not real_terminal:
                 # Time-limit cutoff, not a true terminal state -- fold the
@@ -309,6 +319,7 @@ def main():
                 recent_rewards.append(np.mean(list(ep_rewards.values())) / max(ep_len, 1))
                 recent_collisions.append(1.0 if collided else 0.0)
                 recent_target_lost.append(1.0 if target_lost_now else 0.0)
+                recent_ground_strike.append(1.0 if ground_strike_now else 0.0)
                 recent_min_dist.append(min_d)
                 recent_ep_len.append(ep_len)
                 recent_mean_pw.append(swarm["mean_pairwise"])
@@ -337,6 +348,7 @@ def main():
 
         collision_rate = float(np.mean(recent_collisions)) if recent_collisions else 0.0
         target_lost_rate = float(np.mean(recent_target_lost)) if recent_target_lost else 0.0
+        ground_strike_rate = float(np.mean(recent_ground_strike)) if recent_ground_strike else 0.0  # Phase 3, 2026-08-20
 
         # Best-checkpoint tracking and entropy recovery share this signal:
         # only judge once the rolling window has real episodes in it, and
@@ -467,7 +479,12 @@ def main():
                 # frequently loses the target isn't actually the best one,
                 # same lexicographic-safety-first reasoning as collision_rate
                 # itself (see the original comment below/DECISIONS.md).
-                current_score = (round(collision_rate, 2), round(target_lost_rate, 2), -comp_avgs['track'])
+                # Extended again (Phase 3, 2026-08-20) with ground_strike_rate,
+                # ranked with collision_rate (both are hardware-destroying
+                # failures, unlike target_lost's softer "mission failed but
+                # nothing's damaged") rather than after target_lost.
+                current_score = (round(collision_rate, 2), round(ground_strike_rate, 2),
+                                  round(target_lost_rate, 2), -comp_avgs['track'])
                 if current_score < best_score:
                     best_score = current_score
                     save_best_actor(actor, RUN_ID)
@@ -481,7 +498,7 @@ def main():
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
-                  f"lost_rate={target_lost_rate:.2f} "
+                  f"lost_rate={target_lost_rate:.2f} ground_rate={ground_strike_rate:.2f} "
                   f"min_dist={avg_min_dist:.2f} ep_len={avg_ep_len:.0f} "
                   f"entropy={last_entropy:.2f} log_std={log_std_mean:.3f} act_abs={mean_action_abs:.3f} "
                   f"brake={mean_brake_reduction:.4f} "
@@ -496,6 +513,7 @@ def main():
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, target_lost_rate=target_lost_rate,
+                     ground_strike_rate=ground_strike_rate,
                      avg_min_dist=avg_min_dist,
                      avg_ep_len=avg_ep_len, entropy=last_entropy,
                      actor_loss=last_actor_loss, critic_loss=last_critic_loss,
@@ -508,7 +526,7 @@ def main():
                      r_safety=comp_avgs['safety'], r_cohesion=comp_avgs['cohesion'],
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
                      r_joint=comp_avgs['joint'], r_contact=comp_avgs['contact'],
-                     r_brake=comp_avgs['brake'],
+                     r_brake=comp_avgs['brake'], r_ground=comp_avgs['ground'],
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
                      mean_brake_reduction=mean_brake_reduction,
                      mean_brake_passes=mean_brake_passes, max_brake_violation=max_brake_violation,

@@ -49,7 +49,15 @@ ACT_DIM = 3
 COLLISION_DIST   = 4.20     # hard physical clearance radius (rotor/frame safety)
 DIVERGE_DIST     = 10.0     # used for re-lock trigger only now
 
-MAX_STEPS        = 200
+# Phase 3 (2026-08-20): raised from a flat 200 (10s) after
+# training/diagnose_horizon.py showed the policy's tracking error nearly
+# quadrupling (0.95 -> 3.66) once run past its training horizon, in a time
+# window that lines up with where the real PX4/Gazebo deployment actually
+# crashed (see PHASE2_CHECKPOINT.md) -- the policy had simply never
+# experienced sustained flight that long. Env-var overridable like
+# NUM_AGENTS/TOTAL_STEPS so this can still be swept/reverted without
+# hand-editing. 1800 = 90s at DT=0.05.
+MAX_STEPS        = int(os.environ.get("MAX_STEPS", 1800))
 DT                = 0.05    # 20 Hz control loop
 
 MAX_ACTION_SPEED = 1.2      # actions set velocity directly -- no acceleration/
@@ -79,6 +87,19 @@ SAFE_DIST_ENTER = COLLISION_DIST + REACTION_DIST                 # = 5.40
 # the warning threshold, in the same physical unit rather than an arbitrary
 # band width.
 SAFE_DIST_EXIT  = SAFE_DIST_ENTER + REACTION_DIST                 # = 6.60
+
+# Ground awareness (Phase 3, 2026-08-20): the abstract sim had no ground
+# plane at all until now -- confirmed by search, not an oversight being
+# fixed blind. Same derivation language as the inter-agent zones above,
+# just against a fixed floor (z=0, matching the deployment pipeline's
+# z-up convention where TAKEOFF_ALTITUDE/TARGET_START are already measured
+# from ground level) instead of another agent's position. Mirrors why the
+# inter-agent case eventually needed a deterministic clamp on top of reward
+# shaping, not reward shaping alone -- see _apply_ground_clamp in
+# envs/formation_env.py.
+GROUND_Z          = 0.0
+GROUND_SAFE_ENTER = GROUND_Z + REACTION_DIST                       # = 1.20
+GROUND_SAFE_EXIT  = GROUND_Z + 2 * REACTION_DIST                   # = 2.40
 
 # TARGET_DIST derived, not hand-picked: the best possible arrangement of
 # NUM_AGENTS points all at distance TARGET_DIST from a shared target is the
@@ -311,3 +332,25 @@ TARGET_LOST_PENALTY = -200.0
 # first thing to retune if this doesn't move the needle either.
 BRAKE_PENALTY_COEF = -10.0
 BRAKE_PENALTY_THRESHOLD = 0.5 * MAX_ACTION_SPEED   # = 0.60
+
+# Ground reward/penalty (Phase 3, 2026-08-20) -- same shapes as the
+# inter-agent case, reused rather than invented fresh: GROUND_URGENT_COEF
+# mirrors SAFETY_URGENT_COEF's ramp toward the hard limit (COLLISION_DIST
+# there, GROUND_Z here); GROUND_STRIKE_PENALTY matches r_collision_global's
+# -300 magnitude rather than TARGET_LOST_PENALTY's deliberately-softer
+# -200 -- a real ground strike is at least as severe as an inter-agent
+# collision (see PHASE2_CHECKPOINT.md's diagnose_horizon.py finding for
+# why this exists at all), not a softer failure mode like losing contact.
+GROUND_URGENT_COEF   = -30.0
+GROUND_STRIKE_PENALTY = -300.0
+
+# Per-axis action scaling (Phase 3, 2026-08-20) -- see envs/formation_env.py
+# step()'s comment. 0.6x is a starting guess at a real-ish climb-rate-vs-
+# lateral-speed ratio, not measured -- first thing to retune if this
+# doesn't move the needle, same spirit as BRAKE_PENALTY_COEF above.
+MAX_ACTION_SPEED_Z = 0.6 * MAX_ACTION_SPEED   # = 0.72
+
+# Dynamic target motion (Phase 3, 2026-08-20) -- see envs/formation_env.py
+# step()'s comment and KNOWN_ISSUES.md item 9. 500 steps = 25s, giving a
+# 1800-step (90s) episode room for ~3 mid-episode redirects.
+TARGET_REDIRECT_INTERVAL_STEPS = 500

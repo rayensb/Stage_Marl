@@ -69,6 +69,9 @@ from config import (
     JOINT_BONUS, JOINT_TRACK_TOL, VELOCITY_WEIGHT,
     SENSOR_RANGE, LOST_TIMEOUT_STEPS, CONTACT_URGENT_COEF, TARGET_LOST_PENALTY,
     BRAKE_PENALTY_COEF, BRAKE_PENALTY_THRESHOLD,
+    GROUND_Z, GROUND_SAFE_ENTER, GROUND_SAFE_EXIT,
+    GROUND_URGENT_COEF, GROUND_STRIKE_PENALTY,
+    MAX_ACTION_SPEED_Z, TARGET_REDIRECT_INTERVAL_STEPS,
 )
 
 # XYZ r_spread (2026-08-19, xyz-spread branch; angle corrected 2026-08-20
@@ -139,6 +142,16 @@ class FormationEnv3D(ParallelEnv):
     def action_space(self, agent):
         return spaces.Box(low=-1.0, high=1.0, shape=(self._act_dim,), dtype=np.float32)
 
+    def _resample_target_motion(self):
+        """Sets self._target_dir/_target_speed from the same distribution
+        reset() always has -- factored out (Phase 3, 2026-08-20) so step()
+        can call it too for mid-episode redirects (see TARGET_REDIRECT_
+        INTERVAL_STEPS in step()) without duplicating the sampling logic."""
+        self._target_dir = self.np_random.uniform(-1, 1, 3).astype(np.float32)
+        self._target_dir[2] *= 0.2
+        self._target_dir /= (np.linalg.norm(self._target_dir) + 1e-6)
+        self._target_speed = self.np_random.uniform(0.3, 1.0)
+
     def reset(self, seed=None, options=None):
         if seed is not None:
             self.np_random = np.random.default_rng(seed)
@@ -158,12 +171,32 @@ class FormationEnv3D(ParallelEnv):
             self.pos[a] = (self.pos_t + offset).astype(np.float32)
             self.vel[a] = np.zeros(3, np.float32)
 
-        self._resolve_overlaps()
+        # Ground-safety and inter-agent-overlap resolution have to run as a
+        # joint fixed point, not one-then-forget (Phase 3, 2026-08-20):
+        # _resolve_overlaps() operates in full unconstrained 3D with no
+        # ground awareness and can push a spawn well below z=0 (confirmed
+        # empirically, NUM_AGENTS=3 seed 0: -1.14, far past what the raw
+        # elevation-offset spawn geometry alone would ever produce). But
+        # clamping Z afterward, on its own, can just as easily collapse
+        # vertical separation the overlap pass had relied on to keep two
+        # agents apart -- also confirmed empirically (same seed: clamping
+        # drone3's z up to the floor put it 2.38 from drone1, inside
+        # COLLISION_DIST, an immediate step-0 collision that didn't exist
+        # pre-clamp). Alternate both passes -- same POCS-style "repeat until
+        # nothing needs correcting" idea already used for the brake -- until
+        # a round makes no ground correction (implying overlaps are also
+        # already resolved from that round's own _resolve_overlaps() call).
+        for _ in range(20):
+            self._resolve_overlaps()
+            any_clamped = False
+            for a in self.agents:
+                if self.pos[a][2] < GROUND_SAFE_ENTER:
+                    self.pos[a][2] = GROUND_SAFE_ENTER
+                    any_clamped = True
+            if not any_clamped:
+                break
 
-        self._target_dir = self.np_random.uniform(-1, 1, 3).astype(np.float32)
-        self._target_dir[2] *= 0.2
-        self._target_dir /= (np.linalg.norm(self._target_dir) + 1e-6)
-        self._target_speed = self.np_random.uniform(0.3, 1.0)
+        self._resample_target_motion()
 
         self._relock_all()
         self._current_diameter = self.get_swarm_stats()["swarm_diameter"]
@@ -401,6 +434,33 @@ class FormationEnv3D(ParallelEnv):
 
         return raw_vel, brake_reduction
 
+    def _apply_ground_clamp(self, raw_vel):
+        """Ground-plane counterpart to _apply_brake (Phase 3, 2026-08-20).
+        Per-agent and independent -- unlike two drones closing on each
+        other, the ground doesn't move and isn't itself a constraint that
+        can conflict with another agent's, so no multi-pass/POCS loop is
+        needed here, one pass is exact. Caps how fast an agent may still
+        be descending as its altitude approaches GROUND_Z, ramping to zero
+        exactly at the floor -- same shape as _apply_brake's closing-speed
+        cap, against a fixed plane instead of another agent's position.
+        Uses MAX_ACTION_SPEED_Z (not the horizontal MAX_ACTION_SPEED) since
+        this is specifically about vertical motion. Returns (corrected_vel,
+        ground_reduction) dicts, one entry per agent in self.agents --
+        signature mirrors _apply_brake's, for the same reuse reason."""
+        raw_vel = {a: v.copy() for a, v in raw_vel.items()}
+        ground_reduction = {a: 0.0 for a in self.agents}
+        for a in self.agents:
+            z = float(self.pos[a][2])
+            v = raw_vel[a]
+            if z < GROUND_SAFE_ENTER and v[2] < 0:
+                max_descend = MAX_ACTION_SPEED_Z * max(0.0, (z - GROUND_Z) / (GROUND_SAFE_ENTER - GROUND_Z))
+                if -v[2] > max_descend:
+                    excess = -v[2] - max_descend
+                    v[2] += excess
+                    ground_reduction[a] = excess
+            raw_vel[a] = v.astype(np.float32)
+        return raw_vel, ground_reduction
+
     def step(self, actions):
         self.step_count += 1
 
@@ -469,14 +529,34 @@ class FormationEnv3D(ParallelEnv):
         # a real vehicle (whose actual velocity this code doesn't control)
         # is involved -- see deployment/docs/PHASE2_HANDOFF.md. Reformulating
         # this with explicit relative velocity is queued, not yet done.
-        raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED).astype(np.float32)
+        # Per-axis action scaling (Phase 3, 2026-08-20): was a single
+        # isotropic MAX_ACTION_SPEED across all 3 components -- real drones
+        # have different vertical (climb) vs horizontal (lateral) speed
+        # authority, so Z gets its own, separate cap. REACTION_DIST/
+        # SAFE_DIST_ENTER/SAFE_DIST_EXIT (config.py) still derive from the
+        # larger MAX_ACTION_SPEED, which stays a valid (if now slightly
+        # conservative on Z) worst-case bound.
+        action_scale = np.array([MAX_ACTION_SPEED, MAX_ACTION_SPEED, MAX_ACTION_SPEED_Z], np.float32)
+        raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * action_scale).astype(np.float32)
                    for a in self.agents}
         raw_vel, brake_reduction = self._apply_brake(raw_vel)
+        raw_vel, ground_reduction = self._apply_ground_clamp(raw_vel)
 
         for a in self.agents:
             self.vel[a] = raw_vel[a]
             self.pos[a] = (self.pos[a] + self.vel[a] * DT).astype(np.float32)
 
+        # Dynamic target motion (Phase 3, 2026-08-20): closes KNOWN_ISSUES.md
+        # item 9 -- _target_dir/_target_speed used to be sampled once in
+        # reset() and never updated, so the dead-reckoning grace period
+        # (_update_target_track) was mathematically exact whenever used,
+        # not a real approximation of an uncertain estimate. Periodic
+        # redirects (same distribution reset() uses) make a mid-episode
+        # direction change able to genuinely mislead a drone's dead-reckoned
+        # estimate while it's out of contact -- the realistic case the grace
+        # period was always meant to be tested against.
+        if self.step_count % TARGET_REDIRECT_INTERVAL_STEPS == 0:
+            self._resample_target_motion()
         self.pos_t = (self.pos_t + self._target_dir * self._target_speed * DT).astype(np.float32)
         self._update_target_track()
 
@@ -513,17 +593,28 @@ class FormationEnv3D(ParallelEnv):
         collision = len(colliding_agents) > 0
         truncated = self.step_count >= MAX_STEPS
 
-        reward_tuples = {a: self._get_reward(a, a in colliding_agents, brake_reduction[a]) for a in self.agents}
+        # ground_strike (Phase 3, 2026-08-20): same global-termination,
+        # targeted-penalty pattern as collision above -- the episode ends
+        # for everyone (the formation task is compromised the moment a
+        # member is down), but only the agent(s) that actually struck the
+        # ground get the terminal penalty, not innocent bystanders.
+        ground_struck_agents = {a for a in self.agents if float(self.pos[a][2]) <= GROUND_Z}
+        ground_strike = len(ground_struck_agents) > 0
+
+        reward_tuples = {a: self._get_reward(a, a in colliding_agents, brake_reduction[a],
+                                               a in ground_struck_agents) for a in self.agents}
         rewards = {a: reward_tuples[a][0] for a in self.agents}
         reward_components = {a: reward_tuples[a][1] for a in self.agents}
 
-        # target_lost (self._update_target_track() above) is a second real
-        # terminal condition alongside collision -- a swarm with no trusted
-        # target estimate left has nothing to learn from by continuing, same
-        # reasoning as collision termination. Kept as its own info flag (not
-        # folded into "collided") so callers can log/attribute the two
-        # failure modes separately rather than conflating them.
-        terminations = {a: bool(collision or self._target_lost) for a in self.agents}
+        # target_lost/ground_strike (self._update_target_track() above /
+        # ground_struck_agents above) are further real terminal conditions
+        # alongside collision -- a swarm with no trusted target estimate,
+        # or missing a member, has nothing to learn from by continuing,
+        # same reasoning as collision termination. Each kept as its own
+        # info flag (not folded into "collided") so callers can log/
+        # attribute the distinct failure modes separately rather than
+        # conflating them.
+        terminations = {a: bool(collision or self._target_lost or ground_strike) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {"min_dist": self._min_dist(a),
@@ -538,13 +629,17 @@ class FormationEnv3D(ParallelEnv):
                        "k_active": self._last_brake_k_active[a],
                        "collision": collision,
                        "target_lost": self._target_lost,
+                       # Ground clamp diagnostic (Phase 3, 2026-08-20),
+                       # mirrors brake_reduction/collision above.
+                       "ground_reduction": ground_reduction[a],
+                       "ground_strike": ground_strike,
                        # Ground-truth track error, NOT used by the reward or
                        # observation (both use the estimate) -- diagnostic
                        # only, to check how far the estimate-based reward
                        # ever actually diverges from reality.
                        "true_track_err": abs(self._dist_to_target(a) - TARGET_DIST)} for a in self.agents}
 
-        if collision or truncated or self._target_lost:
+        if collision or truncated or self._target_lost or ground_strike:
             self.agents = []
 
         return obs, rewards, terminations, truncations, infos
@@ -611,12 +706,15 @@ class FormationEnv3D(ParallelEnv):
 
         return np.clip(np.array(feats, dtype=np.float32), -1.0, 1.0)
 
-    def _get_reward(self, agent, agent_collided, brake_reduction):
+    def _get_reward(self, agent, agent_collided, brake_reduction, agent_ground_struck=False):
         """Returns (total_reward, components_dict). agent_collided is True
         only if this specific agent is within COLLISION_DIST of another
         agent, not just whether the episode is ending in collision.
         brake_reduction is this agent's total closing speed the brake removed
-        this step (see step()), fed back below as r_brake."""
+        this step (see step()), fed back below as r_brake. agent_ground_struck
+        (Phase 3, 2026-08-20) is this agent's own GROUND_Z crossing, same
+        per-agent-not-global-blame idea as agent_collided -- fed back below
+        as r_ground's terminal component."""
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
@@ -730,6 +828,22 @@ class FormationEnv3D(ParallelEnv):
         if self._target_lost:
             r_contact += TARGET_LOST_PENALTY
 
+        # Ground urgency + terminal penalty (Phase 3, 2026-08-20) -- same
+        # two-tier pattern as collision (r_safety ramp + r_collision_global
+        # terminal) and target_lost (r_contact ramp + TARGET_LOST_PENALTY
+        # terminal): graduated warning as altitude approaches GROUND_Z, plus
+        # a large one-time penalty on the step this specific agent actually
+        # strikes it. See config.py's GROUND_URGENT_COEF/GROUND_STRIKE_PENALTY
+        # comment for why the terminal magnitude matches collision, not the
+        # softer target_lost.
+        r_ground = 0.0
+        z = float(p[2])
+        if z < GROUND_SAFE_ENTER:
+            span = GROUND_SAFE_ENTER - GROUND_Z
+            r_ground = GROUND_URGENT_COEF * min(1.0, (GROUND_SAFE_ENTER - z) / span)
+        if agent_ground_struck:
+            r_ground += GROUND_STRIKE_PENALTY
+
         # Joint bonus: an ADDITIVE reward composition lets the policy bank
         # "good enough" reward from tracking OR safety alone, which is
         # exactly the two-mode failure eval.py measured -- tight formation
@@ -758,12 +872,12 @@ class FormationEnv3D(ParallelEnv):
         r_brake = BRAKE_PENALTY_COEF * max(0.0, brake_reduction - BRAKE_PENALTY_THRESHOLD)
 
         total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global
-                      + r_velocity + r_joint + r_contact + r_brake)
+                      + r_velocity + r_joint + r_contact + r_brake + r_ground)
         components = {
             "track": float(r_track), "spread": float(r_spread),
             "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
             "joint": float(r_joint), "contact": float(r_contact),
-            "brake": float(r_brake),
+            "brake": float(r_brake), "ground": float(r_ground),
         }
         return total, components

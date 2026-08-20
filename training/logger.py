@@ -3,12 +3,13 @@ import csv
 
 LOG_PATH = "logs/training_log.csv"
 FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate", "target_lost_rate",
+          "ground_strike_rate",
           "avg_min_dist", "avg_ep_len", "entropy", "actor_loss", "critic_loss",
           "approx_kl", "clip_frac", "early_stop_kl", "steps_per_sec", "collect_steps_per_sec",
           "ent_coef", "entropy_recovery", "best_collision_rate",
           "mean_pairwise", "std_pairwise", "swarm_diameter",
           "r_track", "r_spread", "r_safety", "r_cohesion", "r_collision", "r_velocity", "r_joint", "r_contact",
-          "r_brake",
+          "r_brake", "r_ground",
           "log_std_mean", "mean_action_abs", "mean_brake_reduction",
           "mean_brake_passes", "max_brake_violation", "mean_brake_solo", "mean_brake_multi"]
 
