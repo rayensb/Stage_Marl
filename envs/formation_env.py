@@ -23,12 +23,12 @@ formula, even though most of this env (NUM_AGENTS, K_NEIGHBORS) is
 N-generic. This is a 4-agent study; revisit the derivation before changing
 NUM_AGENTS.
 
-KNOWN SIMPLIFICATION: the angular-spread reward (_get_reward's r_spread)
-only considers the XY (horizontal) projection of neighbor bearings, not
-true 3D angular separation -- a drone directly above/below a neighbor barely
-registers here. Distance-based terms (r_track, r_safety) still constrain
-vertical separation, so this isn't a safety gap, but it means "spread" is a
-horizontal-angular-distribution objective, not a full 3D geometric one.
+SUPERSEDED (was here through the xyz-spread branch, 2026-08-19): r_spread
+used to consider only the XY (horizontal) projection of neighbor bearings,
+blind to true 3D angular separation -- a drone directly above/below a
+neighbor barely registered. Replaced by true pairwise 3D angular
+separation between neighbor direction vectors -- see _IDEAL_NEIGHBOR_ANGLE
+and _get_reward below.
 
 VISION-BASED COOPERATIVE TARGET TRACKING (2026-08-14): the target is no
 longer ground-truth telemetry every drone knows regardless of distance. Each
@@ -71,16 +71,29 @@ from config import (
     BRAKE_PENALTY_COEF, BRAKE_PENALTY_THRESHOLD,
 )
 
-# XYZ r_spread (hypothesis, 2026-08-19, xyz-spread branch): ideal pairwise
-# angular separation between neighbor direction vectors, for however many
-# locked neighbors a drone has -- the same Tammes-problem logic config.py's
-# _PACKING_RATIO already uses for TARGET_DIST (maximally-spread points on a
-# sphere), applied locally around each drone instead of globally around the
-# target. Only K in {2, 3} ever occurs (EFFECTIVE_K at NUM_AGENTS in {3, 4};
-# NUM_AGENTS=2 gives K=1, which r_spread already skips entirely below).
-# K=2 -> antipodal (180 deg), K=3 -> equilateral triangle on a great circle
-# (120 deg) -- exact closed-form optimal packings, not guesses.
-_IDEAL_NEIGHBOR_ANGLE = {2: math.pi, 3: 2 * math.pi / 3}
+# XYZ r_spread (2026-08-19, xyz-spread branch; angle corrected 2026-08-20
+# after supervisor review): ideal pairwise angular separation between
+# neighbor direction vectors, for however many locked neighbors a drone
+# has. NOT the same quantity as config.py's _PACKING_RATIO/TARGET_DIST --
+# that's the angle the TARGET sees between two drones (global, e.g. 109.47
+# deg for N=4's regular tetrahedron); this is the angle a DRONE sees
+# between its neighbors (local). First implementation conflated the two
+# and used the global Tammes-optimal-free-points angle (180/120 deg for
+# K=2/3) here, which is wrong for this purpose -- it was pushing neighbor
+# directions wider than the actual target formation has, fighting
+# convergence rather than helping it.
+#
+# Correct value, verified both analytically and numerically (placing
+# vertices as standard basis vectors e_1..e_{k+1}, the angle between any
+# two edges (e_i - e_1, e_j - e_1) at a shared vertex has cos = 1/2 for
+# ANY k -- see deployment/docs or test_geometry.py for the check): under
+# full connectivity (K_NEIGHBORS = NUM_AGENTS - 1, this project's only
+# mode), the regular-simplex local vertex angle is exactly 60 degrees,
+# independent of K. Only K in {2, 3} ever occurs here (EFFECTIVE_K at
+# NUM_AGENTS in {3, 4}; NUM_AGENTS=2 gives K=1, which r_spread already
+# skips entirely below) -- both map to the same constant, which is why
+# this is no longer a per-K dict.
+_IDEAL_NEIGHBOR_ANGLE = math.pi / 3
 
 
 class FormationEnv3D(ParallelEnv):
@@ -384,12 +397,34 @@ class FormationEnv3D(ParallelEnv):
         # run instead of converging, unlike every NUM_AGENTS=3 run (see
         # EXPERIMENT_LOG.md). Repeating the sweep until no neighbor needs
         # further correction is POCS (projection onto an intersection of
-        # convex sets) -- provably convergent whenever the intersection is
-        # nonempty, which it always is here physically (v=0 satisfies every
-        # constraint, since max_closing is never negative). NUM_AGENTS passes
-        # is a cheap, small upper bound (this project supports at most 4
-        # agents, so at most 3 simultaneous constraints); the early-exit below
-        # is what actually terminates it in practice.
+        # convex sets), which converges in the limit whenever the
+        # intersection is nonempty -- always true here physically (v=0
+        # satisfies every constraint, since max_closing is never negative).
+        #
+        # CAUTION (added 2026-08-20 after supervisor review): "converges in
+        # the limit" is not the same claim as "NUM_AGENTS passes reaches
+        # exact/zero-residual convergence" -- that stronger claim is not
+        # proven here, only checked. NUM_AGENTS is used purely as a cheap
+        # upper bound on iterations (this project supports at most 4 agents,
+        # so at most 3 simultaneous constraints per agent); the early-exit
+        # below is what actually terminates it in practice, and if the exit
+        # condition never fires the loop just stops at the cap with whatever
+        # residual violation remains, silently. Adversarially stress-tested
+        # (2026-08-20): 2 agents head-on and 4 agents simultaneously
+        # converging on a shared centroid, both starting outside
+        # SAFE_DIST_ENTER and always commanding MAX_ACTION_SPEED toward each
+        # other/the centroid every step -- minimum distance asymptotically
+        # approached but never crossed COLLISION_DIST, zero residual
+        # constraint violation after _apply_brake on every step of both
+        # tests. Not a proof, and specific to this system: v_closing below is
+        # each agent's OWN velocity component toward the other, not the
+        # relative closing velocity (v_a - v_b) -- the two adversarial tests
+        # hold because every agent goes through this identical symmetric
+        # formula, with no way for one side to be unconstrained while the
+        # other closes at speed. That symmetry assumption stops holding once
+        # a real vehicle (whose actual velocity this code doesn't control)
+        # is involved -- see deployment/docs/PHASE2_HANDOFF.md. Reformulating
+        # this with explicit relative velocity is queued, not yet done.
         raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * MAX_ACTION_SPEED).astype(np.float32)
                    for a in self.agents}
         raw_vel, brake_reduction = self._apply_brake(raw_vel)
@@ -553,10 +588,11 @@ class FormationEnv3D(ParallelEnv):
         # True 3D angular separation (was horizontal/XY-bearing-only) -- see
         # _IDEAL_NEIGHBOR_ANGLE above. For each pair of locked neighbors,
         # the angle between their direction vectors from this drone; penalize
-        # the minimum pairwise angle's deviation from the Tammes-ideal for
-        # that neighbor count, same "penalize how far the tightest gap is
-        # from even spacing" shape the old 2D version used, just measured on
-        # the sphere instead of the horizontal plane.
+        # the minimum pairwise angle's deviation from the regular-simplex
+        # local ideal (60 deg, same for every K under full connectivity --
+        # see _IDEAL_NEIGHBOR_ANGLE), same "penalize how far the tightest
+        # gap is from even spacing" shape the old 2D version used, just
+        # measured on the sphere instead of the horizontal plane.
         r_spread = 0.0
         if len(neighbors) >= 2:
             dirs = []
@@ -571,8 +607,7 @@ class FormationEnv3D(ParallelEnv):
                     for i in range(len(dirs)) for j in range(i + 1, len(dirs))
                 ]
                 min_angle = min(pairwise_angles)
-                ideal_angle = _IDEAL_NEIGHBOR_ANGLE.get(len(dirs), math.pi)
-                r_spread = -0.3 * abs(min_angle - ideal_angle)
+                r_spread = -0.3 * abs(min_angle - _IDEAL_NEIGHBOR_ANGLE)
 
         # Safety is checked against ALL other agents, not just locked
         # neighbors -- collision termination is global (any pair, anywhere),
