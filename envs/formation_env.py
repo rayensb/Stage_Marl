@@ -72,6 +72,7 @@ from config import (
     GROUND_Z, GROUND_SAFE_ENTER, GROUND_SAFE_EXIT,
     GROUND_URGENT_COEF, GROUND_STRIKE_PENALTY,
     MAX_ACTION_SPEED_Z, TARGET_REDIRECT_INTERVAL_STEPS,
+    CRUISE_ALT_MIN, CRUISE_ALT_COEF, Z_SMOOTHING_ALPHA,
 )
 
 # XYZ r_spread (2026-08-19, xyz-spread branch; angle corrected 2026-08-20
@@ -539,6 +540,21 @@ class FormationEnv3D(ParallelEnv):
         action_scale = np.array([MAX_ACTION_SPEED, MAX_ACTION_SPEED, MAX_ACTION_SPEED_Z], np.float32)
         raw_vel = {a: (np.clip(actions[a], -1.0, 1.0) * action_scale).astype(np.float32)
                    for a in self.agents}
+
+        # Z-velocity smoothing (2026-08-20, user-reported jiggling --
+        # confirmed real, see config.py's Z_SMOOTHING_ALPHA comment).
+        # Deterministic, same "don't just hope the policy learns it" idea
+        # as the brake/ground clamp -- blends the freshly-commanded Z
+        # velocity with last step's ACTUAL Z velocity (self.vel, not yet
+        # overwritten at this point in step()) so the vertical component
+        # can't instantly reverse direction. Applied before the brake/
+        # ground clamp so those safety-critical corrections still always
+        # get the final say -- smoothing is a comfort preference, not a
+        # safety mechanism, and must never be able to block one.
+        for a in self.agents:
+            raw_vel[a][2] = (Z_SMOOTHING_ALPHA * raw_vel[a][2]
+                              + (1.0 - Z_SMOOTHING_ALPHA) * self.vel[a][2])
+
         raw_vel, brake_reduction = self._apply_brake(raw_vel)
         raw_vel, ground_reduction = self._apply_ground_clamp(raw_vel)
 
@@ -844,6 +860,16 @@ class FormationEnv3D(ParallelEnv):
         if agent_ground_struck:
             r_ground += GROUND_STRIKE_PENALTY
 
+        # Cruise-altitude preference (2026-08-20) -- separate from r_ground
+        # above: that's crash-avoidance (derived from REACTION_DIST, a hard
+        # physical boundary), this is a softer "don't loiter uncomfortably
+        # low" preference, graduated the same way but against CRUISE_ALT_MIN
+        # instead of GROUND_SAFE_ENTER. No bonus for flying high, only a
+        # penalty for dipping below the comfort floor.
+        r_altitude = 0.0
+        if z < CRUISE_ALT_MIN:
+            r_altitude = CRUISE_ALT_COEF * (CRUISE_ALT_MIN - z) / CRUISE_ALT_MIN
+
         # Joint bonus: an ADDITIVE reward composition lets the policy bank
         # "good enough" reward from tracking OR safety alone, which is
         # exactly the two-mode failure eval.py measured -- tight formation
@@ -872,12 +898,13 @@ class FormationEnv3D(ParallelEnv):
         r_brake = BRAKE_PENALTY_COEF * max(0.0, brake_reduction - BRAKE_PENALTY_THRESHOLD)
 
         total = float(r_track + r_spread + r_safety + r_cohesion + r_collision_global
-                      + r_velocity + r_joint + r_contact + r_brake + r_ground)
+                      + r_velocity + r_joint + r_contact + r_brake + r_ground + r_altitude)
         components = {
             "track": float(r_track), "spread": float(r_spread),
             "safety": float(r_safety), "cohesion": float(r_cohesion),
             "collision": float(r_collision_global), "velocity": float(r_velocity),
             "joint": float(r_joint), "contact": float(r_contact),
             "brake": float(r_brake), "ground": float(r_ground),
+            "altitude": float(r_altitude),
         }
         return total, components

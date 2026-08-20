@@ -351,6 +351,24 @@ BRAKE_PENALTY_THRESHOLD = 0.5 * MAX_ACTION_SPEED   # = 0.60
 GROUND_URGENT_COEF   = -30.0
 GROUND_STRIKE_PENALTY = -300.0
 
+# Cruise-altitude preference + vertical smoothing (2026-08-20, user-reported
+# jiggling -- confirmed real, not just a hunch: measured 8-25% of steps
+# flipping vertical-velocity sign on a trained Phase 3 checkpoint, one
+# agent briefly down to z=0.98). Separate concept from GROUND_SAFE_ENTER
+# (1.20, the hard safety floor derived from collision-avoidance reaction
+# distance) -- this is a softer "prefer not to loiter this low" preference,
+# a comfortable cruise height rather than a crash-avoidance boundary.
+CRUISE_ALT_MIN  = 1.5
+CRUISE_ALT_COEF = -10.0
+# Deterministic smoothing on commanded vertical velocity, same "don't just
+# hope the policy learns this" reasoning already validated for collision
+# (the brake) and the ground (the clamp) -- blends the new Z command with
+# last step's actual Z velocity rather than allowing an instant reversal.
+# 0.3 = 30% new command, 70% carried over -- a starting guess at enough
+# damping to visibly reduce sign-flipping without making vertical response
+# sluggish; first thing to retune if it overshoots either way.
+Z_SMOOTHING_ALPHA = 0.3
+
 # Per-axis action scaling (Phase 3, 2026-08-20) -- see envs/formation_env.py
 # step()'s comment. 0.6x is a starting guess at a real-ish climb-rate-vs-
 # lateral-speed ratio, not measured -- first thing to retune if this

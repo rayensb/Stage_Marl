@@ -144,7 +144,7 @@ def _handle_interrupt(signum, frame):
 signal.signal(signal.SIGINT, _handle_interrupt)
 signal.signal(signal.SIGTERM, _handle_interrupt)
 
-COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact", "brake", "ground"]
+COMPONENT_KEYS = ["track", "spread", "safety", "cohesion", "collision", "velocity", "joint", "contact", "brake", "ground", "altitude"]
 
 def joint(obs_dict):
     return np.concatenate([obs_dict[a] for a in AGENTS]).astype(np.float32)
@@ -527,6 +527,7 @@ def main():
                      r_collision=comp_avgs['collision'], r_velocity=comp_avgs['velocity'],
                      r_joint=comp_avgs['joint'], r_contact=comp_avgs['contact'],
                      r_brake=comp_avgs['brake'], r_ground=comp_avgs['ground'],
+                     r_altitude=comp_avgs['altitude'],
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
                      mean_brake_reduction=mean_brake_reduction,
                      mean_brake_passes=mean_brake_passes, max_brake_violation=max_brake_violation,
