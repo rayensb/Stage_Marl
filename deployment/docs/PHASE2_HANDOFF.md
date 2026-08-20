@@ -1,5 +1,17 @@
 # Phase 2 handoff: PX4/Gazebo/ROS2 deployment of the trained MARL policy
 
+> **ACTIVE WORK IN PROGRESS (branch `px4-deployment-wip`, 2026-08-20).**
+> This branch is a live PX4/Gazebo/ROS2 deployment debugging session (Phase
+> 7 observation-adapter verification, N=4 checkpoint evaluation, ongoing).
+> It was branched off `origin/vision-tracking` after the shared worktree at
+> `.claude/worktrees/vision-tracking` got switched to `xyz-spread-fixed` by
+> another concurrent session mid-task, which would have kept clobbering
+> this work. If you're working on reward-shaping / `xyz-spread` / the
+> N-aware-margin line of work, please don't force-push over this branch or
+> merge into it without checking in first -- ping before touching
+> `deployment/` here. Not blocking any other branch; just flagging so we
+> don't step on each other.
+
 Written 2026-08-20 at the end of the first live deployment session, to let
 a fresh conversation resume without re-deriving anything below. Read
 `TESTING_METHODOLOGY.md` first -- it's the protocol this effort now
