@@ -107,8 +107,22 @@ if NUM_AGENTS not in _PACKING_RATIO:
 # No longer just an internal derivation step -- envs/formation_env.py now
 # imports this directly too (the reshaped r_safety bonus ramps up to it),
 # so it lost its leading underscore.
-EDGE_TARGET  = SAFE_DIST_EXIT + REACTION_DIST                    # = 7.80, independent of N
-TARGET_DIST  = EDGE_TARGET / _PACKING_RATIO[NUM_AGENTS]          # ~4.78 at N=4
+#
+# N-aware margin (hypothesis, 2026-08-19, n-aware-margin branch): EDGE_TARGET
+# was flat regardless of N, but the brake/collision problem confirmed at N=4
+# (KNOWN_ISSUES.md item 8) scales with valence (simultaneous-neighbor count),
+# not N directly -- K_NEIGHBORS=NUM_AGENTS-1 is full connectivity, so each
+# agent has 2 simultaneous "others" at N=3 (the validated case) and 3 at N=4.
+# Adds one extra REACTION_DIST of margin per neighbor beyond that validated
+# count, so N=3 is exactly unchanged (max(0, 2-2)=0) and N=4 gets +1.20
+# (max(0, 3-2)=1) -- targets the actual mechanism instead of an arbitrary
+# "make N=4 bigger" fudge. Untested as of this branch; the check is whether
+# this measurably helps the confirmed N=4 collision persistence without
+# hurting tracking (a wider formation could push drones toward/past
+# SENSOR_RANGE, the same failure mode the old diameter floor caused once
+# vision-tracking existed -- see DECISIONS.md).
+EDGE_TARGET  = SAFE_DIST_EXIT + REACTION_DIST + max(0, K_NEIGHBORS - 2) * REACTION_DIST
+TARGET_DIST  = EDGE_TARGET / _PACKING_RATIO[NUM_AGENTS]          # ~4.78 at N=4 pre-this-change
 
 OBS_MAX_DIST      = 15.0
 OBS_MAX_VEL        = 2.0
