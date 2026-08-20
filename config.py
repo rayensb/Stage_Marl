@@ -257,18 +257,25 @@ VELOCITY_WEIGHT = float(os.environ.get("VELOCITY_WEIGHT", -0.15))
 SENSOR_RANGE = TARGET_DIST + 2 * REACTION_DIST
 
 # 2 seconds, per explicit design discussion -- worth being honest about what
-# this does and doesn't protect against in the current sim: the target moves
-# at constant velocity for the whole episode (fixed direction/speed at
-# reset, never updated), so dead-reckoning from a last-known reading is
-# mathematically exact here, not an approximation. This timeout isn't
-# currently protecting against real estimate drift -- it's the honest
-# engineering assumption (real systems don't trust dead-reckoning forever,
-# regardless of whether this particular target happens to cooperate), and it
-# sets the mechanism up correctly for when target motion is made less
-# trivial later (occasional direction/speed changes mid-episode -- a natural
-# next step, not attempted here).
-LOST_TIMEOUT_SEC   = 2.0
-LOST_TIMEOUT_STEPS = int(LOST_TIMEOUT_SEC / DT)   # = 40 at DT=0.05
+# this does and doesn't protect against in the current sim: the target used
+# to move at constant velocity for the whole episode (fixed direction/speed
+# at reset, never updated), which made dead-reckoning from a last-known
+# reading mathematically exact, not an approximation. Phase 3 (2026-08-20)
+# closed that gap -- the target now redirects periodically mid-episode (see
+# TARGET_REDIRECT_INTERVAL_STEPS) -- so this grace period is now protecting
+# against real estimate drift, not just a formality.
+#
+# Env-var overridable (2026-08-20) -- was a flat 2.0, tuned against
+# MAX_STEPS=200 (10s) episodes and never revisited when Phase 3 raised
+# MAX_STEPS to 1800 (90s). That mismatch is suspected as the primary cause
+# of Phase 3's target_lost_rate sitting near 100% and never improving: a
+# fixed 2-second grace window has ~9x more opportunities to be exceeded by
+# an ordinary, recoverable contact gap over a 9x longer episode, even with
+# no change in the swarm's actual moment-to-moment tracking competence.
+# Sweeping 6/10/18s across seeds to find out empirically rather than
+# guessing at one value.
+LOST_TIMEOUT_SEC   = float(os.environ.get("LOST_TIMEOUT_SEC", 2.0))
+LOST_TIMEOUT_STEPS = int(LOST_TIMEOUT_SEC / DT)   # = 40 at 2.0s/DT=0.05
 
 # Ramps 0 (swarm just lost contact) -> CONTACT_URGENT_COEF (right at the
 # LOST_TIMEOUT_STEPS boundary, where target_lost termination fires) --
