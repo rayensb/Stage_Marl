@@ -271,3 +271,278 @@ non-constant-velocity target motion (the 2s dead-reckoning grace period is curre
 *mathematically exact*, not an approximation, since the target moves at constant velocity for
 the whole episode — this only becomes a real approximation once target motion is made less
 trivial, which is itself a natural next step, not yet taken).
+
+## Multi-pass brake convergence (POCS), replacing a single sequential sweep
+
+**Decision**: `_apply_brake` (`envs/formation_env.py`) repeats its per-neighbor closing-speed
+correction across all neighbors until no further correction is needed, or `NUM_AGENTS` passes
+are used, whichever comes first — instead of one sequential sweep through neighbors.
+**Rejected alternative**: the original single-pass version (correct for exactly one active
+threat, but a later neighbor's correction could silently reintroduce a violation of an
+earlier neighbor's constraint, never re-checked).
+**Why**: each per-neighbor closing-speed cap is a halfspace constraint on velocity
+(`dot(v, dir_to_b) <= max_closing`), and the correction applied is exactly the Euclidean
+projection onto that halfspace. Repeating the sweep until stable is POCS (projection onto an
+intersection of convex sets) — a standard, provably-limit-convergent technique whenever the
+intersection is nonempty, which it always is here physically (`v=0` satisfies every
+constraint, since `max_closing` is never negative). This directly targets the confirmed
+`NUM_AGENTS=4` mechanism: each agent has 3 simultaneous "others" under full connectivity
+(`K_NEIGHBORS=NUM_AGENTS-1`) instead of `NUM_AGENTS=3`'s 2, and the single-pass version's
+training-time `collision_rate` stayed nonzero and scattered across an entire 3M-step run
+instead of converging (see `EXPERIMENT_LOG.md`'s `N=4` validation entry).
+**Important precision, added after a supervisor review pushed back on an earlier overclaim**:
+"converges in the limit" (proven) is a weaker claim than "`NUM_AGENTS` passes reaches exact,
+zero-residual convergence" (not proven — `NUM_AGENTS` is used only as a cheap iteration cap,
+not a derived bound). The early-exit is what actually terminates the loop in practice; if it
+never fires, the loop stops at the cap with whatever residual violation remains, silently. Two
+diagnostics (`_last_brake_passes`, `_last_brake_violation`) were added specifically to make
+this checkable rather than assumed — see the brake-instrumentation entry below.
+**Verification**: adversarially stress-tested (not just trained-and-hoped) — 2 agents head-on
+and 4 agents simultaneously converging on a shared centroid, both starting outside
+`SAFE_DIST_ENTER` and always commanding `MAX_ACTION_SPEED` toward each other/the centroid
+every step. Minimum distance asymptotically approached but never crossed `COLLISION_DIST`,
+zero residual constraint violation after `_apply_brake` on every step of both tests. Not a
+formal proof, and specific to this system: `v_closing` is each agent's *own* velocity
+component toward the other, not the relative closing velocity (`v_a - v_b`) — the stress
+tests hold because every agent runs through the identical symmetric formula, with no way for
+one side to be unconstrained while the other closes at speed. That symmetry assumption stops
+holding once a real, independently-controlled vehicle is involved — see
+`deployment/docs/PHASE2_HANDOFF.md` and `KNOWN_ISSUES.md`. Reformulating with explicit
+relative velocity is queued, not yet done.
+**Result**: validated as part of the Phase2-combined bundle (below) — 3/3 `N=4` seeds clean at
+0% `collision_rate` across a 5M-step run, first time `N=4` converged cleanly. See
+`EXPERIMENT_LOG.md`.
+
+## Direct brake-engagement reward penalty — v1 (linear) tested, replaced with v2 (threshold)
+
+**Decision**: add `r_brake`, a reward penalty proportional to how much closing speed the
+brake actually removed (`brake_reduction`, already computed every step, previously only
+logged) — closing a gap the indirect `r_safety` urgent-zone penalty leaves open: that penalty
+is proximity-based, not action-based, so a policy could keep commanding more-than-safe closing
+speed without anything specifically penalizing *that choice*, only ambient proximity.
+**v1 (linear from zero)**: `r_brake = BRAKE_PENALTY_COEF * brake_reduction`. **Result**:
+`collision_rate` genuinely fixed (88/59/269 nonzero rollouts out of 1465 per seed dropped to
+14/10/15, all three seeds clean for their entire last 10 rollouts) — but `swarm_diameter`/
+`avg_min_dist` both ran noticeably wider than before and `tracking_rmse` worsened slightly.
+**Diagnosis**: a linear-from-zero penalty can't distinguish a trivial, routine nudge (a
+fraction of a percent of `MAX_ACTION_SPEED`) from a real emergency correction — it taxes both,
+so the policy's cheapest way to minimize the penalty is to avoid entering the brake's trigger
+zone at all (spread out more than necessary), not just avoid needing a large correction once
+inside it — "a good driver rarely triggers ABS" doesn't mean a good driver's ABS light can
+never so much as flicker.
+**v2 (threshold)**: `r_brake = BRAKE_PENALTY_COEF * max(0, brake_reduction -
+BRAKE_PENALTY_THRESHOLD)` — zero penalty below the threshold (matches "normal braking" being
+free), only the excess above it is taxed. `BRAKE_PENALTY_THRESHOLD` is derived from the
+brake's own geometry, not picked independently: `0.5 * MAX_ACTION_SPEED` corresponds to a
+full-speed closing approach already halfway through the safety zone toward `COLLISION_DIST` —
+a genuinely aggressive, late correction, not a minor one. `BRAKE_PENALTY_COEF` itself
+unchanged from v1 (only the zero-point moved).
+**Result**: validated as part of the Phase2-combined bundle — collision stayed at 0% (3/3
+`N=4` seeds) without the v1 diameter/tracking regression. See `EXPERIMENT_LOG.md`.
+
+## Brake instrumentation (`brake_passes`, `brake_violation`, solo/multi split)
+
+**Decision**: `_apply_brake` now stashes three diagnostics on `self` instead of returning
+them (to keep its return signature unchanged — `deployment/inference_node.py` depends on the
+exact `(corrected_vel, brake_reduction)` unpack): `_last_brake_passes` (how many POCS passes
+this call took), `_last_brake_violation` (worst remaining constraint violation after the loop
+— should be ~0 if converged before the pass cap), `_last_brake_k_active` (how many other
+agents were within `SAFE_DIST_ENTER` of each agent, letting callers split `brake_reduction`
+into solo vs. multi-neighbor engagement). Threaded to 4 new `training_log_*.csv` columns
+(`mean_brake_passes`, `max_brake_violation`, `mean_brake_solo`, `mean_brake_multi`).
+**Why**: turns the multi-pass convergence's "should converge, verified only by stress test"
+claim into something checkable against every real training rollout, not just two synthetic
+scenarios — and the solo/multi split is specifically what the N-aware-margin hypothesis (next
+entry) needs to check whether its targeted mechanism (simultaneous-neighbor count) is the
+right one.
+**Status**: pure logging addition, doesn't change training behavior — safe to build on
+without re-validating anything upstream of it.
+
+## N-aware safety margin — `EDGE_TARGET` scaled by simultaneous-neighbor count
+
+**Decision**: `EDGE_TARGET = SAFE_DIST_EXIT + REACTION_DIST + max(0, K_NEIGHBORS - 2) *
+REACTION_DIST` — adds one extra `REACTION_DIST` of margin per simultaneous neighbor beyond
+the validated `NUM_AGENTS=3` case (`K_NEIGHBORS=2`). Unchanged at `N=3` (`max(0, 2-2)=0`), one
+extra `REACTION_DIST` (1.20) at `N=4` (`max(0, 3-2)=1`).
+**Rejected framing**: an arbitrary "make `N=4` bigger" fudge (e.g. a flat multiplier on
+`TARGET_DIST` regardless of mechanism).
+**Why this form specifically**: targets *valence* (how many simultaneous "others" a drone's
+safety layer has to negotiate with at once), the actual mechanism the brake's multi-pass fix
+addresses, rather than `N` directly — `K_NEIGHBORS = NUM_AGENTS - 1` is full connectivity in
+this project, so valence and `N` happen to move together here, but the formula is written
+against the mechanism, not the coincidence.
+**Known risk, flagged before testing**: a wider formation could push drones toward/past
+`SENSOR_RANGE` more than necessary — the same failure mode the old diameter floor caused once
+vision-tracking existed (see the diameter-floor entry above). Worth checking tracking metrics
+specifically, not just collision, once tested.
+**Status**: tested standalone (single seed, `N=4`) alongside the brake fixes, then folded into
+the Phase2-combined bundle for the full validation — see `EXPERIMENT_LOG.md`.
+
+## 3D (XYZ) `r_spread`, and a geometry bug caught by supervisor review before it shipped broken
+
+**Decision**: replace `r_spread`'s horizontal-only (XY bearing-sort) construction with true
+pairwise 3D angular separation between locked-neighbor direction vectors — for each pair of a
+drone's neighbors, the angle between their direction vectors from that drone, penalizing how
+far the *minimum* pairwise angle sits from an ideal.
+**Why**: `N=4`'s exact-consistent target formation (a regular tetrahedron — see the geometric
+feasibility check in `EXPERIMENT_LOG.md`) is inherently non-planar, and the old horizontal-only
+shaping was blind to the one axis (vertical) where reaching that optimum actually requires
+structure. See `KNOWN_ISSUES.md` item 5 (now resolved) for the full mechanistic argument.
+**The bug**: the first implementation used `_PACKING_RATIO`'s angle (109.47°/120° for
+`K=2`/`3`) as the ideal — the angle a formation's *target* sees between two drones (a global,
+target-viewpoint quantity). `r_spread` actually penalizes the angle a *drone* sees between its
+own neighbors (a local, drone-viewpoint quantity) — a different geometric quantity that is not
+interchangeable with the first, despite both being expressible as degrees between two drones.
+Using the wrong one was pushing neighbor directions wider than the actual target formation
+has, fighting convergence rather than helping it.
+**The fix**: `_IDEAL_NEIGHBOR_ANGLE = math.pi / 3` (60°) — proven, not guessed: placing
+`k+1` vertices as standard basis vectors (a textbook regular-simplex construction; `k=2` gives
+the `N=3` equilateral triangle, `k=3` gives the `N=4` regular tetrahedron), the angle between
+any two edges meeting at a shared vertex has `cos = 1/2` for *any* `k` — exactly 60°,
+independent of neighbor count. Both `K=2` (`N=3`) and `K=3` (`N=4`) map to the same constant,
+which is why `_IDEAL_NEIGHBOR_ANGLE` is a single module-level constant, not a per-`K` dict.
+**Verification infrastructure added specifically because this bug shipped once**:
+`test_geometry.py` computes both the global (target-viewpoint) and local (drone-viewpoint)
+angles from the same regular-simplex construction, asserts they're different quantities,
+and asserts `_IDEAL_NEIGHBOR_ANGLE` matches the local one exactly (to `1e-9`) — this is the
+check that would have caught the bug before it shipped, not after.
+**Timeline note, for provenance when reading old logs**: the Phase2-combined 5-seed
+validation run (`EXPERIMENT_LOG.md`) was already in flight on Kaggle when the angle bug was
+found and fixed (commit `ac98d67`) — that validation used the *wrong* (109.47°/120°) angle.
+The corrected 60° version was re-tested in isolation afterward (`xyz-spread-fixed` branch,
+`spread_fixed_seed1`) specifically to check whether the bug had actually cost anything
+measurable, before trusting the combined result. See `EXPERIMENT_LOG.md` for both results.
+
+## Phase2-combined: merge four independently-motivated fixes, then validate as a bundle
+
+**Decision**: after the brake multi-pass fix, brake-engagement penalty, N-aware margin, and
+XYZ `r_spread` were each individually motivated by the confirmed `N=4` collision mechanism
+(`KNOWN_ISSUES.md` items 5 and 8), merge all four into one branch (`phase2-combined`) and run
+one 5-seed validation sweep (`N=2,3,4`) rather than testing each in complete isolation through
+to a full multi-seed conclusion.
+**Tension with the project's own stated discipline**: `AI_CONTEXT.md`'s working-pattern note
+explicitly warns that bundling multiple changes into one tested commit has burned this project
+before (twice, both times flagged afterward as a lapse) and recommends isolating one variable
+per test. This decision accepts that risk deliberately, not by accident, for a specific
+reason: the first two fixes (brake multi-pass, brake-engagement penalty) target the same
+confirmed mechanism and were proposed together from the start (`TODO.md`'s original Phase 1);
+the second two (N-aware margin, XYZ spread) are a distinct "formation-quality" pair, tested
+standalone first (single-seed each, per `EXPERIMENT_LOG.md`) before being folded in — so the
+bundle is two already-individually-checked pairs combined for a final full-scale validation,
+not four totally untested ideas thrown together at once. Kaggle's 5-concurrent-session cap was
+also a practical factor in not running every permutation separately.
+**Result**: 3/3 `N=4` seeds clean (0% collision), best seed's `tracking_rmse` 1.43 — the best
+of the project to that point; 1/1 `N=3` clean collision with some `target_lost` noise in one
+seed (a second `N=3` seed, `phase2_n3_seed2`, was run afterward specifically to check whether
+that noise was real or seed-variance — it wasn't, see `EXPERIMENT_LOG.md`); 1/1 `N=2` clean.
+**Status**: this is the validated reference point Phase 3 (below) branches from. `main` itself
+was not fast-forwarded to it in this pass — a manual `git push origin phase2-combined:main` is
+still pending (blocked by the permission classifier on a direct push from the agent; verified
+as a clean fast-forward, no conflicts) — see `TODO.md`.
+
+## Phase 3: bundling five sustained-flight changes as an explicit "leap of faith," not a lapse
+
+**Decision**: bundle five changes (longer episodes, a larger network, ground awareness,
+per-axis Z/XY speed limits, dynamic target motion) into one branch (`phase3-resilience`, off
+`phase2-combined`) and test them together, rather than isolating each first.
+**Why this one is different from the Phase2-combined bundling above**: this was an explicit,
+informed user call, not a default — `training/diagnose_horizon.py` had shown the best
+Phase2-combined checkpoint's tracking error nearly quadrupling (0.95 → 3.66) once run for 60
+simulated seconds instead of its 10-second training horizon, in a window (20-30s) that lines
+up with where the real PX4/Gazebo deployment actually crashed (15-40s) — real, load-bearing
+evidence, not a hunch (see `deployment/docs/PHASE2_HANDOFF.md`). Given that evidence and
+limited time, the user chose to test the whole resilience hypothesis at once, with an
+explicitly agreed fallback already in place: if the combined run doesn't produce good results,
+isolate each change individually to find out which one(s) actually mattered. This makes the
+bundling a deliberate, risk-acknowledged trade of attribution clarity for speed, with a
+pre-agreed recovery plan — not the same failure mode `AI_CONTEXT.md`'s working-pattern note
+warns about (which was about *accidentally* losing attribution, not choosing to).
+**Result**: mixed, and the bundling's risk materialized partially, but diagnosably. Safety
+(collision, ground_strike) succeeded completely: 0% collision across all 3 seeds,
+`ground_strike_rate` literally 0/209 rollouts in every seed. Tracking failed catastrophically:
+`target_lost_rate` 89-100%, flat from the very first logged rollout through the full 3M steps,
+never improving in any seed. Because the failure was flat-from-step-1 rather than a mid-run
+regression, and because collision (subject to the same "9x fewer episodes" risk from the
+longer-episode change) converged fine, the cause was isolable *without* reverting to
+one-variable-at-a-time testing — see the `LOST_TIMEOUT_SEC` entry below.
+**Status**: root cause diagnosed and a fix (env-overridable `LOST_TIMEOUT_SEC`, swept across
+6/10/18s) is in progress, not yet confirmed. See `EXPERIMENT_LOG.md`/`CURRENT_STATE.md`.
+
+## Ground awareness: clamp + reward + termination, mirroring the brake's pattern exactly
+
+**Decision**: give the ground plane (previously not modeled at all — confirmed by search, not
+an oversight being fixed blind) the same three-part treatment already validated for
+inter-agent collision: a deterministic `_apply_ground_clamp` (single-pass, not multi-pass —
+unlike two drones, the ground doesn't move and can't itself be a conflicting constraint, so
+one pass is exact), a graduated `r_ground` reward penalty as altitude approaches `GROUND_Z`,
+and a `ground_strike` termination flag, distinct from `collision`/`target_lost` (same
+"distinct failure modes stay distinctly labeled" pattern already established).
+**Why reuse the pattern instead of reward-shaping alone**: reward shaping alone was already
+proven insufficient for the inter-agent case (six failed attempts before the brake) — no
+reason to expect it'd fare better against a hard physical floor. `GROUND_URGENT_COEF` mirrors
+`SAFETY_URGENT_COEF`'s ramp shape; `GROUND_STRIKE_PENALTY` matches `r_collision_global`'s -300
+magnitude (not the softer -200 `TARGET_LOST_PENALTY`) — a real ground strike is judged at
+least as severe as an inter-agent collision, not a softer, recoverable-in-principle failure
+like losing target contact.
+**A real bug found while smoke-testing, not shipped blind**: naive ground-safety spawn
+clamping (applied once in `reset()`, before `_resolve_overlaps()`) could collapse inter-agent
+vertical separation and cause an immediate step-0 collision. Fixed by alternating
+`_resolve_overlaps()` and the Z-clamp in a joint fixed-point loop (up to 20 iterations) in
+`reset()` instead of applying each once in sequence — verified across 500 seeds at `N=2/3/4`
+with zero violations of either constraint before this shipped.
+**Result**: `ground_strike_rate` was 0/209 rollouts in every one of the 3 Phase 3 validation
+seeds — the mechanism worked cleanly from the very first test, no iteration needed (unlike the
+brake, which needed the multi-pass fix after its first `N=4` test). See `EXPERIMENT_LOG.md`.
+
+## Cruise-altitude preference + deterministic Z-velocity smoothing
+
+**Decision**: two separate, additive mechanisms for vertical flight quality, distinct from
+`GROUND_SAFE_ENTER`'s hard crash-avoidance boundary: `r_altitude`, a graduated reward penalty
+for loitering below `CRUISE_ALT_MIN=1.5` (a comfort preference, not a safety mechanism — no
+bonus for flying high, only a penalty for dipping low); and `Z_SMOOTHING_ALPHA`-based
+deterministic blending of each step's commanded Z velocity with the previous step's *actual*
+Z velocity, applied in `step()` *before* the brake/ground clamp so those safety-critical
+corrections always retain final say over a comfort-only smoothing pass.
+**Why confirmed empirically before implementing anything**: the user reported jiggling; rather
+than assume it was real (or assume a specific cause), a standalone script loaded the best
+Phase 3 checkpoint and ran 400 deterministic steps, measuring 8-25% of steps per agent flipping
+vertical-velocity sign, with one agent briefly dipping to `z=0.98`. Confirmed real before any
+fix was written.
+**Why a deterministic smoothing filter, not a reward-only fix**: same "don't just hope the
+policy learns it" reasoning already validated for collision (the brake) and the ground (the
+clamp) — a reward term can only ever bias behavior statistically; a filter guarantees the
+property. `Z_SMOOTHING_ALPHA=0.3` (30% new command, 70% carried over) is a starting guess at
+enough damping to visibly reduce sign-flipping without making vertical response sluggish —
+flagged as the first thing to retune if it overshoots either way, same spirit as every other
+"starting guess" constant in `config.py`.
+**Status**: implemented and bundled into the same branch as the `LOST_TIMEOUT_SEC` fix under
+explicit time pressure ("include the altitude thing then test all we don't have much time") —
+smoke-tested locally, not yet re-measured against a trained checkpoint post-fix. Verifying the
+jiggling is actually reduced (not just that the code runs) is a pending step once the current
+Kaggle sweep completes — see `TODO.md`.
+
+## `LOST_TIMEOUT_SEC` made env-overridable and swept, instead of guessing one new value
+
+**Decision**: `LOST_TIMEOUT_SEC` (previously a flat `2.0`, hardcoded) became
+`float(os.environ.get("LOST_TIMEOUT_SEC", 2.0))`, and 5 Kaggle kernels were launched sweeping
+6/10/18 seconds (2/2/1 seeds) rather than picking one new value analytically.
+**Why the original 2.0 broke**: it was tuned against `MAX_STEPS=200` (10s) episodes and never
+revisited when Phase 3 raised `MAX_STEPS` to 1800 (90s) — a fixed 2-second grace window has
+~9x more independent opportunities to be exceeded by an ordinary, recoverable contact gap over
+a 9x longer episode, even with zero change in the swarm's actual moment-to-moment tracking
+competence. This diagnosis was reasoned from evidence, not assumed: `target_lost_rate` was
+flat at 89-100% from the very first logged rollout (not a mid-training regression, which would
+suggest a learning-dynamics cause), and `collision_rate` — subject to the same "9x fewer
+episodes" data-starvation risk from the longer-episode change — converged fine, arguing against
+pure data-starvation as the explanation and pointing specifically at the timeout/episode-length
+mismatch instead.
+**Why sweep instead of computing a new fixed value**: no clean formula maps "how long should
+dead-reckoning be trusted" to `MAX_STEPS` — it depends on how often real contact gaps occur and
+how long they typically last, which is a property of the trained policy's behavior, not a
+constant that can be derived the way `REACTION_DIST` or `SAFE_DIST_ENTER` were. Measuring
+across a spread of values is the honest way to find a working one, consistent with this
+project's established pattern of measuring rather than guessing at reward/config constants.
+**Status**: in progress. 4 of 5 kernels (6s x2, 10s x2) launched and running; the 18s kernel
+was blocked by Kaggle's 5-concurrent-session cap even after the other 4 were confirmed running
+and everything else confirmed complete — see `KNOWN_ISSUES.md` and `SESSION_HANDOFF.md` for
+the live troubleshooting state.

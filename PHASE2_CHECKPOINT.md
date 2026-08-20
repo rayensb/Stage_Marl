@@ -110,6 +110,38 @@ branch `phase3-resilience`) -- note the actual slugs Kaggle assigned
 differ from what was requested (title-derived, not the requested id):
 `stage-marl-phase3-resilience-seed1`, `-seed2`, `-seed3`.
 
+## Update 2026-08-20 (later still): altitude fix bundled in, docs refreshed, timeout sweep in progress
+
+`phase3-resilience` (commit `62a685d`) now also includes a cruise-altitude reward preference
+(`CRUISE_ALT_MIN`/`CRUISE_ALT_COEF`) and deterministic Z-velocity smoothing
+(`Z_SMOOTHING_ALPHA`), fixing a confirmed vertical-jiggling issue (8-25% of steps per agent
+flipping vz sign on a trained checkpoint) — bundled with the `LOST_TIMEOUT_SEC` fix below
+under time pressure, not yet re-verified against a post-fix checkpoint.
+
+`LOST_TIMEOUT_SEC` is now env-overridable (was a flat 2.0) — Phase 3's `target_lost_rate`
+came back catastrophic (89-100%, all 3 seeds, flat from the first rollout) because this never
+scaled when `MAX_STEPS` grew 9x. A 5-kernel sweep (6s x2 seeds, 10s x2 seeds, 18s x1 seed) is
+running: `stage-marl-timeout6-seed1`, `-timeout6-seed2`, `-timeout10-seed1`, `-timeout10-seed2`
+confirmed `RUNNING`. `-timeout18-seed1` has not started — Kaggle's "Maximum batch CPU session
+count of 5" persisted even with only 4 kernels confirmed running and everything else on the
+account confirmed complete; likely an orphaned session from an earlier interrupted push,
+invisible to `kernels status`. No CLI/API way found to list or cancel it directly. If you're
+picking this up: check Kaggle's web UI (Your Work → Notebooks) for a stray running session
+before retrying the push again, and see `docs/ai_context/KNOWN_ISSUES.md` item 15 for the full
+troubleshooting record.
+
+`docs/ai_context/` (all 11 files) was fully rewritten this pass to reflect everything since
+the last update: Phase 1/1b (brake fixes), the N-aware-margin/xyz-spread hypotheses and the
+geometry-angle bug caught along the way, the Phase2-combined validation, Phase 3's bundle and
+its `target_lost` failure, and the in-progress sweep above. Also corrected a stale claim in
+`ARCHITECTURE.md`/`AI_CONTEXT.md`/`ENVIRONMENT.md` that the repo had no ROS2/Gazebo/PX4
+integration — `deployment/` exists now (this thread's work) and is cross-referenced from
+those files, though its own documentation stays in `deployment/docs/` as before.
+
+**Kaggle account username, for whoever launches the next kernel**: `rayensboui`, not
+`rayensb` (the GitHub org name) — easy to transpose, produces a permission-denied error that
+reads like a slug typo rather than an owner typo.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,

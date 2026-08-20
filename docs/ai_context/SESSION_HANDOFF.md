@@ -6,150 +6,180 @@ session ends mid-task or reaches a natural checkpoint.
 
 ## Last updated
 
-2026-08-19. Prior entry (2026-08-17) covered the session that solved collision and tracking at
-`NUM_AGENTS=3` and merged to `main` (`b59c139`). Since then: `NUM_AGENTS=4` was run (3 seeds,
-3M steps, against commit `45b42a2`) with a mixed result — tracking generalized cleanly,
-collision did not — followed by a design discussion (brake determinism, formation geometry,
-proposed fixes) and this doc update. **No code has changed in this pass** — `main` is still at
-`45b42a2`; everything new below is analysis and proposals, not yet implemented.
+2026-08-20. Prior entry (2026-08-19) covered the session that ran the first `NUM_AGENTS=4`
+3-seed validation and found a mixed result (tracking generalized, collision didn't) — that
+problem is now **resolved**. Since then: the two proposed fixes for it were implemented and
+validated, two formation-quality hypotheses were tested and merged alongside them, a real
+geometry bug was caught by review before it cost anything measurable, the combined result was
+validated across `N=2/3/4`, a sustained-flight diagnostic surfaced a *new* problem (tracking
+degrades past the training horizon, matching real deployment crash timing), a 5-change bundle
+was built and tested to address it (explicit "leap of faith," user-directed), and that bundle's
+one serious failure (`target_lost_rate` near 100%) was diagnosed and a fix is now being swept
+on Kaggle. This doc update itself — "document all" — is the most recent action.
 
 ## What was happening (the short version)
 
-This session started by reconstructing context from a prior session's handoff (which was
-waiting on `NUM_AGENTS=4` results that had never actually arrived), found the actual local
-data was `NUM_AGENTS=3`, and used it to diagnose a long-standing collision-rate collapse. Six
-reward-shape/schedule fixes in a row failed (recovery-trigger budget, recovery timing,
-`r_safety` zone reshape, a diameter floor) before direct instrumentation revealed the real
-cause: the policy was learning to commit to larger-magnitude actions over training, not
-losing exploration noise — every prior fix had targeted the wrong variable. The actual fix
-was a **deterministic action-space safety layer** (the closing-speed brake), not a reward
-change, and it worked immediately and completely (`collision_rate=0.000`).
+Starting from the `N=4` collision problem confirmed at the end of the last session: two fixes
+were implemented together (multi-pass POCS-style brake convergence; a brake-engagement reward
+penalty) and validated on `N=4` — collision fixed, but a first, linear-from-zero version of the
+penalty (Phase 1) pushed the formation wider and hurt tracking. A refined threshold-based
+version (Phase 1b) fixed that side effect without losing the collision fix. In parallel, two
+formation-quality hypotheses — an N-aware safety margin, and a true-3D (not horizontal-only)
+`r_spread` — were each tested standalone, then merged with the Phase 1b brake fixes into
+`phase2-combined` for a full 5-seed validation across `N=2/3/4`. Result: the best `N=4` numbers
+of the project (0% collision in all 3 seeds, 0% `target_lost`, `tracking_rmse` averaging 1.91).
+**A real bug was caught mid-stream by supervisor review**: the first `r_spread` implementation
+used the wrong angle (a global, target-viewpoint quantity where a local, drone-viewpoint one
+was needed) — caught, fixed, and given a permanent regression test (`test_geometry.py`) before
+it was trusted, though an isolated re-test found the bug hadn't visibly cost anything in that
+one run.
 
-With collision solved, focus shifted to tracking quality, which led to a deliberate,
-carefully-scoped redesign: **vision-based cooperative target tracking**, replacing the
-ground-truth telemetry every drone had always had access to. This surfaced a new failure mode
-(`target_lost`) that took two more iterations to resolve (disabling a diameter floor that had
-become counterproductive, then training substantially longer) before a 3-seed, 3M-step
-validation confirmed it: 0-3% target-lost, 0-1% collision, best tracking accuracy of the whole
-session. Merged to `main`, then `docs/ai_context/` was brought up to date on explicit request
-("document all") — commit `45b42a2`.
+With `phase2-combined` validated, a sustained-flight diagnostic
+(`training/diagnose_horizon.py`, built specifically for this check) ran the best checkpoint for
+60 simulated seconds instead of its 10-second training horizon — tracking error nearly
+quadrupled (0.95 → 3.66) in a 20-30s window that lines up *directly* with where the real
+PX4/Gazebo deployment (a concurrent conversation's work, sharing this worktree) actually
+crashed (15-40s). Given that evidence and limited time, the user made an explicit, informed
+call to bundle five sustained-flight changes together (longer episodes, a larger network,
+ground awareness, per-axis Z/XY speed limits, dynamic target motion) rather than isolate each
+first — with an agreed fallback already in place if it didn't work. It partially didn't:
+ground awareness and per-axis dynamics succeeded cleanly (0 ground strikes across every
+validation rollout), collision stayed unaffected (~0%), but `target_lost_rate` came back at
+89-100%, flat from the very first rollout through the entire 3M-step run in all 3 seeds — a
+new failure at a severity matching the original collision problem.
 
-**Then (2026-08-19)**: the planned `NUM_AGENTS=4` validation ran (3 seeds, 3M steps) — see
-`EXPERIMENT_LOG.md`. Tracking transferred cleanly with no changes. Collision did not: eval-time
-numbers looked fine (0-2%) but training-time rolling-window data showed the real picture —
-scattered, non-converging collision events throughout the full run in all 3 seeds, confirming
-what `KNOWN_ISSUES.md` item 8 had only flagged as theoretical before. This led to a design
-discussion covering: whether the closing-speed brake is "still ML" (it isn't — a deterministic
-layer on top of a fully-learned policy, same pattern as ABS on a car), a geometric check of
-whether `N=4`'s target formation numbers are even mutually satisfiable (they are — verified
-exactly, see `EXPERIMENT_LOG.md`'s geometric feasibility entry), and four concrete, **not yet
-implemented** proposed fixes now queued in `TODO.md` (multi-pass brake convergence, a direct
-brake-engagement reward penalty, an N-aware safety margin, and a 3D/XYZ `r_spread`). Separately,
-the user shared a detailed PX4+Gazebo+ROS2 SITL deployment-architecture writeup (their own setup
-work on a separate machine) requesting feedback — feedback was given inline in conversation, but
-per the user's own explicit request that workflow's documentation is deferred, not saved to
-`docs/ai_context/` yet.
+The user asked for a plain-language explanation of what the "grace period" (`LOST_TIMEOUT_SEC`)
+actually does, then, once it clicked, gave a precise, multi-part request: increase the grace
+period and sweep several values to find a working one (6s/10s/18s, specific seed counts given);
+add a coordinated "active search" behavior for when the swarm loses the target entirely
+(queued, not yet built); and fix reported vertical jiggling, preferring a real altitude floor
+or top-down tracking over letting the drone bob. Under an explicit time-pressure instruction
+("include the altitude thing then test all we don't have much time"), the altitude/jiggling
+fix (empirically confirmed first, then fixed with a graduated reward preference plus
+deterministic Z-velocity smoothing) was bundled into the same branch and Kaggle sweep as the
+`LOST_TIMEOUT_SEC` fix, rather than tested separately. 4 of the 5 sweep kernels launched
+successfully; the 5th hit a Kaggle platform quirk (session-cap error despite only 4 kernels
+confirmed running) that wasn't resolved before time pressure was lifted.
 
-## What changed this session (chronological, commits on `main`)
+Once time pressure was lifted, the user asked for two things in order: bring `docs/ai_context/`
+fully up to date (this document is part of that), then go back and resolve the stuck 5th
+kernel. The stuck-kernel investigation confirmed the 4 real kernels are running and everything
+else on the account is genuinely complete, narrowed the likely cause to an orphaned session
+from an earlier interrupted push, and found no CLI/API way to list or cancel it directly (no
+Chrome browser was connected to check Kaggle's web UI in this session) — see "Unresolved"
+below.
 
-- `494c23b` → `e4af171` → `67ccfd7`: three consecutive attempts at fixing the collision
-  collapse via reward/schedule changes. **All three tested and falsified or found
-  insufficient** — see `EXPERIMENT_LOG.md` for the full data. Do not re-propose these without
-  reading why they failed first.
-- `ff104b4`: added `log_std_mean`/`mean_action_abs` instrumentation. This is the turning point
-  of the whole session — it's what actually revealed the real cause instead of another guess.
-- `0b6278d`: the closing-speed brake. **Solved collision** — `collision_rate=0.000` from here
-  on, replicated across every subsequent config.
-- `09e3038`: fixed a real bug (found via an external review, verified before acting on it) —
-  `r_collision` had been silently logging `0.0` in every rollout of every run ever produced,
-  due to a stale `env.agents` check reading state after it had already been mutated.
-  Training itself was unaffected; only that one logged/plotted column was blind.
-- `dc1de73` (on a `vision-tracking` branch, later merged): the full vision-based cooperative
-  tracking redesign — see `ARCHITECTURE.md`/`DECISIONS.md` for the mechanism.
-- `b59c139`: disabled the diameter floor (`DIAMETER_FLOOR_WEIGHT` → 0.0), which had become
-  counterproductive once vision-tracking added a sensor-range constraint the floor was
-  fighting. This is where `main` is now, after merging the `vision-tracking` branch in.
-- Between `dc1de73` and merge: single-seed verification at 600k (floor active, then
-  disabled), 1.2M (no floor), then a **3-seed, 3M-step validation** (no floor) that confirmed
-  the system works well and reliably. All of this happened on the `vision-tracking` branch,
-  which is now merged — `main` and `vision-tracking` point at the same commit (`b59c139`).
+## What changed this session (chronological, key commits on `phase3-resilience` and its
+ancestor branches)
+
+- `0b6278d`/`09e3038`/`dc1de73`/`b59c139`: pre-date this session's start — the original brake +
+  vision-tracking work, already on `main`. Listed here only for orientation.
+- `3f251b9`: Phase 1 — multi-pass brake convergence + linear brake-engagement penalty.
+  **Fixed collision, widened the formation as a side effect** — see `EXPERIMENT_LOG.md`.
+- `f042fb2`: Phase 1b — thresholded the brake-engagement penalty (only excess above a derived
+  threshold is taxed). Fixed the side effect without losing the collision fix.
+- `2c7c296` (branch `n-aware-margin`), `4c13f86` (branch `xyz-spread`): the two Phase 2
+  formation-quality hypotheses, each tested standalone first.
+- `ac98d67`: fixed `r_spread`'s ideal angle (60° local, not 109.47°/120° global) — a real bug
+  caught by supervisor review, given a permanent regression test (`test_geometry.py`).
+- `4bd4146`/`3f9069c`: merged `n-aware-margin` and `xyz-spread` into `phase2-combined`.
+- `ad4c483`: brake instrumentation (`brake_passes`/`brake_violation`/solo-multi split) — pure
+  logging, no behavior change.
+- `8b724bb`: added `training/diagnose_horizon.py`; checkpointed Phase 2 as a reference point in
+  `PHASE2_CHECKPOINT.md`.
+- `85f0615`: Phase 3 — the 5-change sustained-flight bundle (longer episodes, larger network,
+  ground awareness, per-axis dynamics, dynamic target motion), on branch `phase3-resilience`.
+  **Ground/per-axis clean; `target_lost_rate` catastrophic** — see `EXPERIMENT_LOG.md`.
+- `ad2de3a`: checkpoint doc update recording Phase 3's launch.
+- `ed2f92d`: made `LOST_TIMEOUT_SEC` env-overridable, diagnosed and documented the episode-
+  length/grace-period mismatch.
+- `62a685d`: added `CRUISE_ALT_MIN`/`CRUISE_ALT_COEF` (altitude preference) and
+  `Z_SMOOTHING_ALPHA` (deterministic Z-velocity smoothing), bundled with the timeout fix under
+  time pressure. **Current `HEAD`.**
+- `bebe232` and other commits interleaved in this same branch's history: the concurrent
+  deployment conversation's PX4/Gazebo/ROS2 work — a separate workstream, not detailed here,
+  see `ARCHITECTURE.md`'s `deployment/` section and `deployment/docs/`.
+- This doc-update pass itself (uncommitted as of this writing) — full rewrite of all 11
+  `docs/ai_context/` files to reflect everything above.
 
 ## Discoveries worth knowing
 
-- **An external review of this repo made several claims; some held up, some didn't — verify,
-  don't trust.** Real: the `r_collision` logging bug (confirmed and fixed, see above). Fair:
-  a critique that some earlier commits (`e4af171`, `67ccfd7`) bundled multiple changes into
-  one tested commit, weakening attribution. False: a claim that no runs had been tested
-  against two specific commits — they had been, the review's evidence was just an incomplete
-  local file listing (this session's own oversight — not all Kaggle run results were being
-  copied into `stage/logs/` consistently; fixed by archiving everything found).
-- **The Kaggle API works from this machine now.** `~/.kaggle-venv` has a working `kaggle` CLI
-  (kaggle.json placed by the user outside this chat, never seen by the assistant). Kernels can
-  be pushed, polled, and their output downloaded directly — used for every Kaggle run this
-  session instead of manual notebook copy/paste. `kaggle kernels status`/`logs`/`output` all
-  work correctly *once a kernel has actually been pushed at least once*; don't be alarmed by
-  transient local DNS/network errors when polling — they look like remote failures in the
-  error text (e.g. `NameResolutionError` contains the substring "Error") but aren't; re-check
-  the specific kernel's status directly rather than trusting a poll loop's broad error match.
-- **Track provenance by commit tag, not just filename pattern.** `stage/logs/`/`stage/models/`
-  now contain many timestamped runs across many commits (pre-brake, brake-only, vision-
-  tracking-with-floor, vision-tracking-without-floor, at 600k/1.2M/3M). The commit tag in each
-  filename is load-bearing — don't compare across configs without checking it.
-- **The closing-speed brake is not learned — confirmed and worth restating precisely.** It's a
-  deterministic clamp applied to the network's raw output (`step()`, after `actions` come from
-  the policy), zero learned parameters, can only subtract from commanded velocity, never
-  redirect. Everything else (formation, tracking, coordination) is fully learned. Same pattern
-  as ABS on a car layered under a human driver — a recognized "safety shield over a learned
-  policy" technique in safe RL, not a workaround.
-- **`N=4`'s target formation numbers are geometrically consistent, not contradictory — verified,
-  don't re-litigate.** `TARGET_DIST` (4.78) and `EDGE_TARGET` (7.80) correspond exactly to a
-  regular tetrahedron's circumradius and edge (`_PACKING_RATIO[4] = (8/3)**0.5` is exactly that
-  ratio). What actually differs from `N=3` is that the tetrahedron is inherently non-planar
-  while `r_spread` is horizontal-only — see `KNOWN_ISSUES.md` item 5.
-- **The shared-actor architecture simplifies any future deployment work.** There is one `Actor`
-  (one weights file), not one per drone — reused for every agent's observation, not four
-  separate networks to keep track of. Relevant if/when a PX4/ROS2/Gazebo inference bridge gets
-  built.
+- **A real, ship-before-cost-was-measured bug was caught by review, not by testing.** The
+  `r_spread` angle conflation (global vs. local) passed a full single-seed test with no
+  visible harm — it was still wrong, and the fix was still correct to make. Don't take "the
+  test looked fine" as proof a piece of reasoning was sound; `test_geometry.py` exists
+  specifically because a plausible-looking test result isn't the same as a verified derivation.
+- **Eval-time numbers keep understating real problems — this happened again.** The `N=4`
+  collision problem last session was invisible at eval-time (0-2%) and only visible in the
+  training-time rolling-window data. This session, the pattern repeated in a different form:
+  Phase 3's `target_lost_rate` was so severe it was obvious even at eval-time, but the
+  *diagnosis* (that it was flat from step 1, not a mid-training regression) came from the
+  training-time data, not the eval CSV. Keep checking both.
+- **The bundling-multiple-changes risk is real, but managed differently each time it comes
+  up.** `phase2-combined` bundled two already-individually-tested pairs (brake fixes;
+  formation-quality fixes) for a final validation — a lower-risk kind of bundling. Phase 3
+  bundled five genuinely untested-together changes as an explicit, informed user decision under
+  real time pressure, with an agreed fallback already in place. Both are documented as
+  deliberate trade-offs in `DECISIONS.md`, not lapses — but Phase 3's partial failure (tracking
+  broke while safety didn't) is exactly the attribution cost that kind of bundling risks, even
+  though this particular failure turned out to be diagnosable without un-bundling.
+- **Kaggle's per-kernel `status` check and its account-wide `list` command both have real,
+  non-obvious gaps.** `status` appears to report only a kernel's latest-version session, so an
+  interrupted-then-repushed kernel can leave an old version's session running invisibly. `list`
+  sorts by a `lastRunTime` that isn't reliably newest-first across the whole account. Both are
+  documented in detail in `ENVIRONMENT.md`/`KNOWN_ISSUES.md` item 15 — read those before
+  troubleshooting a similar Kaggle issue rather than re-discovering these the slow way.
+- **The Kaggle account username is `rayensboui`, not `rayensb`** (the GitHub org name, one
+  letter off) — a wrong-owner guess produces a permission-denied error that reads like a slug
+  typo, not an owner typo. Cost real time this session before being caught.
+- **Two requested tracking behaviors turned out to already exist.** When the user asked for
+  dead-reckoning to last-known position/velocity and instant swarm-wide sharing on contact,
+  both were already fully implemented in `_update_target_track()` from the original
+  vision-tracking work — confirmed by reading the code before building anything, avoiding
+  redundant/conflicting reimplementation. The genuinely new ask (coordinated active search when
+  the whole swarm loses contact) is queued in `TODO.md`, not built yet.
 
 ## Unresolved / pending as of this handoff
 
-1. **`N=4` collision persistence — the real open problem now.** Confirmed, not theoretical (see
-   above). Two fixes proposed (multi-pass brake convergence, direct brake-engagement reward
-   penalty) — see `TODO.md` Phase 1 — **neither implemented yet**, pending confirmation before
-   touching code.
-2. **Two more proposed changes queued behind that (`TODO.md` Phase 2)**: an N-aware safety
-   margin (`EDGE_TARGET` scaled by simultaneous-neighbor count) and a 3D/XYZ `r_spread`. Test
-   these separately, after Phase 1, to preserve attribution — bundling untested changes has
-   burned this project before (see `AI_CONTEXT.md`'s closing note).
-3. **PX4/Gazebo/ROS2 SITL deployment — scoping in progress, not started.** The user has already
-   built real infrastructure on their own machine (PX4-Autopilot SITL, Gazebo, ROS2 Jazzy,
-   px4_msgs/px4_ros_com, Micro XRCE-DDS agent) and shared a deployment-architecture plan.
-   Feedback was given (not yet saved to docs, per explicit request — will be documented once the
-   user says so). Key technical notes for whoever picks this up: (a) the observation adapter
-   needs to replicate `_get_obs()`'s vision-tracking state machine, not just raw
-   position/velocity — treat Gazebo/PX4 as a physics layer under the *same* sensor-range
-   abstraction the policy trained on, not a new real-perception problem; (b) the closing-speed
-   brake is not part of the network — it must be reimplemented in the inference/adapter node
-   explicitly, or the deployed swarm loses the one mechanism that solved collision at `N=3`;
-   (c) action space is direct velocity (no inertia in training), maps to PX4 offboard velocity
-   setpoints, but expect real degradation from the zero-inertia mismatch; (d) `K_NEIGHBORS=2` in
-   the user's own notes is stale — it's `NUM_AGENTS-1=3` now, always re-derive from `config.py`;
-   (e) start any demo with an `N=3` checkpoint, not `N=4`, given `N=4`'s open collision issue.
-   Waiting on the user to share "what's on the PC" before scoping further.
-4. **`readme.txt`** is more stale than ever — still not fixed, still out of scope unless
-   explicitly requested.
-5. **`envs/formation_env.py`'s module docstring** has one remaining stale paragraph (the
-   pre-existing "4-agent study" SCOPE note) that a new docstring paragraph was added next to
-   without fixing the old one. Low priority, flagged not fixed.
+1. **The `LOST_TIMEOUT_SEC` sweep — the real open problem now.** 4 of 5 kernels running
+   (6s x2, 10s x2); the 18s kernel is blocked by a Kaggle session-cap issue that persisted even
+   after confirming only 4 kernels were genuinely running and everything else was complete. See
+   `KNOWN_ISSUES.md` item 15 for the full troubleshooting record. **Next step for whoever picks
+   this up**: retry the push (`cd` to the `kaggle_timeout18_seed1` scratchpad dir if it still
+   exists, or recreate it — `kernel-metadata.json` id is `rayensboui/stage-marl-timeout18-seed1`,
+   `verify.py` sets `LOST_TIMEOUT_SEC=18`, `SEED=1`, `NUM_AGENTS=4`, `TOTAL_STEPS=3000000`,
+   branch `phase3-resilience`); if it still fails, ask the user to check Kaggle's web UI
+   directly for a stray running session (there was no Chrome browser connected in this session
+   to do that automatically). Once all 5 complete, analyze and pick a value — see `TODO.md`.
+2. **Vertical-jiggling fix unverified.** Implemented, smoke-tested, not yet re-measured against
+   a trained checkpoint. Do this once the sweep produces checkpoints — load one, run the same
+   400-deterministic-step sign-flip measurement used to confirm the original problem, compare.
+3. **The "active search when lost" feature — queued, not started.** See `TODO.md` High section
+   for the scoping notes already worked out (what's already implemented vs. what's genuinely
+   new). Deliberately not bundled into the current sweep.
+4. **`phase2-combined` → `main` fast-forward still blocked** on the permission classifier;
+   needs the user to run `git push origin phase2-combined:main` themselves.
+5. **The brake's relative-vs-absolute-velocity gap** — now concretely relevant given
+   `deployment/inference_node.py` calls `_apply_brake` against real telemetry. Not started. See
+   `KNOWN_ISSUES.md` item 13.
+6. **`readme.txt`** and **`envs/formation_env.py`'s stale "4-agent study" docstring
+   paragraph** — both still not fixed, still low priority, flagged across several doc passes
+   now without anyone getting to them.
+7. **`PHASE2_CHECKPOINT.md`** (repo root, shared coordination doc with the deployment
+   conversation) needs an update recording this doc pass and the sweep/stuck-kernel status —
+   pending as the last step of the current "document all" instruction.
 
 ## Exact recommended next step for a new session
 
-Check `git log`/`git status` to confirm `main` is still at `45b42a2` (or later, if more work has
-happened since). If the user wants to proceed on the `N=4` collision problem, implement
-`TODO.md` Phase 1 (multi-pass brake convergence + direct brake-engagement reward penalty)
-together, test at `N=4` (that's where the problem is confirmed), and compare the same
-training-time rolling-window data — not just eval-time numbers, which understated the problem
-last time — against this run's baseline (`EXPERIMENT_LOG.md`'s `N=4` entry) before declaring it
-fixed. If the user has instead moved on to the PX4/Gazebo/ROS2 deployment work, read their
-system-state info first and scope against it rather than assuming what's installed — see
-"Unresolved / pending" item 3 above for the technical notes already worked out.
+Check `git log`/`git status` on `phase3-resilience`, and check the 5 timeout-sweep kernels'
+status directly (`kaggle kernels status rayensboui/stage-marl-timeout{6,10,18}-seed{N}` for
+each — don't trust the account-wide `list` command's ordering, see `KNOWN_ISSUES.md` item 15).
+If all 5 are complete, download and analyze them (collision/target_lost/tracking_rmse, both
+eval-time and training-time rolling-window, per `TODO.md`'s Critical section) and pick a
+`LOST_TIMEOUT_SEC` value to adopt — then re-measure the vertical-jiggling fix against one of
+the resulting checkpoints before considering Phase 3 done. If the 18s kernel is still stuck,
+try re-pushing it once, and if it still fails, ask the user to check Kaggle's web UI for a
+stray session rather than continuing to guess-and-retry. If the user has instead moved on to
+something else (the deployment thread, a new feature), read `PHASE2_CHECKPOINT.md` first to
+check what the other concurrent session has in flight before touching shared files
+(`envs/formation_env.py`, `config.py`, `training/*.py`).

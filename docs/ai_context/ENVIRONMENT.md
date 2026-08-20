@@ -46,17 +46,26 @@ Verified via direct inspection this session:
 
 ## Git remote
 
-- Origin: `https://github.com/rayensb/Stage_Marl.git`.
-- Default branch: `main`.
-- This session's push access was already established in prior sessions (multiple successful
-  pushes) — treat as configured/working unless a push actually fails.
-- **Feature-branch workflow used this session for a large, exploratory change** (the
-  vision-tracking redesign): pushed to a separate branch (`vision-tracking`), validated there
-  with multiple Kaggle runs, then merged to `main` via a fast-forward push
-  (`git push origin vision-tracking:main`) once validated — not a `git merge`/local checkout
-  of `main`, since the working session was in an isolated git worktree at the time. Worth
-  reusing this pattern for the next similarly-large, unproven change rather than committing
+- Origin: `https://github.com/rayensb/Stage_Marl.git` (note: this is the *repo's* org/name —
+  the Kaggle account username is different, see below, don't conflate the two).
+- Default branch: `main`, currently at `b59c139` — **substantially behind** the work described
+  in this doc suite. `phase2-combined` (validated) and `phase3-resilience` (in-progress) both
+  branch off points well past `main`. A manual `git push origin phase2-combined:main` is
+  still pending (blocked by the permission classifier on a direct push from the agent —
+  verified as a clean fast-forward, no conflicts) — see `TODO.md`.
+- **Feature-branch workflow, now used repeatedly, not just once**: `vision-tracking` (merged),
+  `n-aware-margin` and `xyz-spread` (hypothesis branches, merged into `phase2-combined`),
+  `xyz-spread-fixed` (isolated angle-bug retest, not merged — its finding was "no measurable
+  difference," so nothing to merge beyond the fix already in `phase2-combined`'s successor),
+  `phase2-combined` (validated reference point, not yet fast-forwarded to `main`),
+  `phase3-resilience` (current work, off `phase2-combined`), `px4-deployment-wip` (the
+  concurrent deployment thread's branch — separate workstream, see `ARCHITECTURE.md`). Worth
+  continuing this pattern for any further large, unproven change rather than committing
   straight to `main`.
+- **This worktree is shared with a concurrent conversation** doing PX4/Gazebo/ROS2 deployment
+  work (see `ARCHITECTURE.md`'s `deployment/` section). Coordination happens via
+  `PHASE2_CHECKPOINT.md` at the repo root — check it before touching `envs/formation_env.py`,
+  `config.py`, or `training/*.py` if unsure whether another session has in-flight work there.
 
 ## Kaggle API access from this machine (set up 2026-08-17)
 
@@ -83,6 +92,31 @@ Verified via direct inspection this session:
 - Kaggle kernel titles that don't closely match their `id` slug get auto-resolved to a
   derived slug (a warning, not an error) — the actual resulting URL/ref can differ slightly
   from what was requested; always confirm the real slug from the push output before polling.
+- **The Kaggle account username is `rayensboui`** (confirmed via `kaggle kernels list --mine`)
+  — every kernel ref is `rayensboui/<kernel-slug>`. This is easy to get wrong by analogy with
+  the GitHub org (`rayensb`, one letter different) — a wrong-username guess fails with
+  `Permission 'kernels.get' was denied`, which reads like a slug typo, not an owner typo; if
+  that error shows up, check the owner segment first, not just the slug.
+- **`kaggle kernels list --mine`'s default sort order is not reliable for "what's running right
+  now."** Its `lastRunTime` column does not sort strictly newest-first across the full account
+  — kernels pushed hours later can appear far down a default-page listing, behind kernels
+  pushed earlier the same day (confirmed directly: a kernel pushed at 22:17 didn't appear in
+  the top 15 of a `--page-size 100` listing that still led with a kernel pushed at 13:34 the
+  same day). Don't use this listing's ordering to infer recency or currently-running state —
+  check specific kernels' status individually via `kaggle kernels status <ref>` instead.
+- **Kaggle's "Maximum batch CPU session count of 5 reached" can fire even when fewer than 5
+  kernels show `RUNNING` via individual `kernels status` checks.** Observed directly
+  (2026-08-20): 4 kernels confirmed `RUNNING` by name, every other kernel on the account
+  confirmed `COMPLETE` by name, yet a 5th push still hit the cap. Leading hypothesis, not
+  confirmed: `kernels status` reports only a kernel's *latest version's* session — if an
+  earlier push of the same kernel slug was interrupted mid-flight and had already started
+  running server-side before a newer version was pushed on top of it, the old version's
+  session may continue occupying a slot invisibly. The `kaggle` CLI has no command to list
+  active sessions independent of a specific kernel ref, and no command to cancel one — only
+  Kaggle's own web UI (`kaggle.com` → "Your Work" → Notebooks) shows this directly. If this
+  recurs: check the web UI for a stray running session before assuming the count itself is
+  wrong, and avoid re-pushing the *suspected* orphaned kernel's slug again while a known-good
+  version of it is still legitimately training (that would risk restarting real progress).
 
 ## Environment variables the project reads (all in `config.py` / `training/train.py`)
 
@@ -93,12 +127,20 @@ Verified via direct inspection this session:
 | `VELOCITY_WEIGHT` | `-0.15` | Reward weight for the velocity component. |
 | `SEED` | unset (random) | Sets a reproducible seed and enables `RUN_ID` filename suffixing for parallel multi-seed runs. |
 | `DEVICE` | `cpu` | Training device (`cpu` or `cuda`); CPU is the measured-optimal default on Kaggle. |
-| `TOTAL_STEPS` | `600_000` | **New 2026-08-17.** Total training steps; made env-var overridable so longer-training tests (this session used up to 3,000,000) don't need a hardcode-then-revert commit cycle. |
+| `TOTAL_STEPS` | `600_000` | Total training steps; env-var overridable (this session has used up to 5,000,000). |
+| `MAX_STEPS` | `1800` (was `200`) | **New 2026-08-20 (Phase 3).** Episode length in steps (`1800` = 90s at `DT=0.05`, raised from the original 10s after `diagnose_horizon.py` showed tracking degrading past the old horizon). `ROLLOUT_LEN = MAX_STEPS * ROLLOUT_EPISODES` derives from this automatically — see `ARCHITECTURE.md`. |
+| `LOST_TIMEOUT_SEC` | `2.0` | **New 2026-08-20.** Vision-tracking dead-reckoning grace period before `target_lost` termination. Was hardcoded; made overridable after the flat 2.0s value broke badly once `MAX_STEPS` grew 9x (see `KNOWN_ISSUES.md` item 12) — a sweep of 6/10/18 is in progress to find a working value at the new episode length. |
 
 No other env vars are read by the training/eval code as of this writing.
 
-## What is NOT part of this environment (as of this writing)
+## PX4/Gazebo/ROS2 environment — a separate workstream, not part of this doc suite's scope
 
-No ROS2, Gazebo, PX4, MAVSDK, or MAVROS anywhere — no such packages, workspaces, or config
-files exist in this repo. Confirmed by directory listing; do not assume a robotics
-middleware stack is present unless it's actually been added.
+**This is now out of date if it still says "no ROS2/Gazebo/PX4 in this repo" — that claim was
+true through 2026-08-17 and is not true anymore.** `deployment/` contains a real PX4 SITL +
+Gazebo + ROS2 inference pipeline, built by a concurrent conversation sharing this worktree
+(see `ARCHITECTURE.md`'s `deployment/` section for how the two workstreams connect). Its own
+environment details (PX4-Autopilot SITL, Gazebo, ROS2 Jazzy, px4_msgs/px4_ros_com, Micro XRCE-
+DDS agent, and whatever machine/setup specifics apply) belong in `deployment/docs/`, not here —
+this file documents the MARL training/simulation environment specifically. If you need the
+deployment side's environment details, read `deployment/docs/` directly rather than assuming
+this file covers it.

@@ -16,9 +16,19 @@ install at minimum: `torch numpy gymnasium pettingzoo pandas matplotlib`.
 python test_env.py
 ```
 
-Runs 200 random-action steps against `FormationEnv3D(num_agents=4, k_neighbors=2)`. No
-assertions beyond not crashing — this is a liveness check, not a correctness test suite (no
-formal test suite exists in this repo as of this writing).
+Runs random-action steps against `FormationEnv3D`. No assertions beyond not crashing — this
+is a liveness check, not a correctness test suite.
+
+```bash
+python test_geometry.py
+```
+
+**Added 2026-08-20.** Verifies `_IDEAL_NEIGHBOR_ANGLE` (the local, drone-viewpoint spread
+angle) against an independent analytical construction (regular simplex via standard basis
+vectors), and explicitly asserts it's a different quantity from `_PACKING_RATIO`'s global,
+target-viewpoint angle. This is a real correctness check with assertions (unlike
+`test_env.py`'s liveness-only check) — added specifically because the two angles were once
+conflated in shipped code; see `DECISIONS.md`/`KNOWN_ISSUES.md` item 5.
 
 ## Train (full run — normally run on Kaggle, not locally; see `ENVIRONMENT.md`)
 
@@ -48,12 +58,20 @@ sandbox):
 DEVICE=cuda SEED=1 python training/train.py
 ```
 
-Longer training run (`TOTAL_STEPS` env var, added 2026-08-17 — default `600_000`; this
-session validated up to `3_000_000` for the vision-tracking system, where it made a real
-difference — see `EXPERIMENT_LOG.md`):
+Longer training run (`TOTAL_STEPS` env var — default `600_000`; runs up to `5_000_000` have
+been used for full validation sweeps — see `EXPERIMENT_LOG.md`):
 
 ```bash
 TOTAL_STEPS=3000000 NUM_AGENTS=3 SEED=1 python training/train.py
+```
+
+Longer episodes and a non-default dead-reckoning grace period (`MAX_STEPS`/`LOST_TIMEOUT_SEC`
+env vars, both added 2026-08-20 for Phase 3 — see `ARCHITECTURE.md`/`KNOWN_ISSUES.md` item 12;
+`MAX_STEPS=1800`/`LOST_TIMEOUT_SEC=2.0` are now the defaults, shown explicitly here since
+they're the values currently being swept):
+
+```bash
+MAX_STEPS=1800 LOST_TIMEOUT_SEC=10 NUM_AGENTS=4 SEED=1 TOTAL_STEPS=3000000 python training/train.py
 ```
 
 Parallel multi-seed runs (the pattern used on Kaggle — run from separate processes/sessions,
@@ -92,13 +110,14 @@ prefix) — pass the run explicitly if not relying on env vars:
 python training/plot_training.py n3_1
 ```
 
-Produces an **8x2** diagnostic subplot grid (grew from 7x2 on 2026-08-17): collision rate +
-target_lost rate overlay (was collision-only), entropy, pairwise distance, swarm diameter,
-reward components (now 8, includes `r_contact`), critic loss, approx KL, clip fraction,
-throughput, entropy coefficient, entropy-recovery activity, `log_std_mean`, `mean_action_abs`,
-and the closing-speed brake's mean speed removed. Saves to
-`logs/training_curves[_<run_id>].png` (confirmed — `plt.savefig`, not just interactive
-display).
+Produces a multi-panel diagnostic subplot grid — collision/target_lost/ground_strike rate
+overlays, entropy, pairwise distance, swarm diameter, all 11 reward components (see
+`ARCHITECTURE.md`), critic loss, approx KL, clip fraction, throughput, entropy coefficient,
+entropy-recovery activity, `log_std_mean`, `mean_action_abs`, and the brake's mean speed
+removed plus its Phase-1-era instrumentation (`mean_brake_passes` etc. — see
+`training/logger.py`'s `FIELDS` for the exhaustive current list, it has grown incrementally
+each phase and the exact panel count wasn't re-verified for this doc pass). Saves to
+`logs/training_curves[_<run_id>].png` (`plt.savefig`, not just interactive display).
 
 ## Kaggle runs, driven from this machine via the API
 
@@ -140,6 +159,20 @@ argparse block in this session beyond the initial read.
 
 Output: a per-episode metrics CSV (path logic in `evaluate.py` depends on the
 `--best`/`--run-id` combination — check the script if the exact output filename matters).
+
+## Check sustained-flight behavior past the training horizon
+
+**Added 2026-08-20.** Loads a frozen checkpoint and runs it well past `MAX_STEPS`, without
+terminating on the first failure, so degradation past the training horizon is actually visible
+instead of just pass/fail. This is what surfaced the tracking-degradation evidence that
+motivated Phase 3 — see `EXPERIMENT_LOG.md`.
+
+```bash
+python training/diagnose_horizon.py
+```
+
+Check the script directly for its current CLI flags (model/run-id selection, duration) — not
+re-documented here in detail since it's a newer, less-used tool than `evaluate.py`.
 
 ## Git
 

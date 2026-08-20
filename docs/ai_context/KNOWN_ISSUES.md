@@ -1,8 +1,11 @@
 # Known Issues
 
-Open problems as of commit `b59c139`, 2026-08-17 (vision-tracking merged to `main`). For
-issues that were investigated and resolved, see `EXPERIMENT_LOG.md` (they're experiments with
-a conclusion, not open issues).
+Updated 2026-08-20 against commit `62a685d` on `phase3-resilience` (not yet merged to `main`
+— see `TODO.md`). Three items below (5, 8, 9) that were open as of the last pass are now
+resolved; three new items (12, 13, 14) were found since. For issues that were investigated and
+resolved, see `EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues) —
+items below are only marked `[RESOLVED]` inline rather than removed, so the numbering stays
+stable and the resolution history is visible in place.
 
 ## 1. [RESOLVED] Collision-rate collapse recurred late in training
 
@@ -61,7 +64,7 @@ bug — flagged here only because if the project's goals ever require genuinely 
 sensing (e.g. moving toward real hardware or ROS2/Gazebo integration), this is a real
 architecture item, not a quick fix. See `TODO.md` research/future section.
 
-## 5. `r_spread` formation-spread metric is horizontal-only — now a plausible, mechanistically-grounded contributor to the `N=4` difficulty, not just an unverified limitation
+## 5. [RESOLVED] `r_spread` formation-spread metric is horizontal-only
 
 **Symptom**: documented directly in the `envs/formation_env.py` module docstring — the
 spread reward component only considers horizontal (x/y) spacing, not vertical (z) spread.
@@ -87,12 +90,21 @@ existing horizontal-only shaping already rewards.
 **Status**: not confirmed as *the* cause of the `N=4` collision persistence (item 8 above has
 its own independently-sufficient mechanism), but plausible as a contributing factor and worth
 fixing regardless.
-**Proposed fix (not yet implemented, queued in `TODO.md` Phase 2)**: replace the 2D bearing-sort
-construction with pairwise 3D angular separation between neighbor direction vectors
-(`arccos(dot(dir_i, dir_j))`), penalizing when the minimum pairwise angle is below the
-Tammes-ideal angle for that neighbor count (180° for 2 neighbors, 120° for 3 — reusing the same
-spherical-packing logic `_PACKING_RATIO` already uses for `TARGET_DIST`, applied locally around
-each drone instead of globally around the target).
+**Resolved 2026-08-19/20**: replaced with true pairwise 3D angular separation between locked
+neighbors' direction vectors, penalizing the minimum pairwise angle's deviation from
+`_IDEAL_NEIGHBOR_ANGLE`. **The first implementation shipped with a real bug**: it reused
+`_PACKING_RATIO`'s angle (109.47°/120°, the *global*, target-viewpoint angle between two
+drones as seen from the target/center) where the correct quantity is the *local*,
+drone-viewpoint angle between two neighbors as seen from one drone — a different geometry
+entirely, proven to be exactly 60° for any neighbor count under full connectivity (regular-
+simplex construction, see `DECISIONS.md`). Caught by supervisor review before the bug's
+practical cost was ever measured; a standalone re-test with a single seed
+(`xyz-spread-fixed`/`spread_fixed_seed1`) after the fix found no obvious measurable harm from
+the original wrong angle in that one test, but the fix was correct to make regardless — the
+*reasoning* was wrong even where a specific outcome happened not to visibly suffer.
+`test_geometry.py` was added specifically as the regression check that would have caught this
+before it shipped, and now guards against it recurring. See `DECISIONS.md` and
+`EXPERIMENT_LOG.md` for the full timeline and numbers.
 
 ## 6. Curriculum can't literally transfer weights across `NUM_AGENTS`
 
@@ -115,7 +127,7 @@ waste time debugging what looks like a CUDA failure but is just this machine's d
 **Impact**: no local run can validate GPU-path behavior specifically, if that ever becomes
 relevant (e.g. if the network grows enough that CUDA becomes faster again).
 
-## 8. Closing-speed brake's no-crossing property fails under simultaneous multi-threat braking — now confirmed at `NUM_AGENTS=4`, not just a theoretical gap
+## 8. [RESOLVED] Closing-speed brake's no-crossing property failed under simultaneous multi-threat braking at `NUM_AGENTS=4`
 
 **Symptom**: the brake's algebraic no-crossing guarantee (worst-case per-step gap reduction is
 a fixed fraction of the remaining gap, never reaching `COLLISION_DIST` in finite steps) was
@@ -141,30 +153,38 @@ shares the brake's trigger threshold, `SAFE_DIST_ENTER`, but is proximity-based,
 action-based — a policy can keep commanding more-than-safe closing speed without anything
 specifically penalizing that choice beyond ambient proximity). See `EXPERIMENT_LOG.md` for the
 full run data.
-**Proposed fixes (not yet implemented, queued in `TODO.md` Phase 1)**: (1) sweep the per-pair
-brake correction to convergence — repeat the pass across all neighbors until no further
-correction is needed, instead of one sequential pass. Each per-neighbor constraint is a
-halfspace in velocity space, and repeated projection onto an intersection of halfspaces
-(POCS/alternating-projections) is a standard, provably-convergent technique for exactly this
-situation. (2) Add a direct reward penalty proportional to `brake_reduction` (already computed
-every step, currently only logged) so the policy is penalized specifically for *needing* the
-brake, not just for proximity. Both target the same confirmed mechanism; proposed to test
-together.
+**Resolved (Phase 1/1b, 2026-08-19)**: both proposed fixes were implemented and tested
+together, then refined once. (1) The per-pair brake correction now sweeps to convergence
+(POCS-style repeated projection, up to `NUM_AGENTS` passes) instead of one sequential pass —
+see `DECISIONS.md` for the precise "limit-convergent, not N-pass-exact" claim and the
+adversarial stress-test verification. (2) A direct reward penalty on `brake_reduction` was
+added, first linear-from-zero (v1), then refined to only tax the excess above a derived
+threshold (v2) after v1 measurably fixed collision but pushed the policy toward an overly wide
+formation (see `DECISIONS.md`). **Confirmed fixed, not just theoretically addressed**: the
+Phase2-combined 5-seed validation (`EXPERIMENT_LOG.md`) showed all 3 `N=4` seeds clean at 0%
+`collision_rate`, both at eval-time and in the training-time rolling-window picture that
+previously told a much worse story than eval-time numbers alone. **Residual, not fully closed**:
+the no-crossing proof still assumes each agent's own velocity toward another, not relative
+velocity — see item 13 below, which is the same underlying gap restated with its current,
+more concrete (deployment-relevant) stakes.
 
-## 9. Target motion is still constant-velocity, so the vision-tracking dead-reckoning grace period is currently exact, not approximate
+## 9. [RESOLVED] Target motion was constant-velocity, so the vision-tracking dead-reckoning grace period was mathematically exact, not approximate
 
-**Symptom**: `_target_dir`/`_target_speed` are sampled once in `reset()` and never updated —
-the target moves in a straight line at constant speed for the whole episode. This means the
-2-second dead-reckoning grace period (`LOST_TIMEOUT_STEPS`, see `config.py`) is currently
-mathematically *exact* whenever it's used, not a real approximation of an uncertain estimate.
-**Status**: not a bug — a deliberate, explicitly-flagged scope decision (see `DECISIONS.md`'s
-vision-tracking entry) made to keep that one change controlled. Documented here so a future
-session doesn't mistake "the dead-reckoning grace period isn't really being tested" for "the
-mechanism doesn't work" — it works, it just hasn't been tested under real estimate
-uncertainty yet.
-**Next step**: making the target occasionally change direction/speed mid-episode is the
-natural follow-up — it would make the grace period's confidence-decay behavior actually
-matter, and is a good candidate for the next controlled, single-variable test in this area.
+**Symptom (historical)**: `_target_dir`/`_target_speed` were sampled once in `reset()` and
+never updated — the target moved in a straight line at constant speed for the whole episode,
+making the dead-reckoning grace period mathematically exact whenever used, not a real
+approximation of an uncertain estimate.
+**Resolved (Phase 3, 2026-08-20)**: `step()` now calls `_resample_target_motion()` (same
+distribution `reset()` uses) every `TARGET_REDIRECT_INTERVAL_STEPS` (500 steps = 25s) — a
+90-second episode now sees ~3 mid-episode redirects. Dead-reckoning is now a genuine
+approximation that can actually mislead a drone while it's out of contact, the realistic case
+this was always meant to be tested against.
+**What this resolution surfaced, not fixed by it**: making the grace period a real
+approximation (rather than removing the constant-velocity assumption's *masking effect* on a
+separate, pre-existing problem) is very likely part of why Phase 3's `target_lost_rate` result
+was so severe — see item 12 below, which is the current, actually-open problem in this area.
+Item 9 itself (motion realism) is resolved; item 12 (the grace period's *length* at the new
+episode duration) is not the same claim and is still open.
 
 ## 10. UWB-realistic neighbor sensing still deferred
 
@@ -186,3 +206,83 @@ in this sim to support a directional camera cone).
 **Status**: explicitly out of scope for the change that added vision-tracking, not forgotten —
 see `DECISIONS.md`. A FOV cone specifically requires adding heading/orientation as a new state
 dimension first, which is a bigger prerequisite change than the other two.
+
+## 12. `target_lost_rate` near-total failure at `MAX_STEPS=1800` — root cause diagnosed, fix in progress, not yet confirmed
+
+**Symptom**: Phase 3's 3-seed `N=4` validation (2026-08-20) showed `target_lost_rate` 89-100%,
+flat from the very first logged rollout through the full 3M-step run in every seed — never
+once improving. Collision and ground-strike were both essentially unaffected by the same
+bundle (0-1% and literally 0/209, respectively), so this is specific to target tracking, not a
+general regression from the bundle.
+**Diagnosis (reasoned from evidence, not assumed)**: `LOST_TIMEOUT_SEC` (a fixed 2.0s grace
+period, `LOST_TIMEOUT_STEPS=40`) was never rescaled when Phase 3 raised `MAX_STEPS` from 200
+to 1800 (9x). An ordinary, recoverable contact gap now has ~9x more independent windows per
+episode in which to exceed a still-2-second grace period, with zero change in the swarm's
+actual moment-to-moment tracking competence. The flat-from-step-1 shape (rather than a
+mid-training regression) and collision's clean convergence despite being subject to the same
+"9x fewer episodes per fixed step budget" risk both argue against pure data-starvation as the
+explanation, and point specifically at the timeout/episode-length mismatch. See
+`EXPERIMENT_LOG.md`'s Phase 3 entry and `DECISIONS.md` for the full reasoning.
+**Status**: `LOST_TIMEOUT_SEC` made env-overridable; a 5-kernel sweep (6s x2, 10s x2, 18s x1)
+is running to find a value that works at the new episode length, rather than guessing one.
+**Not yet confirmed** — see `CURRENT_STATE.md`/`SESSION_HANDOFF.md` for live status. 4 of 5
+kernels are running; the 5th is blocked by an unrelated Kaggle platform issue (see item 15
+below, `ENVIRONMENT.md`).
+
+## 13. Closing-speed brake assumes each agent's own velocity, not relative velocity — a real gap once independently-controlled vehicles are involved
+
+**Symptom**: `_apply_brake`'s `v_closing` is `dot(v_a, dir_to_b)` — agent A's own velocity
+component toward B — not the relative closing velocity `(v_a - v_b)`. The brake's adversarial
+stress-test verification (`DECISIONS.md`) holds specifically because every agent in this sim
+runs through the identical symmetric formula every step, with no way for one side to be
+unconstrained while the other closes at speed.
+**Why this matters more now than when first noted**: this was originally flagged as a
+theoretical footnote. It's now concretely relevant — `deployment/inference_node.py` calls
+`_apply_brake` directly against real PX4/Gazebo vehicle telemetry (see `ARCHITECTURE.md`), and
+a real or simulated vehicle's actual velocity is not something this code controls or can
+assume is running the same symmetric correction on the same schedule. The symmetry assumption
+the stress tests relied on doesn't automatically hold in that setting.
+**Status**: not yet reformulated. Queued, not forgotten — see `deployment/docs/
+PHASE2_HANDOFF.md` for the deployment-side account and `TODO.md` for tracking. Reformulating
+with explicit relative velocity (`dot(v_a - v_b, dir_to_b)`) is the proposed fix, not yet
+implemented or tested.
+
+## 14. Vertical jiggling — fixed, but only smoke-tested, not yet re-validated against a trained checkpoint
+
+**Symptom**: a trained Phase 3 checkpoint, run deterministically for 400 steps, showed 8-25%
+of steps per agent flipping vertical-velocity sign, one agent briefly dipping to `z=0.98` —
+confirmed empirically (not just accepted on the user's report) before any fix was written.
+**Fix implemented**: `CRUISE_ALT_MIN=1.5`/`CRUISE_ALT_COEF=-10.0` (a graduated `r_altitude`
+reward preference, no hard clamp) plus `Z_SMOOTHING_ALPHA=0.3` (a deterministic low-pass
+filter on commanded Z velocity, applied before the brake/ground clamp so those retain final
+say) — see `DECISIONS.md`.
+**Status**: implemented, smoke-tested (imports clean, `test_env.py` passes, episodes run to
+completion), bundled into the same branch and Kaggle sweep as the `LOST_TIMEOUT_SEC` fix
+(item 12) under explicit time pressure. **Not yet re-measured against an actual trained
+checkpoint** — the 8-25% sign-flip figure above is the *pre-fix* baseline; whether the fix
+actually reduces it by a meaningful amount is an open question until the current sweep's
+checkpoints can be loaded and measured the same way. Don't cite this as "fixed and confirmed"
+until that check happens — see `TODO.md`.
+
+## 15. Kaggle "Maximum batch CPU session count of 5" blocked a launch even with only 4 kernels confirmed running
+
+**Symptom**: pushing the 5th kernel in the `LOST_TIMEOUT_SEC` sweep (`stage-marl-timeout18-
+seed1`) failed with Kaggle's 5-concurrent-session cap error, even after individually
+confirming (via `kaggle kernels status` on each kernel by its correct slug) that only 4
+kernels were `RUNNING` and every other kernel on the account was `COMPLETE`.
+**Investigation so far**: the account-wide `kaggle kernels list` command's `lastRunTime`
+sort order turned out to be unreliable for determining "what's running right now" (kernels
+pushed hours later appeared far down the default listing, behind kernels pushed earlier the
+same day) — don't trust it for this purpose; check specific kernels' status individually
+instead. No Chrome browser was connected in this session to inspect Kaggle's web UI directly
+(the authoritative source for currently-running sessions), and the `kaggle` CLI has no
+"list active sessions" or "stop session" command independent of a specific kernel ref.
+**Leading hypothesis, not confirmed**: an orphaned session tied to an old, interrupted version
+of one of the kernels (the initial `timeout6-seed1` push was interrupted mid-flight earlier in
+this session, before being re-pushed with the altitude fix included) — `kernels status`
+appears to report only the latest version's session, so an old version's session could still
+be silently consuming a slot.
+**Status**: unresolved as of this writing. Likely to self-resolve once Kaggle's own session
+time limit lapses the orphaned session, or resolvable directly via the user checking Kaggle's
+web UI (`kaggle.com` → "Your Work" → Notebooks) for a stray running session and stopping it
+manually. See `SESSION_HANDOFF.md` for what to try next.

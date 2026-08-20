@@ -13,10 +13,21 @@ If the repo has moved on significantly since then, treat anything here that cont
 current code as stale — the code wins, and the discrepancy is worth noting back into
 `KNOWN_ISSUES.md` or `CURRENT_STATE.md`.
 
-Updated again 2026-08-19 (still commit `45b42a2`, no code changed): `NUM_AGENTS=4` was
-validated and found to need more work — tracking generalizes, collision doesn't yet. See
-`SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` item 8 and `TODO.md`
-Phase 1/2 for the specifics.
+Updated 2026-08-19 (still commit `45b42a2`, no code changed): `NUM_AGENTS=4` was validated and
+found to need more work — tracking generalizes, collision doesn't yet.
+
+**Updated again 2026-08-20, now against commit `62a685d` on `phase3-resilience` (`main` is
+still at `b59c139` — see `TODO.md`): the `N=4` collision problem from the previous update is
+now resolved.** Since then: two more formation-quality fixes were validated alongside it
+(`phase2-combined`), a sustained-flight diagnostic motivated a 5-change bundle for longer
+missions (`phase3-resilience`), and that bundle's one serious failure (near-total target
+tracking loss over longer episodes) is diagnosed with a fix currently being swept on Kaggle.
+**Also new since the last update**: `deployment/` now contains a real PX4/Gazebo/ROS2
+inference pipeline, built by a separate, concurrent conversation sharing this worktree — its
+own documentation lives in `deployment/docs/` and is deliberately **not** part of this index
+or this suite's scope; see `ARCHITECTURE.md`'s `deployment/` section for how the two connect.
+See `SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` items 12/14/15 and
+`TODO.md` Critical for the specifics of what's still open.
 
 ## Read order for a new session
 

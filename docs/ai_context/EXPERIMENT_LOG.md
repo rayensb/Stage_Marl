@@ -373,3 +373,260 @@ implemented) for the follow-up.
 **Status**: verified finding, not yet acted on — a plausible contributing factor to the `N=4`
 collision problem, not confirmed as sufficient on its own (item 8's sequential-correction
 mechanism is independently sufficient to explain it).
+
+## Phase 1 — multi-pass brake convergence + linear brake-engagement penalty (v1) — N=4, 3 seeds, 3M steps
+
+**Objective**: directly test the two fixes proposed for the confirmed `N=4` collision
+persistence (`KNOWN_ISSUES.md` item 8): sweep the brake's per-neighbor correction to
+convergence (POCS-style) instead of one sequential pass, and add `r_brake = BRAKE_PENALTY_COEF
+* brake_reduction` (linear from zero) so the reward directly penalizes needing the brake, not
+just proximity.
+**Configuration**: `NUM_AGENTS=4`, 3 seeds, 3M steps each (kernels
+`stage-marl-n4-phase1-seed{1,2,3}`).
+**Result** (eval-time, 100 episodes each):
+
+| seed | collision (final/best) | target_lost (final/best) | tracking_rmse (final/best) | avg_diameter (final/best) |
+|---|---|---|---|---|
+| 1 | 0% / 0% | 1% / 0% | 3.15 / 3.21 | 13.36 / 13.38 |
+| 2 | 0% / 0% | 1% / 2% | 2.55 / 2.88 | 12.08 / 12.58 |
+| 3 | 0% / 0% | 1% / 1% | 2.50 / 2.61 | 11.05 / 11.32 |
+
+**Training-time rolling-window picture** (1465 rollouts/seed, 3,000,320 final step in every
+seed — confirmed complete, not truncated): nonzero-`collision_rate` rollouts dropped from the
+pre-fix baseline's 88/59/269 (out of 1465, per `KNOWN_ISSUES.md` item 8's original data) to
+**14/10/15** — a real, large reduction. All three seeds' last 10 rollouts were clean
+(`collision_rate=0` throughout), unlike the pre-fix run where seed3 was still nonzero at the
+very end of training.
+**Conclusion**: the combined fix worked on the metric it targeted — collision, both at
+eval-time and (more importantly, given eval-time numbers previously understated the problem)
+in the training-time rolling-window picture. But `avg_diameter` (11.05-13.36) ran noticeably
+wider than later fixes achieve (see Phase 1b below), and `tracking_rmse` (2.50-3.15) is worse
+than Phase2-combined's eventual `N=4` numbers. Diagnosed as the linear-from-zero brake penalty
+taxing trivial, routine engagement the same as genuine emergency corrections, pushing the
+policy toward avoiding the brake's trigger zone altogether (i.e. spreading out) rather than
+just avoiding needing a large correction inside it — see `DECISIONS.md`.
+**Status**: superseded by Phase 1b (below), which fixes the diameter/tracking side effect
+without giving up the collision fix.
+
+## Phase 1b — thresholded brake-engagement penalty (v2) — N=4, 3 seeds, 3M steps
+
+**Objective**: test whether only penalizing brake engagement *above* a derived threshold
+(`BRAKE_PENALTY_THRESHOLD = 0.5 * MAX_ACTION_SPEED`), rather than linearly from zero, fixes
+Phase 1's diameter/tracking regression while keeping its collision fix.
+**Configuration**: identical to Phase 1 except `r_brake`'s v2 formula (see `DECISIONS.md`).
+`NUM_AGENTS=4`, 3 seeds, 3M steps each (kernels `stage-marl-n4-phase1b-seed{1,2,3}`).
+**Result** (eval-time, 100 episodes each):
+
+| seed | collision (final/best) | target_lost (final/best) | tracking_rmse (final/best) | avg_diameter (final/best) |
+|---|---|---|---|---|
+| 1 | 0% / 0% | 0% / 0% | 2.25 / 2.27 | 10.88 / 10.84 |
+| 2 | 0% / 0% | 1% / 2% | 2.70 / 2.69 | 12.32 / 12.27 |
+| 3 | 0% / 0% | 0% / 0% | 2.12 / 2.15 | 11.57 / 11.60 |
+
+Averaged across seeds: `tracking_rmse` 2.36 final / 2.37 best (down from Phase 1's 2.73/2.90),
+`avg_diameter` 11.59 final / 11.57 best (down from Phase 1's 12.16/12.43) — **the threshold
+change achieved exactly what it was meant to**, a real, measurable improvement in both
+tracking and formation tightness.
+**Training-time rolling-window picture** (1465 rollouts/seed, 3,000,320 final step in every
+seed): nonzero-`collision_rate` rollouts were **30/31/19** — a counterintuitive increase from
+Phase 1's 14/10/15, despite Phase 1b's clearly better diameter/tracking. Reported honestly,
+not smoothed over: both are drastically better than the pre-fix 88/59/269 baseline, and all
+three Phase 1b seeds' last-10 rollouts were still clean (`collision_rate=0`), so this is
+*more transient collision events somewhere earlier in training*, not a failure to converge by
+the end. The trade being made is legible — a small amount of additional transient training-time
+collision risk for a real, measured gain in tracking/diameter quality — not a regression
+disguised as an improvement.
+**Conclusion**: adopted as the reference brake configuration — the diameter/tracking
+improvement is worth the small increase in mid-training transient collision events, given both
+configurations converge cleanly by the end and eval-time collision stayed at 0% throughout.
+**Status**: landed, carried forward into Phase2-combined (below).
+
+## N-aware safety margin — standalone hypothesis test, N=4, 1 seed
+
+**Objective**: test `EDGE_TARGET`'s N-aware scaling (`+1.20` margin at `N=4`) in isolation,
+on top of the already-validated Phase 1b brake fixes, before combining it with the XYZ
+`r_spread` hypothesis.
+**Configuration**: `NUM_AGENTS=4`, 1 seed, 3M steps (kernel `stage-marl-n4-margin-seed1`,
+branch `n-aware-margin`).
+**Result** (eval-time, 100 episodes): `collision_rate` 0% final / 1% best, `target_lost_rate`
+0%/0%, `tracking_rmse` **1.69 final / 1.60 best** — notably better than either Phase 1 or
+Phase 1b's tracking, `avg_diameter` 11.21/11.01. Training-time: 10/1465 nonzero-collision
+rollouts, last 10 rollouts clean.
+**Conclusion**: no evidence of the feared failure mode (a wider formation pushing drones past
+`SENSOR_RANGE` more than necessary, the same mechanism that made the old diameter floor
+counterproductive) — if anything, tracking improved. Single seed, not a full validation on its
+own, but a clean enough result to justify combining with the spread hypothesis.
+**Status**: folded into Phase2-combined (below) for full multi-seed validation.
+
+## XYZ (true 3D) `r_spread` — standalone hypothesis test, N=4, 1 seed (uses the *pre-fix*, incorrect angle)
+
+**Objective**: test the 3D pairwise-angle `r_spread` replacement in isolation, on top of the
+Phase 1b brake fixes.
+**Configuration**: `NUM_AGENTS=4`, 1 seed, 3M steps (kernel `stage-marl-n4-spread-seed1`,
+branch `xyz-spread`). **Important caveat, confirmed by timeline**: this run used the
+*original, incorrect* `_IDEAL_NEIGHBOR_ANGLE` (109.47°/120°, the global target-viewpoint
+angle) — the local/global conflation bug (see `DECISIONS.md`) wasn't caught until later.
+**Result** (eval-time, 100 episodes): `collision_rate` 0%/0%, `target_lost_rate` 0%/0%,
+`tracking_rmse` 2.02 final / 2.19 best, `avg_diameter` 10.76/11.11. Training-time: 10/1465
+nonzero-collision rollouts, last 10 clean.
+**Conclusion**: no obvious harm from the wrong angle at this scale — the run is clean on every
+metric. This does **not** mean the angle bug didn't matter; it means a single-seed test wasn't
+sufficient to reveal a subtler cost (the corrected-angle isolated retest, `spread_fixed_seed1`
+below, is the real check of whether the bug cost anything measurable).
+**Status**: superseded by the corrected-angle version, folded into Phase2-combined for
+validation before the bug was caught, then independently re-tested after the fix (see below).
+
+## Phase2-combined — 5-seed N-sweep (all four Phase 1/2 fixes together, N=2/3/4, 5M steps)
+
+**Objective**: full multi-seed validation of the combined reference point: multi-pass brake +
+thresholded brake penalty (Phase 1b) + N-aware margin + XYZ `r_spread` — merged to branch
+`phase2-combined`. **Note**: this run used the *pre-fix* spread angle (109.47°/120°) — the
+angle bug was found and fixed (`ac98d67`) after this run had already launched; see the
+isolated re-test (`spread_fixed_seed1`) below for whether that mattered.
+**Configuration**: 5 seeds total, 5M steps each — `N=2` (1 seed), `N=3` (1 seed at 5M, plus a
+second `N=3` seed at 1.5M specifically to check whether seed 1's `target_lost` noise was real
+or seed-variance — see `phase2_n3_seed2` below), `N=4` (3 seeds).
+**Result** (eval-time, 100 episodes each):
+
+| run | collision (final/best) | target_lost (final/best) | tracking_rmse (final/best) | avg_diameter (final/best) |
+|---|---|---|---|---|
+| N=2 seed1 | 0% / 0% | 0% / 1% | 2.25 / 1.72 | 8.14 / 7.33 |
+| N=3 seed1 | 0% / 0% | 5% / 1% | 2.88 / 2.08 | 11.31 / 10.35 |
+| N=4 seed1 | 0% / 0% | 0% / 0% | 1.43 / 1.54 | 10.43 / 10.69 |
+| N=4 seed2 | 0% / 0% | 0% / 0% | 1.97 / 1.97 | 11.67 / 11.67 |
+| N=4 seed3 | 0% / 0% | 0% / 0% | 2.32 / 2.31 | 13.10 / 12.94 |
+| **N=4 avg** | 0% / 0% | 0% / 0% | 1.91 / 1.94 | 11.73 / 11.77 |
+
+(N=4 seed2's final and best rows are identical because `eval_2.csv`/`eval_best_2.csv` are
+byte-identical for that run — the two checkpoints evaluated the same on this particular
+100-episode set, confirmed via checksum, not a script bug.)
+**Training-time rolling-window picture** (2442 rollouts/seed, 5,001,216 final step in every
+seed — all confirmed complete): `N=2` clean throughout (0/2442 nonzero collision). `N=3`
+seed1: 24/2442. `N=4`: seed1 15/2442, seed2 53/2442 (highest of the three — its last-10 shows
+`collision_rate=0.02` for the first 5, then 0 for the final 5, i.e. converges right at the very
+end), seed3 40/2442. All three `N=4` seeds' last-10 `target_lost_rate` are exactly zero.
+**Conclusion**: this is the best `N=4` result of the project to date — 3/3 seeds clean on
+collision at both eval-time and (with the seed2 caveat above) by the end of training, 0%
+`target_lost_rate`, and the best average `tracking_rmse` (1.91 final) measured so far. `N=3`'s
+one seed showed `target_lost_rate` noise (5% final) worth checking against a second seed
+before trusting it (see next entry). `N=2` is unambiguously clean.
+**Status**: adopted as the validated reference point (`phase2-combined`, commit `3f9069c`).
+Not yet fast-forwarded to `main` — see `TODO.md`.
+
+## `phase2_n3_seed2` — second N=3 seed, checking whether seed1's `target_lost` noise was real
+
+**Objective**: seed1's `N=3` result above showed 5% final `target_lost_rate` — check whether
+that's a real, repeatable issue at `N=3` or ordinary seed variance, before trusting the
+Phase2-combined validation's `N=3` result.
+**Configuration**: `NUM_AGENTS=3`, `SEED=2`, 1.5M steps (shorter than the 5M full-validation
+runs — a targeted diagnostic, not a full seed).
+**Result** (eval-time, 100 episodes): `collision_rate` 0%/0%, `target_lost_rate` 1%/1%,
+`tracking_rmse` 2.32 final / 2.27 best. Training-time: 733 rollouts logged, 0/733 nonzero
+collision, last-10 `target_lost_rate` oscillating 0-4% (`[0.02, 0.02, 0.02, 0.04, 0.02, 0.02,
+0.02, 0.04, 0.02, 0.02]`) — low and stable, not trending up.
+**Conclusion**: seed1's 5% was consistent with ordinary seed variance around a low baseline
+(1-5% range), not a systematic `N=3` regression. `N=3` is fine.
+**Status**: resolved — no follow-up action needed.
+
+## Corrected spread angle, isolated re-test — `spread_fixed_seed1`, N=4, 1 seed, 1.5M steps
+
+**Objective**: the Phase2-combined 5-seed validation above used the *wrong* spread angle
+(109.47°/120°, the global/local conflation bug — see `DECISIONS.md`). After fixing it to the
+analytically-correct 60° (`ac98d67`, verified by `test_geometry.py`), check whether the bug
+had actually cost anything measurable, in isolation, before trusting the combined result as-is.
+**Configuration**: `NUM_AGENTS=4`, 1 seed, 1.5M steps, branch `xyz-spread-fixed` (isolated —
+the corrected angle on top of the same base as Phase2-combined, nothing else changed).
+**Result** (eval-time, 100 episodes): `collision_rate` 0%/0%, `target_lost_rate` 0%/0%,
+`tracking_rmse` 2.58 final / 2.42 best. Training-time: 733 rollouts logged, 0/733 nonzero
+collision throughout, last-10 `target_lost_rate` mostly 0-2%.
+**Conclusion**: clean on every metric — consistent with (not distinguishably better or worse
+than) the Phase2-combined numbers at a comparable step count. The angle bug does not appear to
+have cost anything measurable in this metric set, though it was still correct to fix (the
+*reasoning* was wrong even where the *outcome* happened not to be visibly harmed — see
+`DECISIONS.md` for why the fix was worth making regardless, and `test_geometry.py` for the
+regression check that now guards against it recurring).
+**Status**: resolved. The corrected angle is what's in the code going forward; no further
+action needed on this specific question.
+
+## `N=4` sustained-flight diagnostic (`training/diagnose_horizon.py`) — the trigger for Phase 3
+
+**Objective**: not a designed experiment — a direct check of how the best Phase2-combined
+`N=4` checkpoint behaves when run for longer than its training horizon, motivated by the
+deployment thread's real-world PX4/Gazebo crash reports.
+**Configuration**: frozen checkpoint (no retraining), run for 60 simulated seconds instead of
+the 10-second (`MAX_STEPS=200`) training horizon, without terminating on the first failure so
+degradation past the horizon is actually observable rather than just a pass/fail.
+**Result**: zero collisions or `target_lost` events the whole 60s (the abstract sim has no
+ground/physics failure mode at the time of this test, so it can't show a literal crash), but
+tracking error climbed from 0.95 (0-10s, matches training-time performance) to a peak of 3.66
+(20-30s) before recovering to 1.5-1.8 (40-60s).
+**Conclusion**: real, load-bearing evidence — not just a plausible story — that the policy's
+behavior degrades once flying longer than anything it ever trained on. The 20-30s worst window
+lines up *directly inside* the 15-40s window where the real PX4/Gazebo deployment actually
+crashed (see `deployment/docs/PHASE2_HANDOFF.md`), supporting a training-horizon-vs-real-flight
+mismatch as at least part of that crash's cause.
+**Status**: directly motivated Phase 3's longer-episode change (below) — the first fix in this
+chain grounded in a direct measurement of sustained-flight behavior, not an assumption that
+"longer training horizon must help."
+
+## Phase 3 bundle — sustained-flight resilience, N=4, 3 seeds, 3M steps — safety succeeded, tracking failed catastrophically
+
+**Objective**: test five bundled changes (longer episodes `MAX_STEPS` 200→1800, larger
+network, ground awareness, per-axis Z/XY speed limits, dynamic target motion) as one "leap of
+faith" (explicit user framing, with an agreed fallback to isolate individually if this failed)
+— direct response to the horizon-diagnostic finding above.
+**Configuration**: `NUM_AGENTS=4`, 3 seeds, `TOTAL_STEPS=3_000_000`, branch
+`phase3-resilience` off `phase2-combined` (kernels `stage-marl-phase3-resilience-seed{1,2,3}`).
+**Result** (eval-time, 100 episodes each — note `MAX_STEPS=1800` now, so raw episode/rollout
+counts aren't directly comparable to any run above):
+
+| seed | collision (final/best) | target_lost (final/best) | tracking_rmse (final/best) | worst min_dist |
+|---|---|---|---|---|
+| 1 | 0% / 0% | 97% / 98% | 7.22 / 7.40 | 4.201 |
+| 2 | 0% / 0% | 100% / 100% | 6.95 / 7.30 | 4.203 |
+| 3 | 0% / 0% | 89% / 89% | 6.51 / 6.51 | 4.201 |
+
+**Training-time rolling-window picture** (209 rollouts/seed — far fewer than the
+`MAX_STEPS=200`-era runs, expected given `ROLLOUT_LEN` is 9x longer per rollout now; final
+step 3,009,600 in every seed, confirmed complete): `ground_strike_rate` was **0/209 rollouts
+in every seed, max ever 0.000** — ground awareness worked cleanly from the very first test, no
+iteration needed (unlike the brake, which needed the multi-pass fix after its first `N=4`
+test). Collision: seed1 3/209 nonzero, seed2 and seed3 0/209 — safety essentially untouched by
+the bundle. `target_lost_rate` was catastrophic and **flat from the very first logged rollout**
+in every seed (seed1 last-10: 92-98%, seed2: 98-100%, seed3: 82-96%) — not a mid-training
+regression, a failure that never once improved across the entire 3M-step run.
+**Conclusion**: the bundling's risk (from `DECISIONS.md`) materialized partially but
+diagnosably. Ground awareness and per-axis dynamics: clean success. Collision: essentially
+unaffected (still ~0%), consistent with the brake being an independent mechanism from anything
+in this bundle. Tracking: the `target_lost` catastrophe. Because the failure was flat-from-
+step-1 (not a mid-run regression) and collision — subject to the same "9x fewer episodes"
+risk from the longer-episode change — converged fine, data-starvation from fewer episodes was
+argued against as the primary cause, pointing instead at `LOST_TIMEOUT_SEC` (a fixed 2.0s
+grace period, never rescaled when `MAX_STEPS` grew 9x) — see the `DECISIONS.md` entry and the
+sweep below.
+**Status**: root cause diagnosed, fix (env-overridable `LOST_TIMEOUT_SEC`, swept 6/10/18s) in
+progress — see below.
+
+## `LOST_TIMEOUT_SEC` sweep — 6s/10s/18s, in progress
+
+**Objective**: find a `LOST_TIMEOUT_SEC` value that works at the new `MAX_STEPS=1800` (90s)
+episode length, empirically rather than by computing one analytically (no clean formula maps
+episode length to grace-period length — see `DECISIONS.md`).
+**Configuration**: `NUM_AGENTS=4`, `TOTAL_STEPS=3_000_000`, branch `phase3-resilience`
+(commit `62a685d`, includes the altitude/Z-smoothing fix — see `DECISIONS.md`), 5 kernels: 6s
+x2 seeds, 10s x2 seeds, 18s x1 seed.
+**Status**: **in progress, not yet complete**. 4 of 5 kernels launched and confirmed
+`RUNNING` (`stage-marl-timeout6-seed1`, `-timeout6-seed2`, `-timeout10-seed1`,
+`-timeout10-seed2`). The 18s kernel (`stage-marl-timeout18-seed1`) failed to launch —
+Kaggle's "Maximum batch CPU session count of 5 reached" error persisted even after the other 4
+were confirmed running and every other kernel on the account was confirmed `COMPLETE` (not a
+counting error on this session's part — checked individually, not just via the account-wide
+kernel list, which turned out to have a stale/unreliable `lastRunTime` sort order not worth
+trusting for "what's running right now"). Most likely explanation: an orphaned session tied to
+an old, interrupted version of one of the other kernels (the initial `timeout6-seed1` push was
+interrupted mid-flight earlier in this session before being re-pushed with the altitude fix
+included) that isn't visible to the per-kernel `kernels status` check, which appears to report
+only the latest version's session. No CLI/API mechanism was found to list or cancel such a
+session directly — resolving it needs either Kaggle's own session limit to lapse the orphaned
+session automatically, or the user checking Kaggle's web UI directly. See
+`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` for the live troubleshooting state.
