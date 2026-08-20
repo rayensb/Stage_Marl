@@ -203,6 +203,20 @@ def main():
         action_abs_sum = 0.0
         action_count = 0
         brake_sum = 0.0
+        # Brake instrumentation (2026-08-20, supervisor review) -- see
+        # envs/formation_env.py's _apply_brake docstring for what each of
+        # these actually measures. brake_passes/max_brake_violation are
+        # env-wide (one value per env.step() call, not per agent);
+        # brake_solo_sum/brake_multi_sum split brake_sum by whether the
+        # agent had 1 vs 2+ simultaneously-active neighbors, to test
+        # whether N-aware margin is actually reducing multi-neighbor brake
+        # competition specifically, not just inferring it from the
+        # aggregate collision rate.
+        brake_passes_sum = 0.0
+        env_step_count = 0
+        max_brake_violation = 0.0
+        brake_solo_sum = 0.0
+        brake_multi_sum = 0.0
         for t in range(ROLLOUT_LEN):
             with torch.no_grad():
                 agents_now = env.agents
@@ -257,6 +271,15 @@ def main():
             # mean the brake never engaged -- worth checking before reading
             # anything into whether it changed collision_rate.
             brake_sum += sum(infos.get(a, {}).get("brake_reduction", 0.0) for a in agents_now)
+            brake_passes_sum += any_info.get("brake_passes", 0)
+            env_step_count += 1
+            max_brake_violation = max(max_brake_violation, any_info.get("brake_violation", 0.0))
+            for a in agents_now:
+                red = infos.get(a, {}).get("brake_reduction", 0.0)
+                if infos.get(a, {}).get("k_active", 0) >= 2:
+                    brake_multi_sum += red
+                else:
+                    brake_solo_sum += red
             for a in AGENTS:
                 ep_rewards[a] += rewards.get(a, 0.0)
             # Use infos (populated by env.step() before it internally clears
@@ -452,6 +475,9 @@ def main():
             log_std_mean = actor.get_log_std().mean().item()
             mean_action_abs = action_abs_sum / action_count if action_count > 0 else 0.0
             mean_brake_reduction = brake_sum / action_count if action_count > 0 else 0.0
+            mean_brake_passes = brake_passes_sum / env_step_count if env_step_count > 0 else 0.0
+            mean_brake_solo = brake_solo_sum / action_count if action_count > 0 else 0.0
+            mean_brake_multi = brake_multi_sum / action_count if action_count > 0 else 0.0
 
             print(f"steps={total_steps:>8} ep={ep_count:>5} "
                   f"avg_rew={avg_reward:>7.1f} coll_rate={collision_rate:.2f} best={best_collision_rate:.2f} "
@@ -484,7 +510,9 @@ def main():
                      r_joint=comp_avgs['joint'], r_contact=comp_avgs['contact'],
                      r_brake=comp_avgs['brake'],
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
-                     mean_brake_reduction=mean_brake_reduction)
+                     mean_brake_reduction=mean_brake_reduction,
+                     mean_brake_passes=mean_brake_passes, max_brake_violation=max_brake_violation,
+                     mean_brake_solo=mean_brake_solo, mean_brake_multi=mean_brake_multi)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 
