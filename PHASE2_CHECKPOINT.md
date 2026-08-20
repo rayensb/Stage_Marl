@@ -3,13 +3,20 @@
 **If you are a different session or agent working in this shared
 worktree: this is live, in-progress, partially-validated work.** Do not
 modify `envs/formation_env.py`, `config.py`, `training/*.py`, merge or
-rebase `phase2-combined`/`xyz-spread-fixed`, or launch/cancel Kaggle runs
-under the `stage-marl-phase2-*` or `stage-marl-spread-fixed-*` names
-without checking with the user first. Silent changes here can invalidate
+rebase `phase2-combined`/`xyz-spread-fixed`/`phase3-resilience`, or
+launch/cancel Kaggle runs under the `stage-marl-phase2-*`,
+`stage-marl-spread-fixed-*`, or `stage-marl-phase3-*` names without
+checking with the user first. Silent changes here can invalidate
 in-flight Kaggle runs or make it impossible to tell which results map to
 which code state. The deployment work in `deployment/` is a separate,
 independent track (see `deployment/docs/PHASE2_HANDOFF.md`) and is fine to
 keep working on -- this note is about the training/env code specifically.
+
+**Update 2026-08-20 (later)**: `phase3-resilience` (branch, off
+`phase2-combined` `8b724bb`) is now also active -- see "Phase 3" section
+below. `phase2-combined` itself is unchanged and still the validated
+reference point; Phase 3 is a separate, not-yet-validated leap-of-faith
+bundle on top of it.
 
 ## What this reference point is
 
@@ -75,14 +82,40 @@ docstring), threaded to 4 new `training_log_*.csv` columns
 `mean_brake_multi`). Pure logging addition, doesn't change training
 behavior -- safe to build on without re-validating.
 
+## Phase 3: sustained-flight resilience (branch `phase3-resilience`, 2026-08-20)
+
+Direct response to the horizon finding above. User's explicit call: bundle
+five changes into one "leap of faith" test rather than isolate each first,
+with an agreed fallback (isolate individually if the combined result isn't
+good). Full detail: commit `85f0615` on `phase3-resilience`, and the plan
+at the time (`/home/rayen/.claude/plans/abundant-plotting-crayon.md` as of
+2026-08-20, may be overwritten by a later plan since).
+
+1. `MAX_STEPS` 200 -> 1800 (90s), env-overridable. `ROLLOUT_LEN` now
+   derived (`MAX_STEPS * ROLLOUT_EPISODES`), not independently hardcoded.
+   Known risk: ~9x fewer episodes for the same 3M-step budget.
+2. Actor hidden 64->128, Critic 128->256.
+3. Ground awareness: `_apply_ground_clamp` (mirrors `_apply_brake`),
+   `r_ground` reward, `ground_strike` termination + rate, now a 4th
+   best-checkpoint selection criterion. A real bug was found and fixed
+   while smoke-testing this -- see the commit message for the joint
+   ground/overlap spawn-safety fix in `reset()`.
+4. Per-axis `MAX_ACTION_SPEED_Z` (0.6x horizontal).
+5. Dynamic target motion: redirects every `TARGET_REDIRECT_INTERVAL_STEPS`
+   instead of one fixed direction for the whole episode (closes
+   `KNOWN_ISSUES.md` item 9).
+
+**Currently running on Kaggle** (started 2026-08-20, N=4, 3M steps,
+branch `phase3-resilience`) -- note the actual slugs Kaggle assigned
+differ from what was requested (title-derived, not the requested id):
+`stage-marl-phase3-resilience-seed1`, `-seed2`, `-seed3`.
+
 ## Open, not yet decided
 
-- Whether to extend `MAX_STEPS`/train at a longer horizon given the
-  finding above -- a real training-behavior change, needs its own
-  validation, not something to bundle into what's running now.
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
-  not adopted; PPO is what's producing the results above.
+  not adopted; PPO is what's producing every result above.
 - GPU was already measured slower than CPU for this network size
   (`DECISIONS.md`) -- not revisit unless the network architecture changes
   enough to change that math (e.g. the permutation-invariant encoder idea
-  queued elsewhere).
+  queued elsewhere). Phase 3's larger network doesn't change this
+  conclusion on its own -- still small by GPU-dispatch-overhead standards.
