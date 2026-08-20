@@ -330,10 +330,34 @@ class FormationEnv3D(ParallelEnv):
         self.agents; does not mutate them or self.vel, and does not advance
         physics -- callers do that with the returned velocities. See step()
         for the full multi-pass/POCS rationale. Returns (corrected_vel,
-        brake_reduction) dicts, one entry per agent in self.agents."""
+        brake_reduction) dicts, one entry per agent in self.agents --
+        signature intentionally unchanged (2026-08-20 instrumentation below)
+        since deployment/inference_node.py depends on this exact unpack.
+
+        Diagnostics from this call are stashed on self instead of returned,
+        for the same reason: self._last_brake_passes (int, how many passes
+        this call took), self._last_brake_violation (float, worst remaining
+        constraint violation after the loop -- should be ~0 if converged
+        before hitting the pass cap, nonzero and positive means it didn't),
+        self._last_brake_k_active (dict, how many other agents were within
+        SAFE_DIST_ENTER of each agent -- lets callers split brake_reduction
+        by whether it happened solo (1 active neighbor) or under multi-
+        neighbor competition (2+), the mechanism N-aware margin targets."""
         raw_vel = {a: v.copy() for a, v in raw_vel.items()}
         brake_reduction = {a: 0.0 for a in self.agents}
-        for _ in range(NUM_AGENTS):
+
+        k_active = {a: 0 for a in self.agents}
+        for a in self.agents:
+            for b in self.agents:
+                if b == a:
+                    continue
+                if float(np.linalg.norm(self.pos[b] - self.pos[a])) < SAFE_DIST_ENTER:
+                    k_active[a] += 1
+        self._last_brake_k_active = k_active
+
+        passes_used = 0
+        for pass_num in range(NUM_AGENTS):
+            passes_used = pass_num + 1
             any_correction = False
             for a in self.agents:
                 v = raw_vel[a]
@@ -355,6 +379,26 @@ class FormationEnv3D(ParallelEnv):
                 raw_vel[a] = v.astype(np.float32)
             if not any_correction:
                 break
+        self._last_brake_passes = passes_used
+
+        # Post-hoc check, diagnostic only -- doesn't feed back into raw_vel.
+        # Nonzero only if the pass cap was hit before the early-exit fired
+        # (see the CAUTION comment in step()); this is what actually turns
+        # that caveat into a checkable number instead of an assumption.
+        max_violation = 0.0
+        for a in self.agents:
+            for b in self.agents:
+                if b == a:
+                    continue
+                diff = self.pos[b] - self.pos[a]
+                d = float(np.linalg.norm(diff))
+                if d < SAFE_DIST_ENTER and d > 1e-6:
+                    dir_to_b = diff / d
+                    v_closing = float(np.dot(raw_vel[a], dir_to_b))
+                    max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
+                    max_violation = max(max_violation, v_closing - max_closing)
+        self._last_brake_violation = max_violation
+
         return raw_vel, brake_reduction
 
     def step(self, actions):
@@ -485,6 +529,13 @@ class FormationEnv3D(ParallelEnv):
         infos = {a: {"min_dist": self._min_dist(a),
                        "reward_components": reward_components[a],
                        "brake_reduction": brake_reduction[a],
+                       # Diagnostics from _apply_brake, 2026-08-20 -- see its
+                       # docstring. brake_passes/brake_violation are the same
+                       # value for every agent this step (env-wide, not
+                       # per-agent); k_active is per-agent.
+                       "brake_passes": self._last_brake_passes,
+                       "brake_violation": self._last_brake_violation,
+                       "k_active": self._last_brake_k_active[a],
                        "collision": collision,
                        "target_lost": self._target_lost,
                        # Ground-truth track error, NOT used by the reward or
