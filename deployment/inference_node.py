@@ -63,7 +63,9 @@ Run (one invocation per drone, in separate terminals/processes):
 import sys, os
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 import argparse
+import csv
 import subprocess
+import time
 
 import numpy as np
 import torch
@@ -80,28 +82,35 @@ from envs.formation_env import FormationEnv3D
 from training.networks import Actor
 from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_ACTION_SPEED, TARGET_DIST, DT
 
-assert NUM_AGENTS == 3, (
-    "This deployment's fixed 3-way namespace map and spawn geometry assume "
-    "NUM_AGENTS=3 -- rerun with NUM_AGENTS=3 in the environment."
+assert NUM_AGENTS in (2, 3, 4), (
+    "The namespace map and spawn geometry below are generalized from "
+    "NUM_AGENTS but only verified/checkpointed for 2, 3, or 4 agents -- "
+    "rerun with one of those in the environment."
 )
 
 # PX4 instance-per-agent map -- instance 0 unnamespaced, instance N>0 uses
 # /px4_N/fmu/... (confirmed via PX4 ROS2 multi-vehicle docs). Must match
 # the -i flag each deployment/launch_px4_instance.sh invocation used.
-AGENT_NAMESPACE = {"drone1": "", "drone2": "/px4_1", "drone3": "/px4_2"}
-ALL_AGENTS = list(AGENT_NAMESPACE.keys())
+# Generalized from NUM_AGENTS (2026-08-20) -- verified to reproduce the
+# original hardcoded N=3 map exactly (drone1="", drone2="/px4_1",
+# drone3="/px4_2"), so the proven N=3 path is unchanged.
+ALL_AGENTS = [f"drone{i + 1}" for i in range(NUM_AGENTS)]
+AGENT_NAMESPACE = {a: ("" if i == 0 else f"/px4_{i}") for i, a in enumerate(ALL_AGENTS)}
 
 # Fixed, pre-agreed starting scene -- see module docstring for why this is
-# hardcoded rather than computed at runtime. Spawn points sit on a circle of
-# radius ~TARGET_DIST around the target's start, at the exact 120-degree
-# spacing the policy is trained to want, so the starting scene is already
-# close to the trained-for equilateral formation. deployment/
-# launch_px4_instance.sh's spawn args must match SPAWN_XY.
+# computed once here rather than at runtime. Spawn points sit on a circle of
+# radius SPAWN_RADIUS around the target's start, evenly spaced, so the
+# starting scene is already close to the trained-for equilateral formation.
+# deployment/launch_px4_instance.sh's spawn args must match SPAWN_XY.
+# Generalized from NUM_AGENTS (2026-08-20) -- for NUM_AGENTS=3 this
+# reproduces the original hardcoded (5.0,0.0)/(-2.5,4.33)/(-2.5,-4.33) up to
+# float rounding (drone2/3 were hand-rounded to 2dp originally).
 TARGET_START = np.array([0.0, 0.0, 3.0], np.float32)   # sim/Gazebo world frame
+SPAWN_RADIUS = 5.0
 SPAWN_XY = {
-    "drone1": (5.0, 0.0),
-    "drone2": (-2.5, 4.33),
-    "drone3": (-2.5, -4.33),
+    a: (SPAWN_RADIUS * np.cos(2 * np.pi * i / NUM_AGENTS),
+        SPAWN_RADIUS * np.sin(2 * np.pi * i / NUM_AGENTS))
+    for i, a in enumerate(ALL_AGENTS)
 }
 # Each PX4 instance's vehicle_local_position is relative to ITS OWN local
 # EKF origin (near its own spawn point), not a frame shared across
@@ -192,11 +201,27 @@ def set_marker_velocity(name, vel):
                     env=GZ_ENV, capture_output=True)
 
 
+CSV_COLUMNS = [
+    "wall_time", "cycle", "agent", "armed", "took_off",
+    "pos_x", "pos_y", "pos_z", "vel_x", "vel_y", "vel_z",
+    "target_x", "target_y", "target_z", "dist_to_target", "min_dist_to_neighbor",
+    "action_x", "action_y", "action_z",
+    "safe_vel_x", "safe_vel_y", "safe_vel_z", "brake_reduction",
+]
+
+
 class MarlInferenceNode(Node):
-    def __init__(self, model_path, agent_name, device="cpu"):
+    def __init__(self, model_path, agent_name, device="cpu", log_csv=None):
         super().__init__(f"marl_inference_node_{agent_name}")
         self.device = device
         self.agent_name = agent_name
+        self.csv_writer = None
+        self.csv_file = None
+        if log_csv:
+            self.csv_file = open(log_csv, "w", newline="")
+            self.csv_writer = csv.writer(self.csv_file)
+            self.csv_writer.writerow(CSV_COLUMNS)
+            self.get_logger().info(f"[{agent_name}] Logging every cycle to {log_csv}")
         self.other_agents = [a for a in ALL_AGENTS if a != agent_name]
         self.is_target_owner = (agent_name == "drone1")
         self.ns = AGENT_NAMESPACE[agent_name]
@@ -401,11 +426,21 @@ class MarlInferenceNode(Node):
         self._publish_velocity_setpoint(ned_vel)
         self.real_branch_count += 1
 
+        dist_t = float(np.linalg.norm(own_sim_pos - target_pos))
+        min_pair = min(
+            float(np.linalg.norm(self.env.pos[a] - own_sim_pos)) for a in self.other_agents
+        )
+
+        if self.csv_writer is not None:
+            self.csv_writer.writerow([
+                f"{time.time():.3f}", self.cycle, self.agent_name, True, self.took_off,
+                *own_sim_pos.tolist(), *own_sim_vel.tolist(),
+                *target_pos.tolist(), f"{dist_t:.4f}", f"{min_pair:.4f}",
+                *action.tolist(), *safe_vel_sim.tolist(),
+                f"{brake_reduction[self.agent_name]:.4f}",
+            ])
+
         if self.cycle % int(1.0 / DT) == 0:   # ~once/sec
-            dist_t = float(np.linalg.norm(own_sim_pos - target_pos))
-            min_pair = min(
-                float(np.linalg.norm(self.env.pos[a] - own_sim_pos)) for a in self.other_agents
-            )
             self.get_logger().info(
                 f"[{self.agent_name}] pos={own_sim_pos.round(2)} dist_to_target={dist_t:.2f} "
                 f"(ideal={TARGET_DIST:.2f}) min_dist_to_neighbor={min_pair:.2f} "
@@ -416,18 +451,21 @@ class MarlInferenceNode(Node):
 
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--model", required=True, help="Path to an actor .pt checkpoint (NUM_AGENTS=3 shape)")
+    parser.add_argument("--model", required=True, help="Path to an actor .pt checkpoint (NUM_AGENTS-shaped)")
     parser.add_argument("--agent-name", required=True, choices=ALL_AGENTS)
     parser.add_argument("--device", default="cpu")
+    parser.add_argument("--log-csv", default=None, help="Optional path to write one CSV row per control cycle (see CSV_COLUMNS)")
     args = parser.parse_args()
 
     rclpy.init()
-    node = MarlInferenceNode(args.model, args.agent_name, args.device)
+    node = MarlInferenceNode(args.model, args.agent_name, args.device, log_csv=args.log_csv)
     try:
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
+        if node.csv_file is not None:
+            node.csv_file.close()
         node.destroy_node()
         rclpy.shutdown()
 
