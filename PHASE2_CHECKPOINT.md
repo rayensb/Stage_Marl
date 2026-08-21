@@ -162,6 +162,34 @@ those files, though its own documentation stays in `deployment/docs/` as before.
 `rayensb` (the GitHub org name) — easy to transpose, produces a permission-denied error that
 reads like a slug typo rather than an owner typo.
 
+## Update 2026-08-21/22: active search validated (properly, second try) — real win; no-termination ablation partial; timeout-bracket test running
+
+Both the 3-seed no-termination ablation and the first active-search Kaggle batch (v1) were
+re-run after discovering `13b9e38`/`b15f391` had never been pushed (see the git-push note
+above this section) — v1 of both silently ran pre-active-search `62a685d` code. Corrected
+versions (v2) are the results below.
+
+**No-termination ablation (`DISABLE_TARGET_LOST_TERMINATION=1`, 3 seeds, correct code)**:
+`contact_fraction` improved consistently across all 3 seeds (31-48%, up from ~16-21%
+pre-ablation) — a real, reproducible effect. But `target_lost_rate` under the real 6s
+timeout stayed catastrophic (79-100%) and **collision safety, previously ~0%, became
+seed-dependent and unstable (0-21%)** — likely the brake's known two-agent-at-a-time gap
+being stressed harder by longer average episodes + more divergent per-agent motion while
+searching. Net: a genuine partial improvement that doesn't reach the finish line and adds a
+new cost. Not adopted as-is.
+
+**Active search, properly tested (2 seeds, correct code, 6s timeout)**: `contact_fraction`
+85.0-90.7% (final), collision 0-1%, target_lost still 60-81% -- but **median loss-event
+length was exactly 121 steps in both seeds, i.e. 1 step past the 120-step (6s) cutoff**.
+Read: search is working -- the median failure is a near-miss on timing, not a
+never-finds-it failure (contrast the ablation's median loss streak of ~900-1150 steps).
+This reverses the earlier (invalid-code) conclusion that active search doesn't help --
+it's the best single result of the whole investigation once actually tested.
+
+**Currently running** (5 kernels, `phase3-resilience` @ `ddac78e`, active search + longer
+timeout, bracketing the fix suggested by the near-miss finding above): `stage-marl-search-
+t8-s{1,2}` (8s timeout, 2 seeds), `stage-marl-search-t10-s{1,2,3}` (10s timeout, 3 seeds).
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
