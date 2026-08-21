@@ -20,7 +20,7 @@ import torch
 
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, LOST_TIMEOUT_STEPS
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
@@ -61,14 +61,34 @@ def run_episode(env, actors, device, seed, record=False):
     step = 0
     collided = False
     target_lost = False
+    ground_struck = False
     # Ground truth (env.pos_t), deliberately NOT the swarm's own tracked
     # estimate -- this is the objective "how well did it actually do"
     # measure, independent of what the swarm could or couldn't perceive at
     # the time (which is what the reward, not the eval metric, is scored
     # against). See envs/formation_env.py's module docstring.
     track_errors, spacing_stds, diameters, speeds, confidences = [], [], [], [], []
+    estimation_errors = []
     min_dist_ever = float("inf")
     trajectory = [] if record else None
+
+    # Contact/recovery diagnostics (2026-08-21, added for the no-target_lost-
+    # termination training ablation -- see config.py's DISABLE_TARGET_LOST_
+    # TERMINATION comment). contact_fraction is the primary metric: what
+    # fraction of the episode did the swarm actually have the target, not
+    # just "did it eventually fail". Streak/event counts distinguish "loses
+    # contact briefly and often" from "loses it once and never gets it back"
+    # -- both can produce the same target_lost_rate but mean very different
+    # things about what to fix.
+    contact_steps = 0
+    current_contact_streak = 0
+    current_loss_streak = 0
+    longest_contact_streak = 0
+    longest_loss_streak = 0
+    loss_events = 0
+    reacquisitions_total = 0
+    reacquisitions_within_timeout = 0
+    was_in_contact = True  # episodes always start in contact by construction (see reset())
 
     while True:
         act_dict = {}
@@ -93,13 +113,44 @@ def run_episode(env, actors, device, seed, record=False):
         step += 1
         any_info = next(iter(infos.values()), {})
         collided = bool(any_info.get("collision", False))
+        ground_struck = ground_struck or bool(any_info.get("ground_strike", False))
         target_lost = bool(any_info.get("target_lost", False))
-        if collided or target_lost or any(truncs.values()):
+        estimation_errors.append(float(any_info.get("target_estimation_error", 0.0)))
+
+        in_contact_now = (env._steps_since_contact == 0)
+        if in_contact_now:
+            if not was_in_contact:
+                # Just reacquired -- current_loss_streak still holds the
+                # just-ended loss period's full length (checked before it's
+                # reset below), which is exactly what decides whether this
+                # recovery would have beaten the real LOST_TIMEOUT_STEPS.
+                reacquisitions_total += 1
+                if current_loss_streak <= LOST_TIMEOUT_STEPS:
+                    reacquisitions_within_timeout += 1
+            current_contact_streak += 1
+            current_loss_streak = 0
+            contact_steps += 1
+        else:
+            if was_in_contact:
+                loss_events += 1
+            current_loss_streak += 1
+            current_contact_streak = 0
+        longest_contact_streak = max(longest_contact_streak, current_contact_streak)
+        longest_loss_streak = max(longest_loss_streak, current_loss_streak)
+        was_in_contact = in_contact_now
+
+        # env.agents is authoritative for "did the episode actually end" --
+        # respects DISABLE_TARGET_LOST_TERMINATION automatically, unlike
+        # re-deriving the stop condition from collided/target_lost/truncs
+        # directly (which would stop this loop even when the env itself
+        # was told to keep going).
+        if not env.agents:
             break
 
     metrics = {
         "collided": collided,
         "target_lost": target_lost,
+        "ground_strike": ground_struck,
         "episode_len": step,
         "min_dist": min_dist_ever,
         "tracking_rmse": float(np.sqrt(np.mean(np.square(track_errors)))) if track_errors else 0.0,
@@ -107,6 +158,13 @@ def run_episode(env, actors, device, seed, record=False):
         "avg_diameter": float(np.mean(diameters)) if diameters else 0.0,
         "avg_speed": float(np.mean(speeds)) if speeds else 0.0,
         "avg_confidence": float(np.mean(confidences)) if confidences else 0.0,
+        "avg_target_estimation_error": float(np.mean(estimation_errors)) if estimation_errors else 0.0,
+        "contact_fraction": float(contact_steps / step) if step else 0.0,
+        "longest_contact_streak": longest_contact_streak,
+        "longest_loss_streak": longest_loss_streak,
+        "loss_events": loss_events,
+        "reacquisitions_total": reacquisitions_total,
+        "reacquisitions_within_timeout": reacquisitions_within_timeout,
     }
     return metrics, trajectory
 
@@ -149,6 +207,7 @@ def main():
 
     collided = np.array([r["collided"] for r in rows], dtype=float)
     target_lost = np.array([r["target_lost"] for r in rows], dtype=float)
+    ground_strikes = np.array([r["ground_strike"] for r in rows], dtype=float)
     ep_lens = np.array([r["episode_len"] for r in rows], dtype=float)
     min_dists = np.array([r["min_dist"] for r in rows], dtype=float)
     tracking_rmses = np.array([r["tracking_rmse"] for r in rows], dtype=float)
@@ -156,12 +215,25 @@ def main():
     diameters = np.array([r["avg_diameter"] for r in rows], dtype=float)
     speeds = np.array([r["avg_speed"] for r in rows], dtype=float)
     confidences = np.array([r["avg_confidence"] for r in rows], dtype=float)
+    estimation_errors = np.array([r["avg_target_estimation_error"] for r in rows], dtype=float)
+    contact_fractions = np.array([r["contact_fraction"] for r in rows], dtype=float)
+    longest_contact_streaks = np.array([r["longest_contact_streak"] for r in rows], dtype=float)
+    longest_loss_streaks = np.array([r["longest_loss_streak"] for r in rows], dtype=float)
+
+    # Aggregated as counts across all episodes, not an average of per-episode
+    # ratios -- a single episode's loss-event count is often 0 or 1, which
+    # makes a per-episode fraction noisy/undefined; summing first and
+    # dividing once is the statistically sound way to get P(reacquire | lost).
+    total_loss_events = sum(r["loss_events"] for r in rows)
+    total_reacq = sum(r["reacquisitions_total"] for r in rows)
+    total_reacq_in_time = sum(r["reacquisitions_within_timeout"] for r in rows)
 
     summary = {
         "episodes": args.episodes,
         "success_rate": float(1.0 - collided.mean() - target_lost.mean()),
         "collision_rate": float(collided.mean()),
         "target_lost_rate": float(target_lost.mean()),
+        "ground_strike_rate": float(ground_strikes.mean()),
         "avg_episode_len": float(ep_lens.mean()),
         "avg_min_dist": float(min_dists.mean()),
         "worst_min_dist": float(min_dists.min()),
@@ -170,6 +242,19 @@ def main():
         "avg_swarm_diameter": float(diameters.mean()),
         "avg_speed": float(speeds.mean()),
         "avg_track_confidence": float(confidences.mean()),
+        "avg_target_estimation_error": float(estimation_errors.mean()),
+        # --- contact/recovery diagnostics (2026-08-21) ---
+        "contact_fraction": float(contact_fractions.mean()),
+        "median_contact_streak": float(np.median(longest_contact_streaks)),
+        "p90_contact_streak": float(np.percentile(longest_contact_streaks, 90)),
+        "max_contact_streak": float(longest_contact_streaks.max()) if len(longest_contact_streaks) else 0.0,
+        "frac_episodes_streak_gt_100": float((longest_contact_streaks > 100).mean()),
+        "frac_episodes_streak_gt_200": float((longest_contact_streaks > 200).mean()),
+        "median_loss_streak": float(np.median(longest_loss_streaks)),
+        "max_loss_streak": float(longest_loss_streaks.max()) if len(longest_loss_streaks) else 0.0,
+        "total_loss_events": total_loss_events,
+        "reacquire_rate_eventual": float(total_reacq / total_loss_events) if total_loss_events else 0.0,
+        "reacquire_rate_within_timeout": float(total_reacq_in_time / total_loss_events) if total_loss_events else 0.0,
     }
 
     print("\n=== Evaluation summary (deterministic, no exploration) ===")

@@ -399,3 +399,21 @@ MAX_ACTION_SPEED_Z = 0.6 * MAX_ACTION_SPEED   # = 0.72
 # step()'s comment and KNOWN_ISSUES.md item 9. 500 steps = 25s, giving a
 # 1800-step (90s) episode room for ~3 mid-episode redirects.
 TARGET_REDIRECT_INTERVAL_STEPS = 500
+
+# Training ablation (2026-08-21) -- diagnostic-only, off by default. A
+# scripted-controller test showed the environment is solvable (near-zero
+# contact loss with a hand-coded radial+repulsion controller), while every
+# active-search checkpoint spent 79-84% of flight time out of contact --
+# a training/learning gap, not an environment/reward-design one. Hypothesis:
+# episodes ending in target_lost cut the policy off before it experiences
+# either sustained contact or a full loss-then-recovery cycle, starving it
+# of the exact experience needed to learn either. This flag tests ONLY that
+# hypothesis: it gates *just* target_lost's effect on termination -- self.
+# _target_lost, r_contact, and TARGET_LOST_PENALTY are all computed and
+# applied exactly as before (deliberately -- this isolates "does removing
+# the hard cutoff help" from "does changing the tracking objective help",
+# which is a different, not-yet-justified experiment). Collision, ground_
+# strike, and MAX_STEPS truncation are untouched and still end the episode
+# normally. Not intended as a permanent training default -- see
+# docs/ai_context/EXPERIMENT_LOG.md for this ablation's result once run.
+DISABLE_TARGET_LOST_TERMINATION = bool(int(os.environ.get("DISABLE_TARGET_LOST_TERMINATION", 0)))

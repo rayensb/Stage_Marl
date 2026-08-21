@@ -93,7 +93,7 @@ from config import (
     GROUND_URGENT_COEF, GROUND_STRIKE_PENALTY,
     MAX_ACTION_SPEED_Z, TARGET_REDIRECT_INTERVAL_STEPS,
     CRUISE_ALT_MIN, CRUISE_ALT_COEF, Z_SMOOTHING_ALPHA,
-    SEARCH_SPEED,
+    SEARCH_SPEED, DISABLE_TARGET_LOST_TERMINATION,
 )
 
 # XYZ r_spread (2026-08-19, xyz-spread branch; angle corrected 2026-08-20
@@ -698,6 +698,14 @@ class FormationEnv3D(ParallelEnv):
         ground_struck_agents = {a for a in self.agents if float(self.pos[a][2]) <= GROUND_Z}
         ground_strike = len(ground_struck_agents) > 0
 
+        # Training ablation (2026-08-21, see config.py's DISABLE_TARGET_LOST_
+        # TERMINATION comment) -- gates ONLY target_lost's effect on episode
+        # termination, isolated from everything else it does: self._target_lost
+        # itself, r_contact's ramp, and TARGET_LOST_PENALTY in _get_reward
+        # below are all computed identically regardless of this flag. Off by
+        # default (normal behavior, unchanged).
+        target_lost_terminates = self._target_lost and not DISABLE_TARGET_LOST_TERMINATION
+
         reward_tuples = {a: self._get_reward(a, a in colliding_agents, brake_reduction[a],
                                                a in ground_struck_agents) for a in self.agents}
         rewards = {a: reward_tuples[a][0] for a in self.agents}
@@ -711,7 +719,7 @@ class FormationEnv3D(ParallelEnv):
         # info flag (not folded into "collided") so callers can log/
         # attribute the distinct failure modes separately rather than
         # conflating them.
-        terminations = {a: bool(collision or self._target_lost or ground_strike) for a in self.agents}
+        terminations = {a: bool(collision or target_lost_terminates or ground_strike) for a in self.agents}
         truncations = {a: bool(truncated) for a in self.agents}
         obs = {a: self._get_obs(a) for a in self.agents}
         infos = {a: {"min_dist": self._min_dist(a),
@@ -725,6 +733,13 @@ class FormationEnv3D(ParallelEnv):
                        "brake_violation": self._last_brake_violation,
                        "k_active": self._last_brake_k_active[a],
                        "collision": collision,
+                       # Reports the real, computed target_lost state
+                       # regardless of DISABLE_TARGET_LOST_TERMINATION --
+                       # this is "did we exceed the grace period", not
+                       # "did that end the episode". Callers that need to
+                       # know whether the episode actually ended over it
+                       # should check terminations/whether env.agents is
+                       # now empty, not this flag alone.
                        "target_lost": self._target_lost,
                        # Ground clamp diagnostic (Phase 3, 2026-08-20),
                        # mirrors brake_reduction/collision above.
@@ -734,9 +749,22 @@ class FormationEnv3D(ParallelEnv):
                        # observation (both use the estimate) -- diagnostic
                        # only, to check how far the estimate-based reward
                        # ever actually diverges from reality.
-                       "true_track_err": abs(self._dist_to_target(a) - TARGET_DIST)} for a in self.agents}
+                       "true_track_err": abs(self._dist_to_target(a) - TARGET_DIST),
+                       # Estimator error (2026-08-21, diagnostic only) --
+                       # distinct from true_track_err above: that's a RANGE
+                       # error (|actual distance - TARGET_DIST|), this is the
+                       # swarm's shared position ESTIMATE's actual distance
+                       # from ground truth (_track_pos_est vs pos_t, not the
+                       # per-agent search waypoint) -- lets callers separate
+                       # "is our estimate of where the target is wrong" from
+                       # "are we holding the wrong distance from wherever we
+                       # think it is" and "do we currently have contact at
+                       # all", three different failure modes that otherwise
+                       # look identical from target_lost_rate alone.
+                       "target_estimation_error": float(np.linalg.norm(self._track_pos_est - self.pos_t)),
+                       } for a in self.agents}
 
-        if collision or truncated or self._target_lost or ground_strike:
+        if collision or truncated or target_lost_terminates or ground_strike:
             self.agents = []
 
         return obs, rewards, terminations, truncations, infos
