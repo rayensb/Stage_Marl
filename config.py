@@ -267,15 +267,35 @@ SENSOR_RANGE = TARGET_DIST + 2 * REACTION_DIST
 #
 # Env-var overridable (2026-08-20) -- was a flat 2.0, tuned against
 # MAX_STEPS=200 (10s) episodes and never revisited when Phase 3 raised
-# MAX_STEPS to 1800 (90s). That mismatch is suspected as the primary cause
-# of Phase 3's target_lost_rate sitting near 100% and never improving: a
-# fixed 2-second grace window has ~9x more opportunities to be exceeded by
-# an ordinary, recoverable contact gap over a 9x longer episode, even with
-# no change in the swarm's actual moment-to-moment tracking competence.
-# Sweeping 6/10/18s across seeds to find out empirically rather than
-# guessing at one value.
-LOST_TIMEOUT_SEC   = float(os.environ.get("LOST_TIMEOUT_SEC", 2.0))
-LOST_TIMEOUT_STEPS = int(LOST_TIMEOUT_SEC / DT)   # = 40 at 2.0s/DT=0.05
+# MAX_STEPS to 1800 (90s). Swept 6/10/18s across seeds rather than guessing
+# at one value -- result was NOT a clean dose-response (2026-08-21): 3 of
+# 4 completed 6s/10s runs stayed catastrophically broken (78-98%
+# target_lost_rate, flat from the very first rollout), and the one
+# exception (10s, seed2: 4-5%) looks more like a seed that happened to
+# learn contact-maintaining behavior early than a config that reliably
+# works -- it also picked up a new, previously-absent collision problem
+# (see KNOWN_ISSUES.md and the active-search comment below). Conclusion:
+# grace-period length alone was never the primary lever. 6.0 kept as the
+# new default (up from 2.0, not all the way to 10/18) while active search
+# (below) is what's actually expected to do the real work of improving
+# reacquisition odds, rather than just giving dead-reckoning more time to
+# coast toward an increasingly stale, unfound estimate.
+LOST_TIMEOUT_SEC   = float(os.environ.get("LOST_TIMEOUT_SEC", 6.0))
+LOST_TIMEOUT_STEPS = int(LOST_TIMEOUT_SEC / DT)   # = 120 at 6.0s/DT=0.05
+
+# Active search (2026-08-21) -- once the whole swarm loses contact, each
+# drone fans out in its own straight-line direction from the last-known
+# position (assigned once per loss-of-contact event, evenly spread with a
+# randomized start angle) rather than every drone converging on the same,
+# increasingly-stale dead-reckoned point. See _update_target_track/
+# _assign_search_directions in envs/formation_env.py. SEARCH_SPEED is a
+# REWARD-TARGET speed (how fast the synthetic search waypoint recedes),
+# not a velocity cap on the drone itself -- MAX_ACTION_SPEED still governs
+# actual motion. Set to the upper end of the target's own plausible speed
+# range (see _resample_target_motion's 0.3-1.0 uniform range) so a
+# searching drone's waypoint recedes at a rate comparable to how far the
+# real target could plausibly have gone, rather than an arbitrary guess.
+SEARCH_SPEED = 1.0
 
 # Ramps 0 (swarm just lost contact) -> CONTACT_URGENT_COEF (right at the
 # LOST_TIMEOUT_STEPS boundary, where target_lost termination fires) --

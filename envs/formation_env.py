@@ -49,6 +49,26 @@ realistic (noisy, range-only) neighbor sensing, sensing noise/occlusion for
 the target reading itself, a directional FOV cone, or non-constant-velocity
 target motion -- see config.py's SENSOR_RANGE/LOST_TIMEOUT comments for why
 each is deferred rather than skipped.
+
+ACTIVE SEARCH (2026-08-21): added after Phase 3's LOST_TIMEOUT_SEC sweep
+showed the grace-period LENGTH was not the primary lever on target_lost_rate
+(3 of 4 completed 6s/10s runs stayed near-100% broken; the one exception
+looked like a lucky seed, not a working config -- see EXPERIMENT_LOG.md).
+Previously, every agent coasted toward the SAME dead-reckoned point
+(self._track_pos_est) while contact was lost, which only ever gets more
+wrong over time and gives the swarm no way to actively improve its odds of
+reacquiring the target. Now, the moment the whole swarm loses contact, each
+agent is assigned its own fixed search heading (_assign_search_directions,
+called once per loss-of-contact event, not every step) and _get_obs/
+_get_reward track a PER-AGENT synthetic waypoint receding from the
+last-known position in that heading, reusing the exact same r_track/
+r_velocity reward math that already pulls a drone toward a target estimate
+-- no new reward term needed. The instant any agent's real sensor comes
+within SENSOR_RANGE of the true target, the existing contact-sharing logic
+in _update_target_track() takes over unchanged. If nobody finds it before
+LOST_TIMEOUT_STEPS, the episode still ends in target_lost exactly as
+before -- search is meant to improve the odds within that window, not
+remove the window itself.
 """
 
 import math
@@ -73,6 +93,7 @@ from config import (
     GROUND_URGENT_COEF, GROUND_STRIKE_PENALTY,
     MAX_ACTION_SPEED_Z, TARGET_REDIRECT_INTERVAL_STEPS,
     CRUISE_ALT_MIN, CRUISE_ALT_COEF, Z_SMOOTHING_ALPHA,
+    SEARCH_SPEED,
 )
 
 # XYZ r_spread (2026-08-19, xyz-spread branch; angle corrected 2026-08-20
@@ -134,6 +155,14 @@ class FormationEnv3D(ParallelEnv):
         self._observer_count = 0
         self._direct_contact = {}
         self._contact_centroid = None
+        # Active search (2026-08-21) -- see _assign_search_directions/
+        # _update_target_track. Defensive zero-init only, same reasoning as
+        # the fields above: _update_target_track() always runs before any
+        # of this is read, and a fresh env starts in direct contact (see
+        # above), so _search_dirs is never actually consulted un-assigned.
+        self._search_dirs = {}
+        self._effective_pos_est = {}
+        self._effective_vel_est = {}
 
     @functools.lru_cache(maxsize=None)
     def observation_space(self, agent):
@@ -343,6 +372,15 @@ class FormationEnv3D(ParallelEnv):
             self._last_known_vel = (self._target_dir * self._target_speed).astype(np.float32)
             self._steps_since_contact = 0
         else:
+            # Active search (2026-08-21): assign fresh search headings
+            # exactly once, on the first step of a NEW loss-of-contact
+            # event -- self._steps_since_contact is still 0 here iff
+            # contact just ended this step (it's only ever reset to 0 in
+            # the branch above), so this fires once per event, not every
+            # step of a continuing search. See _assign_search_directions
+            # and the module docstring.
+            if self._steps_since_contact == 0:
+                self._assign_search_directions()
             self._steps_since_contact += 1
 
         self._track_confidence = max(0.0, 1.0 - self._steps_since_contact / LOST_TIMEOUT_STEPS)
@@ -352,10 +390,53 @@ class FormationEnv3D(ParallelEnv):
         self._track_pos_est = (self._last_known_pos + self._last_known_vel * elapsed).astype(np.float32)
         self._track_vel_est = self._last_known_vel
 
+        # Per-agent effective estimate (2026-08-21, active search): equals
+        # the shared self._track_pos_est/_track_vel_est above whenever
+        # anyone has contact (self._steps_since_contact == 0 iff contacts
+        # this step, per above) -- a strict generalization, not a parallel
+        # code path, so this reduces to the pre-search behavior exactly
+        # whenever nobody is currently searching. Diverges per-agent only
+        # during a lost period: each agent's own waypoint recedes from the
+        # last-known position in ITS assigned heading, rather than every
+        # agent coasting toward the same increasingly-stale shared point.
+        # _get_obs/_get_reward read this dict, never the shared fields
+        # directly, so both automatically pick up search behavior with no
+        # further reward/observation-shape changes.
+        self._effective_pos_est = {}
+        self._effective_vel_est = {}
+        for a in self.agents:
+            if self._steps_since_contact == 0:
+                self._effective_pos_est[a] = self._track_pos_est
+                self._effective_vel_est[a] = self._track_vel_est
+            else:
+                search_vel = (self._search_dirs[a] * SEARCH_SPEED).astype(np.float32)
+                self._effective_pos_est[a] = (self._last_known_pos + search_vel * elapsed).astype(np.float32)
+                self._effective_vel_est[a] = search_vel
+
         self._contact_centroid = (
             np.mean([self.pos[a] for a in contacts], axis=0).astype(np.float32)
             if contacts else None
         )
+
+    def _assign_search_directions(self):
+        """Called exactly once per loss-of-contact event (see
+        _update_target_track), not every step while lost -- each agent
+        gets a fixed heading to fly in a straight line from the
+        last-known position until contact is regained or the episode
+        ends, rather than continuously re-randomizing (which would never
+        let a drone actually cover ground in a given direction). Evenly
+        spread around a randomized base angle so agents search different
+        areas without the swarm collapsing onto the same absolute compass
+        pattern every single episode. Horizontal-only (z=0) -- altitude
+        is independently governed by GROUND_SAFE_ENTER/CRUISE_ALT_MIN,
+        not something search should fight."""
+        base_angle = self.np_random.uniform(0, 2 * math.pi)
+        n = len(self.agents)
+        self._search_dirs = {}
+        for i, a in enumerate(self.agents):
+            angle = base_angle + 2 * math.pi * i / n
+            self._search_dirs[a] = np.array(
+                [math.cos(angle), math.sin(angle), 0.0], dtype=np.float32)
 
     def _apply_brake(self, raw_vel):
         """Extracted from step() (2026-08-19) so it's callable standalone --
@@ -681,16 +762,19 @@ class FormationEnv3D(ParallelEnv):
 
     def _get_obs(self, agent):
         p, v = self.pos[agent], self.vel[agent]
-        # Sourced from the swarm's tracked estimate (_update_target_track()),
-        # never self.pos_t directly -- see the module docstring. Identical
-        # slots/normalization to the old ground-truth version, so this is a
-        # drop-in swap from the network's point of view, not a new feature
-        # per se, except for the estimate being imperfect during a dead-
-        # reckoning coast (never during direct contact, since the estimate
-        # equals ground truth exactly whenever any drone currently has it).
-        rel_t = (self._track_pos_est - p) / OBS_MAX_DIST
-        dist_t = float(np.linalg.norm(self._track_pos_est - p)) / OBS_MAX_DIST
-        rel_target_vel = (self._track_vel_est - v) / OBS_MAX_VEL
+        # Sourced from this agent's effective estimate
+        # (_update_target_track()), never self.pos_t directly -- see the
+        # module docstring. Identical slots/normalization to the old
+        # ground-truth version, so this is a drop-in swap from the
+        # network's point of view. Equals the swarm-shared tracked
+        # estimate during direct contact; becomes this agent's own
+        # search waypoint during a lost period (active search,
+        # 2026-08-21) -- see _update_target_track/_assign_search_directions.
+        target_pos_est = self._effective_pos_est[agent]
+        target_vel_est = self._effective_vel_est[agent]
+        rel_t = (target_pos_est - p) / OBS_MAX_DIST
+        dist_t = float(np.linalg.norm(target_pos_est - p)) / OBS_MAX_DIST
+        rel_target_vel = (target_vel_est - v) / OBS_MAX_VEL
 
         has_contact = 1.0 if self._direct_contact.get(agent, False) else 0.0
         age_norm = min(1.0, self._steps_since_contact / LOST_TIMEOUT_STEPS)
@@ -734,21 +818,25 @@ class FormationEnv3D(ParallelEnv):
         p, v = self.pos[agent], self.vel[agent]
         neighbors = self.locked[agent]
 
-        # Both computed against the swarm's tracked ESTIMATE, not ground
+        # Both computed against this agent's effective ESTIMATE, not ground
         # truth (self.pos_t) -- an agent can only be rewarded for what it
         # (or the swarm, via shared contact) can actually know. Using ground
         # truth here while the observation uses the estimate would be
         # exactly the same class of observation/reward mismatch a supervisor
         # review caught for r_safety earlier (see config.py's K_NEIGHBORS
-        # comment) -- not repeating that. In this noiseless iteration the
-        # estimate equals ground truth whenever anyone has direct contact,
-        # and is exact dead-reckoning otherwise (constant-velocity target),
-        # so this is numerically a no-op today; it's still the structurally
-        # correct thing to compute once sensing noise exists.
-        track_err = abs(float(np.linalg.norm(p - self._track_pos_est)) - TARGET_DIST)
+        # comment) -- not repeating that. Equals the shared tracked estimate
+        # during direct contact (numerically ~a no-op there, same as
+        # before); during a lost period this is now the agent's own search
+        # waypoint (active search, 2026-08-21) -- reusing this exact reward
+        # shape to pull a searching agent toward ITS assigned heading is
+        # deliberate, not an approximation: no new reward term was added for
+        # search, this one just gets pointed at a different target.
+        target_pos_est = self._effective_pos_est[agent]
+        target_vel_est = self._effective_vel_est[agent]
+        track_err = abs(float(np.linalg.norm(p - target_pos_est)) - TARGET_DIST)
         r_track = TRACK_WEIGHT * track_err
 
-        r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - self._track_vel_est))
+        r_velocity = VELOCITY_WEIGHT * float(np.linalg.norm(v - target_vel_est))
 
         # True 3D angular separation (was horizontal/XY-bearing-only) -- see
         # _IDEAL_NEIGHBOR_ANGLE above. For each pair of locked neighbors,
