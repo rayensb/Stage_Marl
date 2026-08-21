@@ -16,13 +16,12 @@ implemented and validated (Phase2-combined, 5-seed `N=2/3/4` sweep, 3/3 `N=4` se
 - **Confirm the `LOST_TIMEOUT_SEC` sweep and land a working value.** Phase 3's longer episodes
   (`MAX_STEPS` 200→1800) broke `target_lost_rate` almost completely (89-100%, flat from step 1)
   because the dead-reckoning grace period was never rescaled — see `KNOWN_ISSUES.md` item 12.
-  A 5-kernel sweep (6s x2, 10s x2, 18s x1) is running; 4 of 5 are confirmed `RUNNING`, the 5th
-  is blocked by a Kaggle platform issue (see `KNOWN_ISSUES.md` item 15 — likely to resolve on
-  its own, or needs the user to check Kaggle's web UI directly). **Next step**: once all 5
-  complete, download and analyze results (`collision_rate`, `target_lost_rate`,
-  `tracking_rmse`, plus the training-time rolling-window picture, not just eval-time numbers —
-  eval-time understated the real `N=4` collision problem once before) and pick a value to
-  adopt as the new default.
+  A 5-kernel sweep (6s x2, 10s x2, 18s x1) is running; **all 5 confirmed `RUNNING` as of
+  2026-08-21** (the 18s kernel was blocked ~4-4.5 hours by a Kaggle platform issue that cleared
+  on its own — see `KNOWN_ISSUES.md` item 15, resolved). **Next step**: once all 5 complete,
+  download and analyze results (`collision_rate`, `target_lost_rate`, `tracking_rmse`, plus the
+  training-time rolling-window picture, not just eval-time numbers — eval-time understated the
+  real `N=4` collision problem once before) and pick a value to adopt as the new default.
 - **Verify the vertical-jiggling fix actually worked.** `CRUISE_ALT_MIN`/`CRUISE_ALT_COEF`/
   `Z_SMOOTHING_ALPHA` are implemented and smoke-tested, but the 8-25% vertical-velocity
   sign-flip rate that motivated them was measured *before* the fix — nobody has yet loaded a

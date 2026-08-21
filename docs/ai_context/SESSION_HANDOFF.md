@@ -141,16 +141,15 @@ ancestor branches)
 
 ## Unresolved / pending as of this handoff
 
-1. **The `LOST_TIMEOUT_SEC` sweep — the real open problem now.** 4 of 5 kernels running
-   (6s x2, 10s x2); the 18s kernel is blocked by a Kaggle session-cap issue that persisted even
-   after confirming only 4 kernels were genuinely running and everything else was complete. See
-   `KNOWN_ISSUES.md` item 15 for the full troubleshooting record. **Next step for whoever picks
-   this up**: retry the push (`cd` to the `kaggle_timeout18_seed1` scratchpad dir if it still
-   exists, or recreate it — `kernel-metadata.json` id is `rayensboui/stage-marl-timeout18-seed1`,
-   `verify.py` sets `LOST_TIMEOUT_SEC=18`, `SEED=1`, `NUM_AGENTS=4`, `TOTAL_STEPS=3000000`,
-   branch `phase3-resilience`); if it still fails, ask the user to check Kaggle's web UI
-   directly for a stray running session (there was no Chrome browser connected in this session
-   to do that automatically). Once all 5 complete, analyze and pick a value — see `TODO.md`.
+1. **The `LOST_TIMEOUT_SEC` sweep — the real open problem now.** All 5 kernels are running as
+   of 2026-08-21 (`timeout6-seed1/2`, `timeout10-seed1/2`, and `timeout18-seed1` — the last one
+   was blocked for roughly 4-4.5 hours by a Kaggle session-cap issue, which cleared on its own;
+   see `KNOWN_ISSUES.md` item 15, now resolved). A background `Monitor` task is watching all 5
+   and will surface a notification per kernel as it completes/fails. **Next step for whoever
+   picks this up**: once all 5 finish, download each (`kaggle kernels output
+   rayensboui/<slug> -p <dir>`) and analyze — collision/target_lost/tracking_rmse, both
+   eval-time and the training-time rolling-window picture, per `TODO.md`'s Critical section —
+   then pick a `LOST_TIMEOUT_SEC` value to adopt.
 2. **Vertical-jiggling fix unverified.** Implemented, smoke-tested, not yet re-measured against
    a trained checkpoint. Do this once the sweep produces checkpoints — load one, run the same
    400-deterministic-step sign-flip measurement used to confirm the original problem, compare.

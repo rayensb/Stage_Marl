@@ -121,14 +121,14 @@ under time pressure, not yet re-verified against a post-fix checkpoint.
 `LOST_TIMEOUT_SEC` is now env-overridable (was a flat 2.0) — Phase 3's `target_lost_rate`
 came back catastrophic (89-100%, all 3 seeds, flat from the first rollout) because this never
 scaled when `MAX_STEPS` grew 9x. A 5-kernel sweep (6s x2 seeds, 10s x2 seeds, 18s x1 seed) is
-running: `stage-marl-timeout6-seed1`, `-timeout6-seed2`, `-timeout10-seed1`, `-timeout10-seed2`
-confirmed `RUNNING`. `-timeout18-seed1` has not started — Kaggle's "Maximum batch CPU session
-count of 5" persisted even with only 4 kernels confirmed running and everything else on the
-account confirmed complete; likely an orphaned session from an earlier interrupted push,
-invisible to `kernels status`. No CLI/API way found to list or cancel it directly. If you're
-picking this up: check Kaggle's web UI (Your Work → Notebooks) for a stray running session
-before retrying the push again, and see `docs/ai_context/KNOWN_ISSUES.md` item 15 for the full
-troubleshooting record.
+running: `stage-marl-timeout6-seed1`, `-timeout6-seed2`, `-timeout10-seed1`, `-timeout10-seed2`,
+`-timeout18-seed1` — **all 5 confirmed `RUNNING` as of 2026-08-21**. The 18s kernel was
+blocked for ~4-4.5 hours by Kaggle's "Maximum batch CPU session count of 5" (persisted even
+with only 4 kernels confirmed running and everything else on the account confirmed complete —
+likely an orphaned session from an earlier interrupted push, invisible to `kernels status`);
+it cleared on its own, no manual Kaggle UI intervention needed. See
+`docs/ai_context/KNOWN_ISSUES.md` item 15 for the full record. A background watcher is polling
+all 5 for completion/failure and will pull results down as each finishes.
 
 `docs/ai_context/` (all 11 files) was fully rewritten this pass to reflect everything since
 the last update: Phase 1/1b (brake fixes), the N-aware-margin/xyz-spread hypotheses and the

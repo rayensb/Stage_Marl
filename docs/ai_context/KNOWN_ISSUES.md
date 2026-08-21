@@ -264,7 +264,7 @@ actually reduces it by a meaningful amount is an open question until the current
 checkpoints can be loaded and measured the same way. Don't cite this as "fixed and confirmed"
 until that check happens — see `TODO.md`.
 
-## 15. Kaggle "Maximum batch CPU session count of 5" blocked a launch even with only 4 kernels confirmed running
+## 15. [RESOLVED] Kaggle "Maximum batch CPU session count of 5" blocked a launch even with only 4 kernels confirmed running
 
 **Symptom**: pushing the 5th kernel in the `LOST_TIMEOUT_SEC` sweep (`stage-marl-timeout18-
 seed1`) failed with Kaggle's 5-concurrent-session cap error, even after individually
@@ -282,7 +282,11 @@ of one of the kernels (the initial `timeout6-seed1` push was interrupted mid-fli
 this session, before being re-pushed with the altitude fix included) — `kernels status`
 appears to report only the latest version's session, so an old version's session could still
 be silently consuming a slot.
-**Status**: unresolved as of this writing. Likely to self-resolve once Kaggle's own session
-time limit lapses the orphaned session, or resolvable directly via the user checking Kaggle's
-web UI (`kaggle.com` → "Your Work" → Notebooks) for a stray running session and stopping it
-manually. See `SESSION_HANDOFF.md` for what to try next.
+**Resolved 2026-08-21**: cleared on its own after roughly 4-4.5 hours of the 4 legitimate
+kernels running (no manual intervention on Kaggle's web UI was used) — consistent with the
+orphaned-session hypothesis: whatever stale session was holding the 5th slot most likely hit
+its own time limit and was force-terminated by Kaggle. `stage-marl-timeout18-seed1` pushed
+successfully and confirmed `RUNNING` once the slot freed. If this recurs on a future kernel
+batch, the same wait-it-out approach worked here — retry the push periodically rather than
+assuming something is permanently broken, though checking Kaggle's web UI directly would
+likely resolve it faster if it happens again.
