@@ -18,6 +18,26 @@ below. `phase2-combined` itself is unchanged and still the validated
 reference point; Phase 3 is a separate, not-yet-validated leap-of-faith
 bundle on top of it.
 
+**Update 2026-08-21 (important, read if anything about `target_lost`
+results looks inconsistent)**: commits `13b9e38` (active search) and
+`b15f391` (`DISABLE_TARGET_LOST_TERMINATION` ablation) were made locally
+but **not pushed to origin** until well after several Kaggle runs claiming
+to test them had already launched and completed. Those runs (the first
+`stage-marl-active-search-seed{1,2,3}`, `stage-marl-search-t2-seed1`,
+`stage-marl-search-t18-seed1`, and the first `stage-marl-ablation-noterm-
+seed{1,2,3}`, all "version 1") actually cloned whatever was on origin at
+the time (`62a685d`) -- i.e. plain `LOST_TIMEOUT_SEC=6` with **no active
+search and no ablation flag at all**. Their eval CSVs confirm this
+directly (old 10-column schema, no `contact_fraction`/etc., and seed-for-
+seed numbers matching the pre-active-search 6s baseline almost exactly).
+`origin/phase3-resilience` is now up to date (`b15f391`, pushed). Relaunched
+correctly as "version 2": `stage-marl-ablation-noterm-seed{1,2,3}` and
+`stage-marl-active-search-seed{1,2}` (2 of 3, Kaggle's 5-session cap only
+had 2 free slots after the 3 ablation seeds). **Always confirm
+`git status` shows "up to date with origin" immediately before pushing any
+new Kaggle kernel from this worktree** -- this is now a standing
+pre-launch check, not just a one-off fix.
+
 ## What this reference point is
 
 Four combined fixes for the N=4 collision problem, validated:
