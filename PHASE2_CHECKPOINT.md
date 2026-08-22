@@ -278,6 +278,16 @@ the case for the already-queued brake relative-velocity reformulation (`TODO.md`
 persistent, un-perturbed near-symmetric closing pattern is exactly what a deterministic policy
 can produce and exactly what the brake's proof gap is about.
 
+## Update 2026-08-22 (later): relative-velocity brake validation launched
+
+Commit `94216fd` (this document also updated in the same commit). 3 fresh 3M-step kernels
+launched to check the reformulation actually reduces `collision_rate` in training, not just in
+the two hand-picked adversarial scenarios in `test_brake_relative_velocity.py`: `stage-marl-
+brake-relvel-s{1,2,3}` (`NUM_AGENTS=4`, `LOST_TIMEOUT_SEC` left at its current default (6s, not
+overridden) so this is a clean test of the brake change alone, no confound from the still-open
+timeout question). All 3 confirmed `RUNNING`. Uses 3 of Kaggle's 5 session slots -- the other 2
+are the `search-t10-s{1,2}-resume-5m` kernels from the update above, still training.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
