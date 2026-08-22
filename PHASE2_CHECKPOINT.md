@@ -288,6 +288,46 @@ overridden) so this is a clean test of the brake change alone, no confound from 
 timeout question). All 3 confirmed `RUNNING`. Uses 3 of Kaggle's 5 session slots -- the other 2
 are the `search-t10-s{1,2}-resume-5m` kernels from the update above, still training.
 
+## Update 2026-08-23: `main` fast-forwarded; brake-relvel re-launched at 8s/10s (6s batch was inconclusive)
+
+`main` fast-forwarded to `phase2-combined` (`8b724bb`) -- clean, no conflicts, per explicit user
+instruction.
+
+The 6s brake-relvel batch above (`stage-marl-brake-relvel-s{1,2,3}`) completed but was
+**inconclusive**: all 3 seeds landed in the same bad-tracking regime the plain-6s sweep already
+showed (88-97% `target_lost_rate`), never reaching the tight, confident convergence where the
+8-14% collision problem this fix targets was ever observed -- collision came back 0-2% in all 3,
+but with nothing to stress the brake against. A quick local check (re-running `evaluate.py`'s
+*current* code -- i.e. the new relative-velocity brake -- against the existing, already-trained
+`search-t8-s1`/`s2` checkpoints, no retraining) showed only a small improvement over the old
+brake (8%->7%, 14%->13%) -- suggesting the fix alone doesn't rescue a policy trained under the
+old, looser constraint; it likely needs to be present *during* training to actually change
+learned behavior, same lesson as the original multi-pass brake fix.
+
+**Relaunched at timeouts known to let tracking converge** (5 kernels, all `RUNNING`):
+`stage-marl-brake-relvel-t8-s{1,2,3}` (8s) and `stage-marl-brake-relvel-t10-s{3,4}` (10s).
+Seeds were chosen to pair directly with existing old-brake results where possible: t8-seed1/2
+and t10-seed3 exactly match `search-t8-s1`/`s2`/`search-t10-s3` (the seeds that converged well
+under the old brake), giving the cleanest available before/after comparison; t8-seed3 and
+t10-seed4 are fresh coverage.
+
+## Update 2026-08-23: checked deployment/ for signs of active work on the crash diagnostic trio
+
+Not touching PX4/Gazebo/ROS2 directly (no established access to that stack in this thread) --
+just checked what's visible in the shared worktree. Found `deployment/verify_obs_adapter.py`
+(dated 2026-08-20), a complete, already-written Phase-7-style observation-adapter verification
+script (6 scenarios: converged-formation sanity, asymmetric-state + velocity-clipping, NED/
+spawn-offset round-trip, clock-skew quantification, neighbor ordering) -- this appears to
+already answer the first item of `PHASE2_HANDOFF.md`'s "NEXT SINGLE TEST" list, contradicting
+that document's own "skipped entirely" framing, which looks stale relative to this file.
+`deployment/n4_seed1_run0.json`/`run1.json`/`last_trajectory.json` (also dated 2026-08-19/20)
+look like real captured trajectory data, possibly toward Phase 9's distribution comparison --
+contents not inspected in detail. No sign of Phase 17 (control-loop Hz under load) having been
+done. **This doc itself has had no updates from the deployment side since 2026-08-20** -- no way
+to confirm from here whether that workstream is still active. Whoever picks this up next should
+first re-run `verify_obs_adapter.py` (per its own docstring, needs ROS2 sourced but no daemon/
+simulator running) to get a current pass/fail before assuming anything about Phase 7's status.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
