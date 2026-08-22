@@ -274,9 +274,13 @@ concern about external vehicles.
 closing rate) in both the multi-pass correction loop and the post-hoc violation diagnostic —
 see `DECISIONS.md`. Re-verified against both adversarial scenarios (now a committed regression
 test, `test_brake_relative_velocity.py`, not just a one-off manual claim) — still zero residual
-violation. **Not yet confirmed to actually reduce `collision_rate` at training scale** — a
-3-seed/3M-step Kaggle validation is in progress. Don't cite this as fully closed until that
-completes; see `EXPERIMENT_LOG.md`/`SESSION_HANDOFF.md`.
+violation.
+**Kaggle validation ran but was inconclusive, not negative**: all 3 seeds (6s timeout, the
+current default) landed in a bad-tracking regime (88-97% `target_lost_rate`) rather than the
+tight, confident convergence where the original 8-14% collision problem was ever observed —
+0-2% collision in all 3, but with nothing to stress the brake against, this doesn't confirm or
+deny the fix. Retesting at a timeout known to let seeds converge well (8-10s) is the natural
+next step, not yet launched. See `EXPERIMENT_LOG.md`.
 
 ## 14. Vertical jiggling — fixed, but only smoke-tested, not yet re-validated against a trained checkpoint
 

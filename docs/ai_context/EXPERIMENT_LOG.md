@@ -790,11 +790,24 @@ test, `test_brake_relative_velocity.py`, rather than left as a one-off manual cl
 against the new formulation: minimum distance never breached `COLLISION_DIST`, residual
 violation ~0 (2-agent: exactly 0; 4-agent: 4e-8, float-precision noise). Standard local smoke
 tests (`test_geometry.py`, `test_env.py` at `N=2/3/4`) also pass clean.
-**Status**: **not yet confirmed at training scale.** 3 fresh 3M-step kernels launched
-(`stage-marl-brake-relvel-s{1,2,3}`, `NUM_AGENTS=4`, `LOST_TIMEOUT_SEC` left at its current
-default of 6s so this is a clean test of the brake change alone) to check the reformulation
-actually reduces `collision_rate` in training, not just in the two hand-picked adversarial
-scenarios above. In progress as of this writing — see `SESSION_HANDOFF.md` for live status.
+**Result (all 3 seeds complete, 3.01M steps each)**: `target_lost_rate` 88-97%, `collision_rate`
+0-2% (eval-time and training-time-rolling-window both), every seed.
+**Conclusion: inconclusive for the question this was meant to answer, not a negative result.**
+All 3 seeds landed in the same bad-tracking regime the plain 6s timeout sweep already showed
+(2 of 2 seeds there were also 85-96% `target_lost`) — none reached the tight, confident tracking
+convergence that `search-t8`/`search-t10`-seed3 showed, which is specifically the regime where
+the 8-14% collision problem this fix targets was ever observed. With `target_lost_rate` this
+high, the swarm spends most of its time coasting/searching rather than tightly converged near
+the target, so there's little opportunity for the brake to be stressed the way it was in the
+runs that motivated this fix. **Choosing to hold `LOST_TIMEOUT_SEC` at its 6s default "for a
+clean test of the brake alone" was reasonable in principle but turned out to be an unlucky
+choice in practice** — 6s is exactly the timeout value most likely to produce this
+non-convergent regime, based on the sweep and ablation data already in this log.
+**Status**: the brake fix itself is unrefuted (nothing here contradicts it), but this batch
+doesn't confirm or deny whether it reduces `collision_rate` in the regime that matters. Retesting
+at a timeout known to let seeds converge well (8-10s, matching where the original problem was
+observed) is the natural next step — not yet launched, pending user direction. See
+`KNOWN_ISSUES.md` item 13.
 
 ## `search-t10` seed1/seed2 — 5M-step resume, testing "just needs more training"
 
