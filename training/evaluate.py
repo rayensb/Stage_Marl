@@ -20,7 +20,7 @@ import torch
 
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, LOST_TIMEOUT_STEPS
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, LOST_TIMEOUT_STEPS, DT
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
@@ -88,6 +88,16 @@ def run_episode(env, actors, device, seed, record=False):
     loss_events = 0
     reacquisitions_total = 0
     reacquisitions_within_timeout = 0
+    # Per-event steps-to-reacquire (2026-08-22) -- reacquisitions_total/
+    # reacquisitions_within_timeout above are counts, not durations. This is
+    # the actual "how long did search take" distribution: one entry per
+    # successful reacquisition this episode, pooled across all episodes in
+    # main(). Deliberately does NOT include events that never reacquired
+    # (the episode ended in target_lost/truncation first) -- those are
+    # already fully captured by target_lost_rate/reacquire_rate_*, and
+    # mixing an undefined "how long would it have taken" duration into this
+    # list would bias it in a way that's hard to interpret.
+    reacquisition_times = []
     was_in_contact = True  # episodes always start in contact by construction (see reset())
 
     while True:
@@ -125,6 +135,7 @@ def run_episode(env, actors, device, seed, record=False):
                 # reset below), which is exactly what decides whether this
                 # recovery would have beaten the real LOST_TIMEOUT_STEPS.
                 reacquisitions_total += 1
+                reacquisition_times.append(current_loss_streak)
                 if current_loss_streak <= LOST_TIMEOUT_STEPS:
                     reacquisitions_within_timeout += 1
             current_contact_streak += 1
@@ -147,6 +158,7 @@ def run_episode(env, actors, device, seed, record=False):
         if not env.agents:
             break
 
+    track_errors_arr = np.array(track_errors, dtype=float)
     metrics = {
         "collided": collided,
         "target_lost": target_lost,
@@ -154,6 +166,15 @@ def run_episode(env, actors, device, seed, record=False):
         "episode_len": step,
         "min_dist": min_dist_ever,
         "tracking_rmse": float(np.sqrt(np.mean(np.square(track_errors)))) if track_errors else 0.0,
+        # Per-episode true-tracking-error tail stats (2026-08-22) -- RMSE
+        # above already exists for continuity with prior runs, but it
+        # smooths over exactly the tail behavior (occasional bad excursions)
+        # that RMSE alone can mask. Pooled, run-level mean/P95/max (the more
+        # statistically meaningful version -- see main()) are computed from
+        # the raw per-step samples returned below, not from these
+        # per-episode values.
+        "track_err_p95": float(np.percentile(track_errors_arr, 95)) if len(track_errors_arr) else 0.0,
+        "track_err_max": float(track_errors_arr.max()) if len(track_errors_arr) else 0.0,
         "avg_spacing_std": float(np.mean(spacing_stds)) if spacing_stds else 0.0,
         "avg_diameter": float(np.mean(diameters)) if diameters else 0.0,
         "avg_speed": float(np.mean(speeds)) if speeds else 0.0,
@@ -166,7 +187,16 @@ def run_episode(env, actors, device, seed, record=False):
         "reacquisitions_total": reacquisitions_total,
         "reacquisitions_within_timeout": reacquisitions_within_timeout,
     }
-    return metrics, trajectory
+    # Raw per-step/per-event samples, kept separate from the CSV-bound
+    # per-episode `metrics` dict above -- main() pools these across every
+    # episode in the batch to compute run-level percentiles (see its
+    # docstring note on why "average of per-episode P95s" is the wrong
+    # statistic).
+    raw = {
+        "track_errors": track_errors_arr,
+        "reacquisition_times": np.array(reacquisition_times, dtype=float),
+    }
+    return metrics, trajectory, raw
 
 
 def _default_run_id():
@@ -196,10 +226,14 @@ def main():
     env = FormationEnv3D(num_agents=NUM_AGENTS, k_neighbors=K_NEIGHBORS)
 
     rows = []
+    all_track_errors = []
+    all_reacquisition_times = []
     for ep in range(args.episodes):
-        metrics, traj = run_episode(env, actors, args.device, seed=args.seed + ep,
-                                      record=(ep == 0 and args.save_trajectory is not None))
+        metrics, traj, raw = run_episode(env, actors, args.device, seed=args.seed + ep,
+                                           record=(ep == 0 and args.save_trajectory is not None))
         rows.append(metrics)
+        all_track_errors.append(raw["track_errors"])
+        all_reacquisition_times.append(raw["reacquisition_times"])
         if traj is not None:
             np.savez(args.save_trajectory,
                      **{k: np.array([t[k] for t in traj]) for k in traj[0]})
@@ -228,6 +262,15 @@ def main():
     total_reacq = sum(r["reacquisitions_total"] for r in rows)
     total_reacq_in_time = sum(r["reacquisitions_within_timeout"] for r in rows)
 
+    # Pooled raw samples across the whole eval batch (2026-08-22) -- the
+    # statistically sound way to get run-level tail statistics, same
+    # "pool first, then compute the statistic once" reasoning already used
+    # above for total_loss_events/total_reacq (a per-episode P95 of ~18
+    # samples, then averaged over 100 episodes, is a different and noisier
+    # statistic than the true P95 over every sample actually observed).
+    pooled_track_errors = np.concatenate(all_track_errors) if all_track_errors else np.array([])
+    pooled_reacq_times = np.concatenate(all_reacquisition_times) if all_reacquisition_times else np.array([])
+
     summary = {
         "episodes": args.episodes,
         "success_rate": float(1.0 - collided.mean() - target_lost.mean()),
@@ -243,6 +286,14 @@ def main():
         "avg_speed": float(speeds.mean()),
         "avg_track_confidence": float(confidences.mean()),
         "avg_target_estimation_error": float(estimation_errors.mean()),
+        # --- pooled true-tracking-error tail stats (2026-08-22) ---
+        # Ground-truth-based (env.pos_t, not the swarm's estimate -- see
+        # run_episode's track_errors comment), pooled over every step of
+        # every episode -- distinct from avg_tracking_rmse above (an
+        # average of 100 per-episode RMSEs, which understates tail risk).
+        "mean_true_track_err": float(pooled_track_errors.mean()) if len(pooled_track_errors) else 0.0,
+        "p95_true_track_err": float(np.percentile(pooled_track_errors, 95)) if len(pooled_track_errors) else 0.0,
+        "max_true_track_err": float(pooled_track_errors.max()) if len(pooled_track_errors) else 0.0,
         # --- contact/recovery diagnostics (2026-08-21) ---
         "contact_fraction": float(contact_fractions.mean()),
         "median_contact_streak": float(np.median(longest_contact_streaks)),
@@ -253,8 +304,24 @@ def main():
         "median_loss_streak": float(np.median(longest_loss_streaks)),
         "max_loss_streak": float(longest_loss_streaks.max()) if len(longest_loss_streaks) else 0.0,
         "total_loss_events": total_loss_events,
+        "avg_loss_events_per_episode": float(total_loss_events / args.episodes) if args.episodes else 0.0,
         "reacquire_rate_eventual": float(total_reacq / total_loss_events) if total_loss_events else 0.0,
         "reacquire_rate_within_timeout": float(total_reacq_in_time / total_loss_events) if total_loss_events else 0.0,
+        # --- reacquisition-time distribution (2026-08-22) ---
+        # Steps/seconds actually taken to regain contact, over successful
+        # reacquisitions only (see reacquisition_times' comment in
+        # run_episode for why failed/never-reacquired events are excluded
+        # rather than biasing this with an undefined duration).
+        # n_reacquisitions_observed makes the sample size explicit --
+        # important since a "good" seed can paradoxically have very few
+        # loss events to compute this distribution from.
+        "n_reacquisitions_observed": int(len(pooled_reacq_times)),
+        "mean_reacquisition_steps": float(pooled_reacq_times.mean()) if len(pooled_reacq_times) else 0.0,
+        "median_reacquisition_steps": float(np.median(pooled_reacq_times)) if len(pooled_reacq_times) else 0.0,
+        "p95_reacquisition_steps": float(np.percentile(pooled_reacq_times, 95)) if len(pooled_reacq_times) else 0.0,
+        "max_reacquisition_steps": float(pooled_reacq_times.max()) if len(pooled_reacq_times) else 0.0,
+        "mean_reacquisition_sec": float(pooled_reacq_times.mean() * DT) if len(pooled_reacq_times) else 0.0,
+        "p95_reacquisition_sec": float(np.percentile(pooled_reacq_times, 95) * DT) if len(pooled_reacq_times) else 0.0,
     }
 
     print("\n=== Evaluation summary (deterministic, no exploration) ===")
