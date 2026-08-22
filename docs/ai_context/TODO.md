@@ -1,6 +1,6 @@
 # TODO / Roadmap
 
-Updated 2026-08-20. Prioritized, not sequenced by date. "Critical" blocks understanding
+Updated 2026-08-22. Prioritized, not sequenced by date. "Critical" blocks understanding
 current results; "High" is the next real work; "Medium" is valuable but not blocking;
 "Research/Future" is speculative scope, not committed work.
 
@@ -8,25 +8,24 @@ current results; "High" is the next real work; "Medium" is valuable but not bloc
 done** — multi-pass brake convergence, the thresholded brake-engagement penalty, the N-aware
 safety margin, and 3D `r_spread` (plus the geometry-angle bug fix along the way) were all
 implemented and validated (Phase2-combined, 5-seed `N=2/3/4` sweep, 3/3 `N=4` seeds clean at
-0% collision). See `EXPERIMENT_LOG.md`/`DECISIONS.md`. The roadmap below reflects what's open
-*now*, not what was open as of the last pass.
+0% collision). **The `LOST_TIMEOUT_SEC` sweep, active search, and the brake's relative-velocity
+reformulation (all "High" as of the previous pass) are also now done** — see
+`EXPERIMENT_LOG.md`/`DECISIONS.md`. The roadmap below reflects what's open *now*, not what was
+open as of the last pass.
 
 ## Critical
 
-- **Confirm the `LOST_TIMEOUT_SEC` sweep and land a working value.** Phase 3's longer episodes
-  (`MAX_STEPS` 200→1800) broke `target_lost_rate` almost completely (89-100%, flat from step 1)
-  because the dead-reckoning grace period was never rescaled — see `KNOWN_ISSUES.md` item 12.
-  A 5-kernel sweep (6s x2, 10s x2, 18s x1) is running; **all 5 confirmed `RUNNING` as of
-  2026-08-21** (the 18s kernel was blocked ~4-4.5 hours by a Kaggle platform issue that cleared
-  on its own — see `KNOWN_ISSUES.md` item 15, resolved). **Next step**: once all 5 complete,
-  download and analyze results (`collision_rate`, `target_lost_rate`, `tracking_rmse`, plus the
-  training-time rolling-window picture, not just eval-time numbers — eval-time understated the
-  real `N=4` collision problem once before) and pick a value to adopt as the new default.
+- **Confirm the relative-velocity brake fix actually reduces `collision_rate` at training
+  scale.** Adversarially verified (`test_brake_relative_velocity.py`), but the mechanism-level
+  fix isn't the same claim as "this measurably helps a real training run." 3 seeds/3M steps
+  running (`stage-marl-brake-relvel-s{1,2,3}`). **Next step**: once complete, download and
+  analyze both eval-time and training-time rolling-window `collision_rate`, comparing against
+  the `search-t8`/`search-t10`-seed3 baseline this was meant to fix (8-14% eval collision on
+  well-converged checkpoints). See `KNOWN_ISSUES.md` item 13.
 - **Verify the vertical-jiggling fix actually worked.** `CRUISE_ALT_MIN`/`CRUISE_ALT_COEF`/
   `Z_SMOOTHING_ALPHA` are implemented and smoke-tested, but the 8-25% vertical-velocity
   sign-flip rate that motivated them was measured *before* the fix — nobody has yet loaded a
-  post-fix checkpoint and re-measured it the same way. Do this once the current sweep produces
-  checkpoints. See `KNOWN_ISSUES.md` item 14.
+  post-fix checkpoint and re-measured it the same way. See `KNOWN_ISSUES.md` item 14.
 - **Fast-forward `phase2-combined` to `main`.** Verified as a clean fast-forward, no conflicts,
   but blocked by the permission classifier on a direct push from the agent — needs the user to
   run `git push origin phase2-combined:main` themselves (or confirm another approach). `main`
@@ -34,25 +33,14 @@ implemented and validated (Phase2-combined, 5-seed `N=2/3/4` sweep, 3/3 `N=4` se
 
 ## High
 
-- **The "active search when lost" behavior — explicitly requested, not yet started.** When the
-  whole swarm loses target contact (not just an individual drone), have drones fan out in
-  different directions to search, and communicate the target's location swarm-wide the moment
-  any one of them reacquires it. The current system already does two related things well
-  (dead-reckoning to last-known position/velocity, and instant swarm-wide sharing on contact —
-  both were already implemented before this was requested, see `ARCHITECTURE.md`'s
-  `_update_target_track` description) — this is the genuinely new piece: coordinated search
-  *after* the dead-reckoning estimate is no longer trusted, instead of just continuing to
-  drift toward a stale last-known position. Deliberately **not** bundled into the Phase 3
-  changes or the `LOST_TIMEOUT_SEC` sweep, to avoid further compounding attribution difficulty
-  while that sweep is still unresolved — treat as its own follow-up once tracking is stable
-  again.
-- **Reformulate the closing-speed brake with relative velocity, not each agent's own
-  velocity.** `v_closing` is currently `dot(v_a, dir_to_b)`; the brake's stress-test
-  verification relies on every agent running the identical symmetric formula, an assumption
-  that doesn't hold once a real or independently-controlled vehicle is involved. This is no
-  longer a purely theoretical footnote — `deployment/inference_node.py` calls `_apply_brake`
-  directly against real PX4/Gazebo telemetry. See `KNOWN_ISSUES.md` item 13 and
-  `deployment/docs/PHASE2_HANDOFF.md`.
+- **Decide whether/how to push `target_lost_rate` further.** Active search + a long-enough
+  timeout can reach ~2-4% `target_lost_rate` when a seed converges well, but training is
+  seed-sensitive — 2 of 3 `t10` seeds got stuck worse, and resuming them to 5M steps only
+  partially closed the gap (70-72%→41%, 92-96%→83%). Options not yet tried: more training steps
+  still (from a fresh run, not a resume, to avoid the LR/entropy-schedule discontinuity a resume
+  introduces), a different seed, or a design change to reduce seed-sensitivity itself. Not
+  urgent relative to the collision-safety cost item above, which is the more concrete, more
+  deployment-relevant open problem right now.
 - **Update or replace `readme.txt`** — more stale than ever (still describes a removed
   per-drone-file save scheme, silent on everything from the brake onward). See
   `KNOWN_ISSUES.md` item 2.

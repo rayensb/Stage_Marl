@@ -26,7 +26,17 @@ tracking loss over longer episodes) is diagnosed with a fix currently being swep
 inference pipeline, built by a separate, concurrent conversation sharing this worktree — its
 own documentation lives in `deployment/docs/` and is deliberately **not** part of this index
 or this suite's scope; see `ARCHITECTURE.md`'s `deployment/` section for how the two connect.
-See `SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` items 12/14/15 and
+
+**Updated again 2026-08-22, now against commit `94216fd`/`3eae55b` on `phase3-resilience`**:
+the plain `LOST_TIMEOUT_SEC` sweep found no clean dose-response; **active search** was built and
+validated as a real, major fix for `target_lost_rate` (though not a complete one); testing it at
+a longer timeout surfaced a **new** collision-safety cost under deterministic execution, which
+was investigated, explained (a policy's mean action can converge to a knife-edge equilibrium
+training-time noise never sat at — deterministic eval, not training-time numbers, is now the
+trusted safety signal), and addressed by reformulating the closing-speed brake with true
+relative velocity — adversarially verified, Kaggle-scale validation in progress. Two stuck
+seeds were resumed to 5M steps to test "does more training help" (partially yes). See
+`SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` items 12/13/16/17 and
 `TODO.md` Critical for the specifics of what's still open.
 
 ## Read order for a new session

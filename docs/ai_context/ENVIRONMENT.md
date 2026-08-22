@@ -104,6 +104,20 @@ Verified via direct inspection this session:
   the top 15 of a `--page-size 100` listing that still led with a kernel pushed at 13:34 the
   same day). Don't use this listing's ordering to infer recency or currently-running state —
   check specific kernels' status individually via `kaggle kernels status <ref>` instead.
+- **Confirm `git status` shows up to date with `origin` immediately before every Kaggle
+  launch, every time.** Standing rule, adopted after ~8 kernels across two feature branches
+  silently ran stale code because the local commits they were meant to test hadn't been pushed
+  yet — the kernels' fresh `git clone` picked up whatever was on `origin` at push time, not what
+  was on disk locally. Caught via a missing-columns anomaly in the downloaded eval CSVs, not
+  assumed. See `KNOWN_ISSUES.md` item 17.
+- **Kaggle datasets (`dataset_sources` in `kernel-metadata.json`) mount at
+  `/kaggle/input/datasets/<owner>/<dataset-slug>/`, not the classic `/kaggle/input/
+  <dataset-slug>/`** the current `kaggle-cli` docs still describe (confirmed against the docs
+  directly, not just assumed stale). Confirmed 2026-08-22 via a throwaway diagnostic kernel
+  (`os.walk("/kaggle/input")`) after two real kernels failed with `cp: cannot stat` on the
+  documented path — `kaggle datasets status` reporting `ready` does not mean the dataset is
+  correctly referenceable at the path the docs describe. If using a dataset to resume training
+  from a checkpoint (see `COMMANDS.md`), use the `datasets/<owner>/` form.
 - **Kaggle's "Maximum batch CPU session count of 5 reached" can fire even when fewer than 5
   kernels show `RUNNING` via individual `kernels status` checks.** Observed directly
   (2026-08-20): 4 kernels confirmed `RUNNING` by name, every other kernel on the account

@@ -302,13 +302,14 @@ and 4 agents simultaneously converging on a shared centroid, both starting outsi
 `SAFE_DIST_ENTER` and always commanding `MAX_ACTION_SPEED` toward each other/the centroid
 every step. Minimum distance asymptotically approached but never crossed `COLLISION_DIST`,
 zero residual constraint violation after `_apply_brake` on every step of both tests. Not a
-formal proof, and specific to this system: `v_closing` is each agent's *own* velocity
-component toward the other, not the relative closing velocity (`v_a - v_b`) — the stress
-tests hold because every agent runs through the identical symmetric formula, with no way for
-one side to be unconstrained while the other closes at speed. That symmetry assumption stops
-holding once a real, independently-controlled vehicle is involved — see
-`deployment/docs/PHASE2_HANDOFF.md` and `KNOWN_ISSUES.md`. Reformulating with explicit
-relative velocity is queued, not yet done.
+formal proof, and specific to this system *at the time*: `v_closing` was each agent's *own*
+velocity component toward the other, not the relative closing velocity (`v_a - v_b`) — the
+stress tests held because every agent ran through the identical symmetric formula, with no way
+for one side to be unconstrained while the other closes at speed. That symmetry assumption
+stopped holding once a real, independently-controlled vehicle was involved — see
+`deployment/docs/PHASE2_HANDOFF.md` and `KNOWN_ISSUES.md`. **Reformulated with explicit
+relative velocity on 2026-08-22 — see the dedicated entry below. No longer an open gap in the
+mechanism itself, only in Kaggle-scale validation of the fix.**
 **Result**: validated as part of the Phase2-combined bundle (below) — 3/3 `N=4` seeds clean at
 0% `collision_rate` across a 5M-step run, first time `N=4` converged cleanly. See
 `EXPERIMENT_LOG.md`.
@@ -542,7 +543,118 @@ how long they typically last, which is a property of the trained policy's behavi
 constant that can be derived the way `REACTION_DIST` or `SAFE_DIST_ENTER` were. Measuring
 across a spread of values is the honest way to find a working one, consistent with this
 project's established pattern of measuring rather than guessing at reward/config constants.
-**Status**: in progress. 4 of 5 kernels (6s x2, 10s x2) launched and running; the 18s kernel
-was blocked by Kaggle's 5-concurrent-session cap even after the other 4 were confirmed running
-and everything else confirmed complete — see `KNOWN_ISSUES.md` and `SESSION_HANDOFF.md` for
-the live troubleshooting state.
+**Result**: not a clean dose-response — 3 of 5 runs stayed catastrophically broken (85-96%
+`target_lost_rate`) regardless of timeout length, and the two that worked weren't distinguished
+from the three that didn't by timeout length alone (10s-seed1 failed as badly as both 6s seeds;
+10s-seed2 and 18s-seed1 worked). See `EXPERIMENT_LOG.md` for the full table.
+**Status**: resolved. Default set to **6.0** (up from the original flat 2.0, not all the way to
+10/18, given the lack of a clean dose-response) — grace-period length alone was never the
+primary lever. Active search (below) was built as the mechanism actually expected to do the
+real work.
+
+## Active search — per-agent fixed headings on loss of contact, reusing existing reward math
+
+**Decision**: the moment the whole swarm loses contact, assign each agent its own fixed search
+heading (`_assign_search_directions`, called once per loss-of-contact event, evenly spread from
+a randomized base angle) rather than letting every agent continue dead-reckoning toward the
+same, increasingly stale shared estimate. Feeds a per-agent synthetic waypoint
+(`_effective_pos_est`/`_effective_vel_est`) into the *existing* `r_track`/`r_velocity` reward
+math — no new reward term.
+**Rejected alternative**: a new, dedicated "search" reward term. Rejected because the existing
+tracking reward already does exactly the right thing (pull toward a target estimate) — the only
+missing piece was giving each agent a *different*, genuinely-searchable estimate to pull toward
+during a loss period, not a different objective.
+**Why per-agent fixed headings, not continuously re-randomized**: a heading that changes every
+step would never let a drone actually cover ground in a given direction — fixing it for the
+duration of one loss-of-contact event is what makes "fan out and search" a coherent behavior
+rather than jitter.
+**Process failure alongside this decision, corrected, not hidden**: this feature (and the
+`DISABLE_TARGET_LOST_TERMINATION` ablation flag below) were implemented and smoke-tested locally
+but not pushed to `origin` before several Kaggle validation runs of them had already launched and
+completed — those runs silently tested stale, pre-feature code. Found via a missing-columns
+anomaly in the downloaded eval CSVs, not assumed; corrected by pushing and relaunching. **A
+standing rule now**: confirm `git status` shows up to date with origin immediately before every
+Kaggle launch, not just after a mistake. See `PHASE2_CHECKPOINT.md` for the incident record and
+`EXPERIMENT_LOG.md` for the (corrected) validation result.
+**Result**: `contact_fraction` improved from ~16-21% to 85-90.7%, with the median loss event
+landing just 1 step past the (then) 6s cutoff — a near-miss on timing, not a fundamentally
+failing search. The single best result of the `target_lost` investigation. See
+`EXPERIMENT_LOG.md`.
+
+## `DISABLE_TARGET_LOST_TERMINATION` ablation — tested as a diagnostic, not adopted
+
+**Decision**: add an env-gated flag that disables *only* `target_lost`'s termination effect
+(leaving `_target_lost`, `r_contact`, and `TARGET_LOST_PENALTY` computed identically) to test
+whether ending episodes on `target_lost` was itself starving the policy of the sustained-contact
+or full-recovery-cycle experience it needs, isolated from any change to the tracking objective
+itself.
+**Why isolate termination specifically, not just remove the whole `target_lost` mechanism**:
+removing termination alone tests one precise hypothesis ("does the hard cutoff prevent learning
+recovery") without also changing what's rewarded/penalized, which would be a different,
+unrelated experiment.
+**Result**: a genuine, reproducible partial improvement (`contact_fraction` 31-48%, up from
+~16-21%), but `target_lost_rate` stayed catastrophic (79-100%) and collision safety — previously
+~0% — became seed-dependent and unstable (0-21%), likely the brake's known multi-agent gap being
+stressed harder by longer, more divergent search-without-a-hard-stop behavior.
+**Why not adopted**: a real improvement that doesn't reach the finish line and introduces a new
+safety cost is a worse trade than not adopting it at all, especially with active search (above)
+already showing a cleaner path forward. See `EXPERIMENT_LOG.md`.
+
+## Trusting deterministic eval over training-time rolling numbers for safety claims
+
+**Decision**: when `collision_rate` differs between eval-time (deterministic) and training-time
+(stochastic, rolling-window) numbers, trust the deterministic eval number as the honest
+real-world estimate, not the training-time one — even though the training-time number is
+computed over vastly more episodes.
+**Why**: directly investigated, not assumed (see `EXPERIMENT_LOG.md`'s train-vs-eval
+discrepancy entry). Running the exact same frozen checkpoint deterministically vs. stochastically
+on identical eval seeds showed determinism alone can account for most or all of an observed gap
+(11% vs 2% for one seed) — a policy shaped by entropy-driven exploration can converge its *mean*
+action to a knife-edge equilibrium riskier than the noise-perturbed behavior actually seen during
+training. A real flight controller runs the mean/deterministic policy, not a sampled one, so the
+deterministic number is what real deployment will actually experience.
+**Correction, for the record**: an earlier verbal explanation of the residual gap for one seed
+incorrectly attributed a different run's `target_lost_rate` figure to it, implying its tracking
+was less converged. That specific seed's tracking was in fact excellent (`contact_fraction`
+99.7%) — the real explanation for its residual gap is more likely a small-sample artifact in the
+training-time rolling window (50 episodes is not many for a ~10% event rate), not an unconverged
+policy. See `EXPERIMENT_LOG.md` for the corrected account.
+**Status**: adopted as a standing interpretation rule for this project, not just a one-off
+finding — directly motivated the relative-velocity brake reformulation below.
+
+## Relative-velocity brake reformulation
+
+**Decision**: `_apply_brake`'s `v_closing` changed from `dot(v_a, dir_to_b)` (agent a's own
+velocity toward b, silently treating b as stationary) to `dot(v_a - v_b, dir_to_b)` (the true
+mutual closing rate), in both the multi-pass correction loop and the post-hoc violation
+diagnostic. The correction mechanism itself is unchanged — agent a still unilaterally corrects
+only its own velocity, same multi-pass loop, same `max_closing` shape; only what's measured
+changed.
+**Why now, not earlier**: this gap was identified and queued as far back as the original
+multi-pass brake work (see the entry above), but stayed a theoretical footnote until two things
+made it concrete: `deployment/inference_node.py` calling `_apply_brake` against real,
+independently-moving PX4/Gazebo telemetry (a real asymmetric case the old formula was never
+built for), and — more immediately actionable — the deterministic-vs-stochastic collision
+investigation directly above, which found real collisions under exactly the symmetric,
+no-perturbing-noise conditions the old formula's own reasoning said should be safe. That's not
+a coincidence: a deterministic policy running the identical formula on every agent, with nothing
+to break a persistent near-symmetric standoff, is precisely the scenario the old one-sided
+formula's guarantee depended on holding cleanly — and it wasn't.
+**Rejected alternative**: a reciprocal/50-50 "who backs off how much" split (as in RVO/ORCA-style
+collision avoidance), where two mutually-threatening agents share the avoidance burden evenly.
+Rejected for now as a bigger departure from the existing mechanism than asked for — the simpler
+change (each agent still fully responsible for its own correction, just now given accurate
+information about the other's velocity) is a strict generalization of what was already there,
+composes the same way with the existing multi-pass loop, and is the more conservative (safer,
+not less-safe) choice if it errs at all, since agent a alone still guarantees the constraint
+regardless of what b actually does next.
+**Verification before any Kaggle spend**: the same two adversarial scenarios used to validate
+the original multi-pass fix (2-agent head-on, 4-agent converge-on-centroid) were rebuilt as a
+committed regression test, `test_brake_relative_velocity.py`, instead of re-running them as a
+one-off manual check. Both pass: `COLLISION_DIST` never breached, residual violation ~0
+(exactly 0 for the 2-agent case, ~4e-8 — float-precision noise — for the 4-agent case). Standard
+local smoke tests (`test_geometry.py`, `test_env.py` at `N=2/3/4`) also pass clean.
+**Status**: implemented and adversarially verified; **not yet confirmed at training scale** — a
+3-seed/3M-step Kaggle validation is in progress (`stage-marl-brake-relvel-s{1,2,3}`,
+`LOST_TIMEOUT_SEC` left at its current default so this isolates the brake change alone). See
+`EXPERIMENT_LOG.md`/`SESSION_HANDOFF.md` for live status.

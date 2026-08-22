@@ -28,14 +28,21 @@ Train a policy that, at `NUM_AGENTS=4` (the target agent count), maintains tight
 tracking and formation cohesion while avoiding both collisions and losing sensor contact with
 the target — and, as of Phase 3, sustains that quality over a realistic flight duration (90s),
 not just the original 10-second training horizon. The original `N=4` collision problem (brake
-gaps under simultaneous multi-threat braking) **is now resolved** — see `DECISIONS.md`. **The
-current headline open problem is different**: extending episode length to make the policy
-sustain flight longer broke target tracking almost completely (`target_lost_rate` 89-100%),
-root-caused to a dead-reckoning grace period that never scaled with the longer episodes. A fix
-is being swept on Kaggle now. See `TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` item 12.
+gaps under simultaneous multi-threat braking) **is now resolved** — see `DECISIONS.md`.
+**Phase 3's `target_lost` catastrophe (89-100%) is substantially better but not solved**:
+active search (each agent fans out on its own when the swarm loses contact, instead of everyone
+coasting toward the same stale point) got it down to 60-81% at the original 6s timeout, and to
+~2-4% for seeds that converge well at a longer (8-10s) timeout — but training is seed-sensitive,
+and 2 of 3 seeds tested at 10s got stuck in a much worse regime. **The current headline open
+problem is different again**: when a seed *does* converge to that tight, confident tracking
+behavior, deterministic execution (what a real flight controller actually runs) exposes a real
+collision-safety cost (8-14%) the training-time numbers never showed. The brake has been
+reformulated to use true relative velocity instead of each agent's own — adversarially verified,
+Kaggle-scale confirmation in progress. See `TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md`
+items 12-13.
 
-## Current status (code as of commit `62a685d` on `phase3-resilience`, 2026-08-20; `main` still
-at `b59c139`, well behind — see `TODO.md`)
+## Current status (code as of commit `94216fd`/`3eae55b` on `phase3-resilience`, 2026-08-22;
+`main` still at `b59c139`, well behind — see `TODO.md`)
 
 - **Collision avoidance is solid at both `NUM_AGENTS=3` and `4`.** The closing-speed brake
   (a deterministic mechanism, not reward shaping) was extended from a single sequential
@@ -64,16 +71,31 @@ at `b59c139`, well behind — see `TODO.md`)
   `ARCHITECTURE.md`) actually crashed. Ground awareness worked perfectly from the first test
   (zero ground strikes across every validation rollout). **Target tracking did not** — see
   below.
-- **`target_lost_rate` is the current open problem, root-caused, fix in progress.** Phase 3's
-  longer episodes exposed that the vision-tracking system's dead-reckoning grace period
-  (`LOST_TIMEOUT_SEC`, a fixed 2 seconds) was never rescaled — an ordinary, recoverable
-  contact gap now has ~9x more chances per episode to exceed a still-2-second window, with no
-  change in actual tracking competence. `LOST_TIMEOUT_SEC` is now env-overridable; a sweep
-  (6s/10s/18s) is running on Kaggle to find a working value empirically. Not yet confirmed. See
-  `KNOWN_ISSUES.md` item 12.
+- **`target_lost_rate`: a plain `LOST_TIMEOUT_SEC` sweep (6s/10s/18s) found no clean
+  dose-response** — 3 of 5 runs stayed catastrophically broken regardless of timeout length.
+  Default raised to 6.0 anyway; the real lever turned out to be **active search**, not the
+  timeout constant.
+- **Active search, implemented and validated as a real, major improvement.** Each agent now
+  fans out in its own fixed heading when the whole swarm loses contact, instead of every agent
+  coasting toward the same stale point — `contact_fraction` improved from ~16-21% to 85-90.7%
+  at the 6s timeout. A follow-up 8s/10s timeout bracket showed the mechanism can reach 99%+
+  contact / ~2-4% `target_lost_rate` when a seed converges well, but training is seed-sensitive
+  (2 of 3 `t10` seeds got stuck worse). Resuming the stuck seeds to 5M steps confirmed "more
+  training helps" but didn't fully close the gap. See `KNOWN_ISSUES.md` item 12,
+  `EXPERIMENT_LOG.md`.
 - **A separately-reported vertical-jiggling issue was confirmed and fixed in code**, bundled
-  into the same branch/sweep under time pressure — not yet re-verified against a trained
+  into the same branch/sweep under time pressure — still not re-verified against a trained
   checkpoint. See `KNOWN_ISSUES.md` item 14.
+- **New: deterministic execution (what real deployment runs) exposes a collision-safety cost
+  training-time numbers never showed.** Investigated directly — running the same frozen
+  checkpoint deterministically vs. stochastically on identical eval seeds showed determinism
+  alone can explain most/all of an observed gap (a policy's mean action can converge to a
+  knife-edge equilibrium the noise-perturbed training behavior never sat at). Deterministic
+  eval numbers, not training-time rolling numbers, are now the trusted safety signal. See
+  `DECISIONS.md`, `KNOWN_ISSUES.md` item 16.
+- **The brake's known relative-velocity gap (previously theoretical) has been reformulated and
+  adversarially verified — Kaggle-scale confirmation in progress.** `v_closing` now uses the
+  true mutual closing rate, not just one agent's own velocity. See `KNOWN_ISSUES.md` item 13.
 
 ## Important technologies / dependencies
 
@@ -108,6 +130,24 @@ later, a geometry bug shipped a full test cycle before a review caught that two 
 angular quantities had been conflated. Treat any critique or hypothesis — including ones a
 user pastes in, and including this project's own early guesses — as something to verify
 against real data, not as ground truth.
+
+**A third instance of this same lesson, this time an AI's own verbal explanation, not a shipped
+bug**: investigating the train-vs-eval collision discrepancy (2026-08-22), a mid-session verbal
+explanation of one seed's residual gap attributed a *different* run's `target_lost_rate` figure
+to it, implying its tracking was less converged. It wasn't (that seed's `contact_fraction` was
+99.7%, among the best in the project) — the mix-up came from two different experiments each
+having a "seed2." Caught and corrected before it was written into the permanent record, but the
+lesson generalizes: an explanation that sounds coherent and is offered confidently is not the
+same as one that's been checked against the specific numbers it cites — re-verify a causal story
+against the actual source data before treating it as settled, even (especially) your own.
+
+**Also new this pass, a genuinely new class of finding, not a bug**: deterministic execution
+(what real deployment runs) can expose safety costs training-time numbers never show, because a
+policy shaped by exploration noise can converge its *mean* action to a riskier equilibrium than
+the noise-perturbed behavior ever sat at. This isn't "eval-time understates, training overstates"
+like the earlier `N=4` brake lesson — it's closer to the opposite: training's own numbers can be
+optimistic in a way that only shows up once the noise is removed. Trust deterministic eval for
+safety claims; see `DECISIONS.md`.
 
 **On bundling multiple changes into one tested run**: this has happened several times now,
 with different outcomes worth distinguishing rather than treating as one lesson. Early on it

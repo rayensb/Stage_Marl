@@ -615,18 +615,235 @@ episode length to grace-period length — see `DECISIONS.md`).
 **Configuration**: `NUM_AGENTS=4`, `TOTAL_STEPS=3_000_000`, branch `phase3-resilience`
 (commit `62a685d`, includes the altitude/Z-smoothing fix — see `DECISIONS.md`), 5 kernels: 6s
 x2 seeds, 10s x2 seeds, 18s x1 seed.
-**Status**: **in progress, not yet complete**. 4 of 5 kernels launched and confirmed
-`RUNNING` (`stage-marl-timeout6-seed1`, `-timeout6-seed2`, `-timeout10-seed1`,
-`-timeout10-seed2`). The 18s kernel (`stage-marl-timeout18-seed1`) failed to launch —
-Kaggle's "Maximum batch CPU session count of 5 reached" error persisted even after the other 4
-were confirmed running and every other kernel on the account was confirmed `COMPLETE` (not a
-counting error on this session's part — checked individually, not just via the account-wide
-kernel list, which turned out to have a stale/unreliable `lastRunTime` sort order not worth
-trusting for "what's running right now"). Most likely explanation: an orphaned session tied to
-an old, interrupted version of one of the other kernels (the initial `timeout6-seed1` push was
-interrupted mid-flight earlier in this session before being re-pushed with the altitude fix
-included) that isn't visible to the per-kernel `kernels status` check, which appears to report
-only the latest version's session. No CLI/API mechanism was found to list or cancel such a
-session directly — resolving it needs either Kaggle's own session limit to lapse the orphaned
-session automatically, or the user checking Kaggle's web UI directly. See
-`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` for the live troubleshooting state.
+**Status update**: the stuck 18s kernel (Kaggle's session-cap issue) cleared on its own after
+~4-4.5 hours with no manual intervention — see `KNOWN_ISSUES.md` item 15 (resolved). All 5
+completed.
+**Result** (eval-time, final model, 100 episodes each):
+
+| kernel | `LOST_TIMEOUT_SEC` | collision | target_lost |
+|---|---|---|---|
+| timeout6-seed1 | 6 | 1% | 85% |
+| timeout6-seed2 | 6 | 0% | 96% |
+| timeout10-seed1 | 10 | 0% | 93% |
+| timeout10-seed2 | 10 | 4% | 4% |
+| timeout18-seed1 | 18 | 4% | 3% |
+
+**Conclusion**: **not a clean dose-response.** 3 of 5 runs stayed catastrophically broken
+(85-96% `target_lost_rate`) regardless of timeout length; the 2 that worked (10s-seed2,
+18s-seed1) happened to be the two longest timeouts tested, but 10s-seed1 — identical
+configuration to 10s-seed2 — failed just as badly as the 6s runs, a ~90-point spread between
+two seeds at the *exact same* timeout value. Grace-period length alone is not the primary
+lever; whichever seeds happen to "break through" during training matters at least as much as
+the timeout constant itself — the same bimodal, seed-sensitive pattern already seen elsewhere
+in this project (e.g. the `N=3` entropy-recovery relapse in the first `NUM_AGENTS=3` curriculum
+run above).
+**Status**: resolved. `LOST_TIMEOUT_SEC`'s default was raised to 6.0 (up from the original flat
+2.0, not all the way to 10/18, given the lack of a clean dose-response) — see `DECISIONS.md`.
+This result is what motivated building active search (below) as the mechanism actually expected
+to do the real work, rather than continuing to sweep the timeout constant further.
+
+## Active search — implemented, then corrected after a build/launch discipline lapse, then validated as a real, major improvement
+
+**Objective**: give the swarm something better to do than coast toward an increasingly stale
+dead-reckoned point once contact is lost entirely — each agent fans out in its own fixed
+heading (assigned once per loss-of-contact event, evenly spread from a randomized base angle)
+instead of every agent converging on the same point.
+**Configuration**: `_assign_search_directions()` / per-agent `_effective_pos_est`/
+`_effective_vel_est` in `envs/formation_env.py` (commit `13b9e38`) — reuses the existing
+`r_track`/`r_velocity` reward math unchanged, pointed at a per-agent search waypoint instead of
+the shared track estimate during a loss period. No new reward term added.
+**Process failure, caught and corrected, not swept under the rug**: this commit (and the
+`DISABLE_TARGET_LOST_TERMINATION` ablation flag, `b15f391`, below) were made locally but not
+pushed to `origin/phase3-resilience` before several Kaggle kernels claiming to test them had
+already launched and completed. Those runs (`stage-marl-active-search-seed{1,2,3}` v1,
+`stage-marl-search-t2-seed1`, `stage-marl-search-t18-seed1`, `stage-marl-ablation-noterm-
+seed{1,2,3}` v1) actually cloned whatever was on `origin` at the time (`62a685d` — plain
+`LOST_TIMEOUT_SEC=6`, no active search, no ablation flag), confirmed directly from their eval
+CSVs (old 10-column schema, no `contact_fraction`, numbers matching the pre-active-search 6s
+baseline almost exactly) — found via a missing-columns anomaly, not assumed. Fixed by pushing
+and relaunching as "v2"; **confirming `git status` shows up to date with origin immediately
+before every Kaggle launch is now a standing pre-launch check** (see `ENVIRONMENT.md`), not a
+one-off fix. See `PHASE2_CHECKPOINT.md` for the full incident record.
+**Result (v2, correct code, 2 seeds, 6s timeout)**: `contact_fraction` 85.0-90.7% (final) — up
+from ~16-21% pre-active-search — `collision_rate` 0-1%, `target_lost_rate` still 60-81%. But
+**median loss-event length was exactly 121 steps in both seeds — 1 step past the 120-step (6s)
+cutoff.** Read: search is working — the median failure is a near-miss on timing, not a
+never-finds-it failure (contrast the ablation's median loss streak of ~900-1150 steps, below).
+This reverses the earlier (invalid-code) conclusion that active search doesn't help.
+**Status**: the single best result of the whole `target_lost` investigation. Directly motivated
+the `t8`/`t10` timeout-bracket follow-up (below) — if search reliably gets a swarm to within
+~1 step of reacquiring, a slightly longer timeout should convert many of those near-misses into
+successes.
+
+## `DISABLE_TARGET_LOST_TERMINATION` ablation — training-time diagnostic, 3 seeds — partial improvement, new cost, not adopted
+
+**Objective**: test whether ending episodes on `target_lost` was itself starving the policy of
+the exact experience (sustained contact, or a full loss-then-recovery cycle) it needs to learn
+either — isolated from any change to the tracking objective itself (`_target_lost`, `r_contact`,
+`TARGET_LOST_PENALTY` all computed identically regardless of this flag; only termination is
+gated).
+**Configuration**: `NUM_AGENTS=4`, `TOTAL_STEPS=3_000_000`, `DISABLE_TARGET_LOST_TERMINATION=1`,
+`phase3-resilience` @ `b15f391` (v2, correctly pushed — see the incident note above), 3 seeds.
+**Result**: `contact_fraction` improved consistently across all 3 seeds (31-48%, up from
+~16-21% pre-ablation) — a real, reproducible effect. But `target_lost_rate` under the real 6s
+timeout stayed catastrophic (79-100%), and **collision safety, previously ~0%, became
+seed-dependent and unstable (0-21%)** — likely the brake's two-agents-at-a-time gap (item 13)
+being stressed harder by longer average episodes and more divergent per-agent motion while
+searching, with no hard stop to bound it.
+**Conclusion**: a genuine partial improvement that doesn't reach the finish line and adds a new
+cost. Not adopted as a training default.
+**Status**: resolved — not pursued further; active search (above) is the mechanism actually
+carried forward.
+
+## Active search + longer timeout bracket (`t8`/`t10`) — bimodal, seed-sensitive; when it converges, tracking is excellent but exposes the brake's gap
+
+**Objective**: test whether active search plus a longer grace period (bracketing the "1 step
+past cutoff" near-miss finding above) converts more near-misses into successful reacquisitions.
+**Configuration**: `NUM_AGENTS=4`, `TOTAL_STEPS=3_000_000`, `phase3-resilience` @ `ddac78e`,
+active search + `LOST_TIMEOUT_SEC` overridden: `stage-marl-search-t8-s{1,2}` (8s, 2 seeds),
+`stage-marl-search-t10-s{1,2,3}` (10s, 3 seeds).
+**Result** (eval-time, final model, 100 episodes each):
+
+| run | timeout | collision | target_lost | contact_fraction |
+|---|---|---|---|---|
+| t8-s1 | 8s | 8% | 2% | 99.6% |
+| t8-s2 | 8s | 14% | 2% | 99.7% |
+| t10-s1 | 10s | 1% | 70% | 84.1% |
+| t10-s2 | 10s | 0% | 96% | 68.4% |
+| t10-s3 | 10s | 6% | 4% | 99.4% |
+
+**Both `t8` seeds converged to excellent tracking** (contact_fraction ~99.6-99.7%,
+`target_lost_rate` ~2%) — the best tracking numbers in the whole investigation — **but at a
+real collision-safety cost (8-14%)**, not seen at this magnitude anywhere else in the project
+since the original `N=4` brake gap. **`t10` split 2-of-3 bad**: seed3 matches `t8`'s good
+outcome almost exactly (99.4% contact, 4% `target_lost`, 6% collision); seed1/seed2 got stuck
+in a much worse regime (68-84% contact, 70-96% `target_lost`) despite identical configuration.
+A training-curve breakdown (first/mid/last rollout-window averages) on the two bad `t10` seeds
+showed they were still in the bad regime at the midpoint of training, consistent with "needs
+more training steps," not "10s doesn't work" on its own — not yet confirmed by an actual longer
+run (see the 5M-step resume entry below).
+**Conclusion, two separate findings**: (1) active search + a long-enough timeout genuinely can
+produce excellent tracking (99%+ contact) — the seed-sensitivity looks like a
+training-duration/convergence question, not evidence the mechanism itself is capped low.
+(2) **When a seed does converge to that tight, confident tracking behavior, deterministic
+execution exposes a real collision-safety cost that wasn't visible in earlier, less-converged/
+looser-tracking runs** — directly motivated the collision-discrepancy investigation and the
+relative-velocity brake reformulation below.
+**Status**: `t10` seed1/seed2 are being resumed from their ~3.01M-step checkpoints to 5M steps
+to test the "just needs more training" hypothesis — in progress, not yet complete (see
+`SESSION_HANDOFF.md`). `t8`/`t10`-seed3's collision cost is what the relative-velocity brake
+fix (below) targets.
+
+## Train-vs-eval collision-rate discrepancy — investigated and explained
+
+**Objective**: deterministic eval collision rate had run consistently higher than the trailing
+training-time (stochastic) rate across many runs project-wide, most starkly `search-t8-s1`/`s2`
+(train ~1-1.2%, eval 8-14%) — investigate why, rather than assume it's noise or an eval bug.
+**Method**: took the exact same frozen `actor_1.pt`/`actor_2.pt` weights from `search-t8-s1`/
+`s2` and ran 100 fresh episodes twice each — once deterministic (`tanh(mu)`, matches
+`evaluate.py`), once stochastic (sampled, matches `train.py`'s own rollout collection) —
+identical eval seeds both times, only the action-selection mode differs
+(`/tmp/.../collision_discrepancy_test.py`, kept local/scratch, not merged into `evaluate.py`).
+**Result**: seed1: deterministic 11% vs stochastic 2% — alone reproduces the originally-observed
+gap almost exactly (matches training's own ~1%). seed2: deterministic 13% vs stochastic 10% —
+determinism only explains a small slice here; the stochastic-replayed-after-training number
+(10%) is still far above what training itself logged near the end (~1.2%).
+**Conclusion, two separate findings, not one**: (1) **determinism vs. stochasticity is a real,
+demonstrated cause**, not speculation — a policy shaped by entropy-driven exploration can
+converge its *mean* action to a knife-edge equilibrium riskier than the noise-perturbed
+behavior actually seen during training; this alone explains seed1's entire gap. Weak secondary
+signal (small-N, not confirmed): deterministic collisions involved 2+ simultaneously-close
+agents more often than stochastic ones (seed2: 54% vs 30%) — consistent with the brake's
+documented multi-agent gap (item 13/`KNOWN_ISSUES.md`) being easier to trigger without noise
+breaking up a persistent near-symmetric closing pattern. (2) **For seed2's remaining gap, an
+earlier verbal explanation given mid-session was wrong and is corrected here**: seed2's tracking
+was *not* less converged — `search-t8-s2`'s `contact_fraction` was 99.7%, among the best in the
+project, so "the policy hadn't converged yet" does not hold up as an explanation. The more
+defensible account: the residual gap is between two *stochastic* numbers (10% freshly
+re-measured over 100 episodes vs. 1.2% logged near the end of training over a rolling window of
+only ~50 episodes) — for a true rate near 10%, a 50-episode sample has enough binomial variance
+(expected count ~5, plausible range roughly 1-9) that observing something as low as 1.2% by
+chance isn't surprising. Not confirmed with a formal significance test — flagged as the leading,
+most parsimonious explanation available, not a proven one.
+**Practical implication**: deterministic eval is the number to trust for real deployment (a
+flight controller runs the mean policy, not a sampled one) — the higher eval collision rates
+are the honest ones, not the more optimistic training-time rolling numbers.
+**Status**: resolved/explained. Directly motivated the relative-velocity brake reformulation
+below.
+
+## Relative-velocity brake reformulation — implemented, adversarially verified, Kaggle training validation in progress
+
+**Objective**: `_apply_brake`'s `v_closing` was `dot(v_a, dir_to_b)` — agent a's own velocity
+toward b, silently treating b as stationary — not the true mutual closing rate. The adversarial-
+test guarantee (`DECISIONS.md`) only held because every agent ran the identical symmetric
+one-sided formula; a real, independently-moving vehicle (or, per the finding directly above, a
+deterministic policy converging every agent to the exact same confident behavior with nothing
+to perturb a persistent near-symmetric standoff) breaks that assumption.
+**Configuration**: `v_closing` changed to `dot(v_a - v_b, dir_to_b)` in both the multi-pass
+correction loop and the post-hoc violation diagnostic (commit `94216fd`) — no other change to
+the correction mechanism (agent a still unilaterally corrects only its own velocity, same
+multi-pass loop, same `max_closing` shape). No changes to the tracking/search mechanism.
+**Verification before any Kaggle spend**: the two adversarial scenarios already described in
+`DECISIONS.md` (2-agent head-on, 4-agent converge-on-centroid, both starting outside
+`SAFE_DIST_ENTER`, always commanding `MAX_ACTION_SPEED`) were rebuilt as a committed regression
+test, `test_brake_relative_velocity.py`, rather than left as a one-off manual claim. Both pass
+against the new formulation: minimum distance never breached `COLLISION_DIST`, residual
+violation ~0 (2-agent: exactly 0; 4-agent: 4e-8, float-precision noise). Standard local smoke
+tests (`test_geometry.py`, `test_env.py` at `N=2/3/4`) also pass clean.
+**Status**: **not yet confirmed at training scale.** 3 fresh 3M-step kernels launched
+(`stage-marl-brake-relvel-s{1,2,3}`, `NUM_AGENTS=4`, `LOST_TIMEOUT_SEC` left at its current
+default of 6s so this is a clean test of the brake change alone) to check the reformulation
+actually reduces `collision_rate` in training, not just in the two hand-picked adversarial
+scenarios above. In progress as of this writing — see `SESSION_HANDOFF.md` for live status.
+
+## `search-t10` seed1/seed2 — 5M-step resume, testing "just needs more training"
+
+**Objective**: test whether the two `t10` seeds stuck in a bad tracking regime (see the `t8`/
+`t10` bracket entry above) would improve given more training steps, holding everything else
+(seed, `LOST_TIMEOUT_SEC=10`, active search, all Phase 3 mechanisms) fixed.
+**Configuration**: resumed (not retrained from scratch) from each seed's actual ~3.01M-step
+checkpoint (`checkpoints/latest_{1,2}.pt`, uploaded as a private Kaggle dataset and copied in
+before `train.py` runs) to `TOTAL_STEPS=5,000,000`. Same commit, same `LOST_TIMEOUT_SEC=10`
+override as the original runs — the only change is the step budget.
+**Caveat, disclosed before launching, not discovered after**: `train.py`'s LR and entropy-
+coefficient schedules are both driven by `total_steps / TOTAL_STEPS`. By the end of the original
+3M-step runs that ratio had reached 1.0, so both had annealed fully to their floor. Resuming
+with `TOTAL_STEPS=5,000,000` immediately recomputes that ratio at ≈0.60, so LR and entropy
+coefficient both jump back up rather than continuing one smooth anneal from step 0 to 5M. This
+means the result isn't quite equivalent to what an uninterrupted 5M-step run would have looked
+like — it's "3M steps fully annealed, then a fresh top-up of LR/exploration for 2M more steps."
+Accepted as a disclosed trade-off (uses the already-completed 3M of compute; a from-scratch 5M
+run would take ~5x longer per seed) after the user chose it explicitly over a from-scratch
+alternative.
+**Infrastructure note**: hit and fixed a real Kaggle platform quirk along the way — datasets
+now mount at `/kaggle/input/datasets/<owner>/<dataset-slug>/`, not the classic `/kaggle/input/
+<dataset-slug>/` the current `kaggle-cli` docs still describe. See `ENVIRONMENT.md`.
+**Result** (eval-time, final model, 100 episodes each; 3M-step baseline numbers alongside for
+comparison):
+
+| seed | steps | collision | target_lost | contact_fraction | tracking_rmse |
+|---|---|---|---|---|---|
+| 1 (3M) | 3.01M | 1% | 70-72% | 0.84 | ~6.9 |
+| 1 (5M resume) | 5.01M | 1% | **41%** | **0.917** | **4.011** |
+| 2 (3M) | 3.01M | 0-1% | 92-96% | 0.68-0.71 | 7.2-7.7 |
+| 2 (5M resume) | 5.01M | 1% | **83%** | **0.771** | **6.157** |
+
+New diagnostics (added to `evaluate.py` specifically for this comparison, see `ARCHITECTURE.md`):
+seed1's `p95_true_track_err`/`max_true_track_err` are 8.4/30.9 against a mean of 3.0 — a real
+tail, not just a slightly-worse average. Reacquisition-time is bimodal: `median_reacquisition_
+steps` is 1-2 (most reacquisitions happen almost instantly, the target re-enters sensor range
+essentially immediately) but `p95`/`max` (73-94 / 188-195 steps) pull `mean_reacquisition_steps`
+up to ~13 — a long tail of much harder recoveries behind a typically-fast median.
+**Conclusion**: **partially confirms "just needs more training," does not fully resolve it.**
+Both seeds improved substantially with 2M more steps (seed1: 70-72%→41% `target_lost`, seed2:
+92-96%→83%) — real, not noise-sized movement, consistent with the earlier training-curve
+finding that both seeds were still in the bad regime mid-training. But neither reached anywhere
+near `t10`-seed3's 4-10% `target_lost_rate` — more training helps, but 5M steps (with the
+LR/entropy-schedule caveat above) isn't sufficient on its own to make these two seeds converge
+like the "lucky" seed did. `collision_rate` stayed low for both (1%) — notably lower than the
+already-converged `t8`/`t10`-seed3 checkpoints' 6-14% — consistent with the collision-discrepancy
+finding above: a policy that hasn't yet converged to a tight, confident tracking equilibrium
+hasn't found the knife-edge behavior that trades into collision risk either.
+**Status**: resolved for this specific question (more training helps but isn't sufficient alone
+within a 5M budget); whether even more steps, a different seed, or a design change would close
+the remaining gap is open, not further pursued in this pass.

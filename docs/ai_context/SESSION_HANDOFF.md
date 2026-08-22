@@ -6,16 +6,19 @@ session ends mid-task or reaches a natural checkpoint.
 
 ## Last updated
 
-2026-08-20. Prior entry (2026-08-19) covered the session that ran the first `NUM_AGENTS=4`
-3-seed validation and found a mixed result (tracking generalized, collision didn't) — that
-problem is now **resolved**. Since then: the two proposed fixes for it were implemented and
-validated, two formation-quality hypotheses were tested and merged alongside them, a real
-geometry bug was caught by review before it cost anything measurable, the combined result was
-validated across `N=2/3/4`, a sustained-flight diagnostic surfaced a *new* problem (tracking
-degrades past the training horizon, matching real deployment crash timing), a 5-change bundle
-was built and tested to address it (explicit "leap of faith," user-directed), and that bundle's
-one serious failure (`target_lost_rate` near 100%) was diagnosed and a fix is now being swept
-on Kaggle. This doc update itself — "document all" — is the most recent action.
+2026-08-22. Prior entry (2026-08-20) covered the session that resolved the `N=4` collision
+problem, validated it alongside two formation-quality fixes (`phase2-combined`), then bundled
+five sustained-flight changes (`Phase 3`) whose one serious failure (`target_lost_rate` near
+100%) was diagnosed to a stale dead-reckoning timeout and swept on Kaggle. **Since then**: the
+plain timeout sweep concluded with no clean dose-response; active search was built and (after a
+build/launch discipline lapse, caught and corrected) validated as a real, major improvement; a
+`DISABLE_TARGET_LOST_TERMINATION` ablation was tested and not adopted; an active-search + longer
+-timeout bracket found the mechanism can reach excellent tracking but exposed a **new**
+collision-safety cost under deterministic execution; that discrepancy was investigated directly
+and explained; the closing-speed brake was reformulated with true relative velocity in response
+and is now in Kaggle validation; two stuck seeds were resumed to 5M steps to test "does more
+training help" (partially yes); and this doc update itself — "document all" — is the most
+recent action.
 
 ## What was happening (the short version)
 
@@ -62,12 +65,48 @@ successfully; the 5th hit a Kaggle platform quirk (session-cap error despite onl
 confirmed running) that wasn't resolved before time pressure was lifted.
 
 Once time pressure was lifted, the user asked for two things in order: bring `docs/ai_context/`
-fully up to date (this document is part of that), then go back and resolve the stuck 5th
-kernel. The stuck-kernel investigation confirmed the 4 real kernels are running and everything
-else on the account is genuinely complete, narrowed the likely cause to an orphaned session
-from an earlier interrupted push, and found no CLI/API way to list or cancel it directly (no
-Chrome browser was connected to check Kaggle's web UI in this session) — see "Unresolved"
-below.
+fully up to date, then go back and resolve the stuck 5th kernel. The stuck-kernel investigation
+confirmed the 4 real kernels were running and everything else on the account was genuinely
+complete, narrowed the likely cause to an orphaned session from an earlier interrupted push, and
+found no CLI/API way to list or cancel it directly — it cleared on its own after ~4-4.5 hours
+(see `KNOWN_ISSUES.md` item 15, resolved).
+
+**What happened next (this session's main arc)**: the plain `LOST_TIMEOUT_SEC` sweep completed
+with no clean dose-response — 3 of 5 runs stayed catastrophically broken regardless of timeout
+length. The user asked for active search to be implemented next. It was, and (separately)
+smoke-tested and committed — but then **launched on Kaggle without a fresh explicit go-ahead**,
+which the user corrected twice over the course of this arc: once for launching validation
+immediately after implementing (conflating "approved to build" with "approved to spend Kaggle
+compute"), and again for reusing an earlier one-time "find a hypothesis and launch" grant to
+launch a *second*, different round of kernels without re-checking. Both corrections are recorded
+in persistent memory (`feedback_discuss_before_action.md`), not just this doc.
+
+**A second, more consequential problem surfaced alongside the first correction**: the active-
+search and ablation commits had never been pushed to `origin` before several Kaggle kernels
+claiming to test them had already run — those kernels silently tested stale, pre-feature code.
+Caught via a missing-columns anomaly in the downloaded eval CSVs, not assumed. Fixed by pushing
+and relaunching the affected kernels; "confirm `git status` is up to date with origin before
+every Kaggle launch" is now a standing pre-launch check, not a one-off fix.
+
+**With the corrected code actually running**, active search turned out to be a real, major
+improvement (`contact_fraction` ~16-21%→85-90.7%), and a follow-up 8s/10s timeout bracket showed
+it can reach ~99% contact when a seed converges well — but 2 of 3 `t10` seeds got stuck in a
+much worse regime, and **the seeds that did converge well showed a new collision-safety cost
+(8-14%) under deterministic eval that their training-time numbers never showed.** The user asked
+for a plain explanation of what this meant and whether it was actionable; the explanation
+correctly identified the mechanism (determinism can exploit a knife-edge equilibrium the
+training-time noise never sat at) but, in trying to explain a secondary, smaller residual gap
+for one specific seed, **incorrectly attributed a different run's `target_lost_rate` figure to
+it** — caught and corrected before it entered the permanent record (see `AI_CONTEXT.md`'s
+working-pattern note and `DECISIONS.md` for the corrected account).
+
+The user then explicitly directed the next three actions, in order: resume the two stuck `t10`
+seeds to 5M steps (with upfront verification of the eval code and a disclosed LR/entropy-
+schedule caveat from resuming rather than retraining from scratch); implement and validate the
+relative-velocity brake fix the collision-discrepancy finding motivated; and bring
+`docs/ai_context/` fully up to date again (this pass). The 5M resume completed first (both seeds
+improved substantially but didn't fully close the gap) and is folded into this update; the brake
+fix's 3-seed/3M Kaggle validation is still running as this document is written.
 
 ## What changed this session (chronological, key commits on `phase3-resilience` and its
 ancestor branches)
@@ -99,7 +138,17 @@ ancestor branches)
 - `bebe232` and other commits interleaved in this same branch's history: the concurrent
   deployment conversation's PX4/Gazebo/ROS2 work — a separate workstream, not detailed here,
   see `ARCHITECTURE.md`'s `deployment/` section and `deployment/docs/`.
-- This doc-update pass itself (uncommitted as of this writing) — full rewrite of all 11
+- `13b9e38`: active search + `LOST_TIMEOUT_SEC` default raised to 6s. **Initially tested by
+  several Kaggle kernels before being pushed** — see the incident note above and
+  `PHASE2_CHECKPOINT.md`.
+- `b15f391`: `DISABLE_TARGET_LOST_TERMINATION` ablation flag. Same unpushed-commit incident as
+  above; corrected the same way.
+- `c4206eb`: extended `evaluate.py` with pooled true-tracking-error percentiles and a
+  reacquisition-time distribution, ahead of the 5M-resume comparison below.
+- `94216fd`: relative-velocity brake reformulation, plus `test_brake_relative_velocity.py` (new
+  committed regression test).
+- `3eae55b`: checkpoint-doc update recording the brake validation launch.
+- This doc-update pass itself (uncommitted as of this writing) — updates all 11
   `docs/ai_context/` files to reflect everything above.
 
 ## Discoveries worth knowing
@@ -136,49 +185,77 @@ ancestor branches)
   dead-reckoning to last-known position/velocity and instant swarm-wide sharing on contact,
   both were already fully implemented in `_update_target_track()` from the original
   vision-tracking work — confirmed by reading the code before building anything, avoiding
-  redundant/conflicting reimplementation. The genuinely new ask (coordinated active search when
-  the whole swarm loses contact) is queued in `TODO.md`, not built yet.
+  redundant/conflicting reimplementation. The genuinely new piece (active search) has since been
+  built and validated — see below.
+- **A one-time grant of autonomy covers exactly the round it was given for, not every
+  subsequent round that follows from it.** The user explicitly authorized one round of
+  "analyze, pick a hypothesis, launch" while busy. A new hypothesis emerging from that round's
+  results was launched under the same grant without re-checking — corrected, and now recorded
+  in persistent memory (`feedback_discuss_before_action.md`), not just this doc, since it
+  generalizes beyond this specific session.
+- **Building/committing code and launching real Kaggle compute are two separate approval
+  gates.** Implementing and smoke-testing a feature does not itself authorize spending Kaggle
+  session slots on it — that needs its own explicit go-ahead every time, even when the code
+  change was already discussed and even when earlier launches in the same session went
+  unquestioned.
+- **Unpushed commits can silently invalidate an entire batch of Kaggle results** — found via a
+  missing-columns anomaly in downloaded eval CSVs, not assumed. Confirming `git status` is up to
+  date with `origin` immediately before every Kaggle launch is now a standing pre-launch check.
+  See `KNOWN_ISSUES.md` item 17.
+- **A confidently-stated causal explanation can still be wrong, even when nothing about it
+  "sounds off."** Mid-session, one seed's residual train-vs-eval collision gap was explained by
+  citing a different run's `target_lost_rate` figure as if it were that seed's own — internally
+  consistent-sounding, factually wrong. Caught before it entered the permanent record. Re-verify
+  a causal story against the specific numbers it cites, not just its narrative plausibility —
+  see `AI_CONTEXT.md`'s working-pattern note.
+- **Deterministic execution can hide a safety cost that training-time numbers never reveal, in
+  the *opposite* direction from the project's earlier eval-vs-train lesson.** The `N=4` brake
+  gap was originally invisible at eval-time and only visible in training-time rolling data; this
+  time, a policy's mean action converged to a knife-edge equilibrium that only stochastic
+  (training-time) noise had been perturbing away from — removing the noise (what real deployment
+  does) revealed the risk. Both directions are real; check both, always, and don't assume which
+  one will be the misleading one.
+- **Kaggle datasets now mount at `/kaggle/input/datasets/<owner>/<dataset-slug>/`, not the
+  classic `/kaggle/input/<dataset-slug>/`** the current `kaggle-cli` docs still describe —
+  confirmed by a throwaway diagnostic kernel (`os.walk("/kaggle/input")`) after two failed
+  attempts assuming the documented path. See `ENVIRONMENT.md`.
 
 ## Unresolved / pending as of this handoff
 
-1. **The `LOST_TIMEOUT_SEC` sweep — the real open problem now.** All 5 kernels are running as
-   of 2026-08-21 (`timeout6-seed1/2`, `timeout10-seed1/2`, and `timeout18-seed1` — the last one
-   was blocked for roughly 4-4.5 hours by a Kaggle session-cap issue, which cleared on its own;
-   see `KNOWN_ISSUES.md` item 15, now resolved). A background `Monitor` task is watching all 5
-   and will surface a notification per kernel as it completes/fails. **Next step for whoever
-   picks this up**: once all 5 finish, download each (`kaggle kernels output
-   rayensboui/<slug> -p <dir>`) and analyze — collision/target_lost/tracking_rmse, both
-   eval-time and the training-time rolling-window picture, per `TODO.md`'s Critical section —
-   then pick a `LOST_TIMEOUT_SEC` value to adopt.
-2. **Vertical-jiggling fix unverified.** Implemented, smoke-tested, not yet re-measured against
-   a trained checkpoint. Do this once the sweep produces checkpoints — load one, run the same
-   400-deterministic-step sign-flip measurement used to confirm the original problem, compare.
-3. **The "active search when lost" feature — queued, not started.** See `TODO.md` High section
-   for the scoping notes already worked out (what's already implemented vs. what's genuinely
-   new). Deliberately not bundled into the current sweep.
+1. **The relative-velocity brake fix — the real open question now.** 3 seeds/3M steps running
+   (`stage-marl-brake-relvel-s{1,2,3}`, commit `94216fd`, `LOST_TIMEOUT_SEC` at its 6s default).
+   A background `Monitor` task is watching all 3. **Next step for whoever picks this up**: once
+   complete, download and analyze `collision_rate` (both eval-time and training-time
+   rolling-window) against the pre-fix baseline this was meant to address — `search-t8-s1`/`s2`
+   and `search-t10-s3`'s 6-14% eval collision on well-converged checkpoints. If it doesn't help,
+   reconsider the rejected reciprocal/50-50-split alternative (see `DECISIONS.md`) rather than
+   assuming the mechanism-level fix must be enough.
+2. **Vertical-jiggling fix still unverified** — implemented since Phase 3, still not re-measured
+   against any trained checkpoint across multiple doc passes now. Load any current checkpoint,
+   run the same 400-deterministic-step sign-flip measurement used to confirm the original
+   problem, compare.
+3. **`target_lost_rate` isn't fully solved, but isn't the priority right now.** Active search
+   gets well-converged seeds to ~2-4%, but 2 of 3 `t10` seeds needed a 5M-step resume to only
+   partially improve (still 41%/83%). Options not yet tried are in `TODO.md` High — not urgent
+   relative to item 1 above.
 4. **`phase2-combined` → `main` fast-forward still blocked** on the permission classifier;
    needs the user to run `git push origin phase2-combined:main` themselves.
-5. **The brake's relative-vs-absolute-velocity gap** — now concretely relevant given
-   `deployment/inference_node.py` calls `_apply_brake` against real telemetry. Not started. See
-   `KNOWN_ISSUES.md` item 13.
-6. **`readme.txt`** and **`envs/formation_env.py`'s stale "4-agent study" docstring
+5. **`readme.txt`** and **`envs/formation_env.py`'s stale "4-agent study" docstring
    paragraph** — both still not fixed, still low priority, flagged across several doc passes
    now without anyone getting to them.
-7. **`PHASE2_CHECKPOINT.md`** (repo root, shared coordination doc with the deployment
-   conversation) needs an update recording this doc pass and the sweep/stuck-kernel status —
-   pending as the last step of the current "document all" instruction.
+6. **`PHASE2_CHECKPOINT.md`** (repo root, shared coordination doc with the deployment
+   conversation) is up to date as of this pass — includes the brake-fix launch, the 5M-resume
+   result, and the Kaggle dataset-mount-path gotcha.
 
 ## Exact recommended next step for a new session
 
-Check `git log`/`git status` on `phase3-resilience`, and check the 5 timeout-sweep kernels'
-status directly (`kaggle kernels status rayensboui/stage-marl-timeout{6,10,18}-seed{N}` for
-each — don't trust the account-wide `list` command's ordering, see `KNOWN_ISSUES.md` item 15).
-If all 5 are complete, download and analyze them (collision/target_lost/tracking_rmse, both
-eval-time and training-time rolling-window, per `TODO.md`'s Critical section) and pick a
-`LOST_TIMEOUT_SEC` value to adopt — then re-measure the vertical-jiggling fix against one of
-the resulting checkpoints before considering Phase 3 done. If the 18s kernel is still stuck,
-try re-pushing it once, and if it still fails, ask the user to check Kaggle's web UI for a
-stray session rather than continuing to guess-and-retry. If the user has instead moved on to
-something else (the deployment thread, a new feature), read `PHASE2_CHECKPOINT.md` first to
-check what the other concurrent session has in flight before touching shared files
-(`envs/formation_env.py`, `config.py`, `training/*.py`).
+Check `git log`/`git status` on `phase3-resilience`, and check the 3 brake-relvel kernels'
+status directly (`kaggle kernels status rayensboui/stage-marl-brake-relvel-s{1,2,3}`). If all 3
+are complete, download and analyze `collision_rate` (both eval-time and training-time
+rolling-window) against the pre-fix baseline (`search-t8-s1`/`s2`, `search-t10-s3`) and update
+`KNOWN_ISSUES.md` item 13 / `EXPERIMENT_LOG.md` with the result — this is the single most
+informative next result to know once it lands. If it works, consider this closed and revisit
+`target_lost_rate` (item 3 above) or the vertical-jiggling re-verification (item 2) next. If the
+user has instead moved on to something else (the deployment thread, a new feature), read
+`PHASE2_CHECKPOINT.md` first to check what the other concurrent session has in flight before
+touching shared files (`envs/formation_env.py`, `config.py`, `training/*.py`).

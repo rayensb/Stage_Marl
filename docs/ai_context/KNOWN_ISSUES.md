@@ -1,11 +1,13 @@
 # Known Issues
 
-Updated 2026-08-20 against commit `62a685d` on `phase3-resilience` (not yet merged to `main`
-— see `TODO.md`). Three items below (5, 8, 9) that were open as of the last pass are now
-resolved; three new items (12, 13, 14) were found since. For issues that were investigated and
-resolved, see `EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues) —
-items below are only marked `[RESOLVED]` inline rather than removed, so the numbering stays
-stable and the resolution history is visible in place.
+Updated 2026-08-22 against commit `94216fd`/`3eae55b` on `phase3-resilience` (not yet merged to
+`main` — see `TODO.md`). Since the last pass (`62a685d`): item 12 (`target_lost_rate`) is
+substantially better but not fully resolved (active search); item 13 (brake relative velocity)
+is now implemented and adversarially verified, pending Kaggle-scale confirmation; two new items
+(16, 17) were found and resolved this pass. For issues that were investigated and resolved, see
+`EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues) — items below are
+only marked `[RESOLVED]` inline rather than removed, so the numbering stays stable and the
+resolution history is visible in place.
 
 ## 1. [RESOLVED] Collision-rate collapse recurred late in training
 
@@ -207,7 +209,7 @@ in this sim to support a directional camera cone).
 see `DECISIONS.md`. A FOV cone specifically requires adding heading/orientation as a new state
 dimension first, which is a bigger prerequisite change than the other two.
 
-## 12. `target_lost_rate` near-total failure at `MAX_STEPS=1800` — root cause diagnosed, fix in progress, not yet confirmed
+## 12. [PARTIALLY RESOLVED] `target_lost_rate` near-total failure at `MAX_STEPS=1800`
 
 **Symptom**: Phase 3's 3-seed `N=4` validation (2026-08-20) showed `target_lost_rate` 89-100%,
 flat from the very first logged rollout through the full 3M-step run in every seed — never
@@ -223,13 +225,34 @@ mid-training regression) and collision's clean convergence despite being subject
 "9x fewer episodes per fixed step budget" risk both argue against pure data-starvation as the
 explanation, and point specifically at the timeout/episode-length mismatch. See
 `EXPERIMENT_LOG.md`'s Phase 3 entry and `DECISIONS.md` for the full reasoning.
-**Status**: `LOST_TIMEOUT_SEC` made env-overridable; a 5-kernel sweep (6s x2, 10s x2, 18s x1)
-is running to find a value that works at the new episode length, rather than guessing one.
-**Not yet confirmed** — see `CURRENT_STATE.md`/`SESSION_HANDOFF.md` for live status. 4 of 5
-kernels are running; the 5th is blocked by an unrelated Kaggle platform issue (see item 15
-below, `ENVIRONMENT.md`).
+**Sweep result**: not a clean dose-response — 3 of 5 completed runs stayed catastrophically
+broken (85-96% `target_lost_rate`) regardless of timeout length; identical 10s configuration
+produced both the worst result (93%) and one of the two working ones (4%) across its two seeds.
+Grace-period length alone was never the primary lever. `LOST_TIMEOUT_SEC`'s default was raised
+to 6.0 (not all the way to 10/18, given the lack of a clean signal).
+**Superseded by active search, a much bigger lever**: rather than continuing to sweep the
+timeout constant, active search (each agent fans out in its own fixed heading on loss of
+contact, instead of every agent coasting toward the same stale point) was built and validated.
+`contact_fraction` improved from ~16-21% to 85-90.7% at the 6s timeout, with the median loss
+event landing just 1 step past the cutoff — a genuine, large improvement, though
+`target_lost_rate` (60-81%) is still not solved. A follow-up bracket (active search + 8s/10s
+timeout) found the mechanism *can* reach excellent tracking (99%+ contact, ~2-4%
+`target_lost_rate`) when a seed converges well, but training is seed-sensitive — 2 of 3 `t10`
+seeds got stuck in a much worse regime despite identical configuration. Resuming those two
+stuck seeds to 5M steps confirmed "more training helps" (70-72%→41% and 92-96%→83%
+`target_lost_rate`) but didn't fully close the gap within that budget.
+**New finding, not previously known**: when a seed *does* converge to the tight, confident
+tracking behavior active search enables, deterministic execution exposes a real collision-safety
+cost (8-14%) not seen at this magnitude since the original `N=4` brake gap — see item 13 below
+and the train-vs-eval discrepancy item further down. This is now the more actionable finding
+than `target_lost_rate` itself.
+**Status**: partially resolved. Active search is a real, adopted improvement; `target_lost_rate`
+is meaningfully better than the Phase 3 catastrophe (89-100%) but not fully solved even at good
+seeds' best case (~2-4%). Not under further active investigation this pass — the currently
+higher-priority, more tractable follow-up is the collision-safety cost this same convergence
+exposes (item 13). See `EXPERIMENT_LOG.md` for full data.
 
-## 13. Closing-speed brake assumes each agent's own velocity, not relative velocity — a real gap once independently-controlled vehicles are involved
+## 13. [RESOLVED, pending Kaggle-scale confirmation] Closing-speed brake assumed each agent's own velocity, not relative velocity
 
 **Symptom**: `_apply_brake`'s `v_closing` is `dot(v_a, dir_to_b)` — agent A's own velocity
 component toward B — not the relative closing velocity `(v_a - v_b)`. The brake's adversarial
@@ -242,10 +265,18 @@ theoretical footnote. It's now concretely relevant — `deployment/inference_nod
 a real or simulated vehicle's actual velocity is not something this code controls or can
 assume is running the same symmetric correction on the same schedule. The symmetry assumption
 the stress tests relied on doesn't automatically hold in that setting.
-**Status**: not yet reformulated. Queued, not forgotten — see `deployment/docs/
-PHASE2_HANDOFF.md` for the deployment-side account and `TODO.md` for tracking. Reformulating
-with explicit relative velocity (`dot(v_a - v_b, dir_to_b)`) is the proposed fix, not yet
-implemented or tested.
+**Why this became urgent, not just theoretical, right when it was fixed**: the
+deterministic-vs-stochastic collision investigation (see the new item below) found real
+collisions under exactly the symmetric, no-noise conditions this formula's own reasoning said
+should be impossible — direct evidence the gap was being exercised, not just a hypothetical
+concern about external vehicles.
+**Resolved 2026-08-22**: `v_closing` reformulated to `dot(v_a - v_b, dir_to_b)` (the true mutual
+closing rate) in both the multi-pass correction loop and the post-hoc violation diagnostic —
+see `DECISIONS.md`. Re-verified against both adversarial scenarios (now a committed regression
+test, `test_brake_relative_velocity.py`, not just a one-off manual claim) — still zero residual
+violation. **Not yet confirmed to actually reduce `collision_rate` at training scale** — a
+3-seed/3M-step Kaggle validation is in progress. Don't cite this as fully closed until that
+completes; see `EXPERIMENT_LOG.md`/`SESSION_HANDOFF.md`.
 
 ## 14. Vertical jiggling — fixed, but only smoke-tested, not yet re-validated against a trained checkpoint
 
@@ -290,3 +321,34 @@ successfully and confirmed `RUNNING` once the slot freed. If this recurs on a fu
 batch, the same wait-it-out approach worked here — retry the push periodically rather than
 assuming something is permanently broken, though checking Kaggle's web UI directly would
 likely resolve it faster if it happens again.
+
+## 16. [RESOLVED] Train-vs-eval collision-rate discrepancy
+
+**Symptom**: deterministic eval `collision_rate` ran consistently higher than the trailing
+training-time (stochastic) rate across many runs project-wide — most starkly `search-t8-s1`/
+`s2`, train ~1-1.2% vs eval 8-14%. Worth documenting explicitly since a future session seeing
+this pattern again might otherwise suspect an eval bug rather than recognize a known, explained
+effect.
+**Investigated, not assumed**: running the identical frozen checkpoint deterministically vs.
+stochastically on identical eval seeds showed determinism alone explains most/all of the gap for
+a well-converged policy — a policy shaped by entropy-driven exploration can converge its *mean*
+action to a knife-edge equilibrium riskier than the noise-perturbed behavior actually seen
+during training. For a less-converged case, a residual gap remained between two stochastic
+numbers, most likely a small-sample artifact in training's 50-episode rolling window rather than
+a real difference in policy quality.
+**Status**: resolved/explained — see `DECISIONS.md`'s "Trusting deterministic eval..." entry and
+`EXPERIMENT_LOG.md` for the full investigation. **Practical rule going forward**: judge safety
+claims from deterministic eval numbers, not training-time rolling numbers.
+
+## 17. [RESOLVED] Unpushed local commits silently tested by ~8 Kaggle kernels
+
+**Symptom**: two feature commits (active search, the `DISABLE_TARGET_LOST_TERMINATION` ablation
+flag) were made locally but not pushed to `origin/phase3-resilience` before several Kaggle
+kernels claiming to validate them had already launched and completed — those runs actually
+cloned whatever was on `origin` at the time, silently testing stale code.
+**Found via**: a missing-columns anomaly in the downloaded eval CSVs (the new features' expected
+output fields weren't present), not assumed or guessed.
+**Status**: resolved — corrected runs relaunched as "v2." **Standing rule adopted**: confirm
+`git status` shows up to date with `origin` immediately before every Kaggle launch from this
+worktree, every time, not just after this specific mistake. See `PHASE2_CHECKPOINT.md` for the
+full incident record and `ENVIRONMENT.md` for the workflow note.

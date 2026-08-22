@@ -1,9 +1,9 @@
 # Architecture
 
 Reference, not a copy: exact code lives in the files cited. Structural/conceptual
-descriptions below were verified directly against commit `62a685d` on `phase3-resilience`
-(2026-08-20) by reading the actual functions, not from memory of older code — trust the file
-over any specific line number here if it's drifted since.
+descriptions below were verified directly against commit `94216fd`/`3eae55b` on
+`phase3-resilience` (2026-08-22) by reading the actual functions, not from memory of older code
+— trust the file over any specific line number here if it's drifted since.
 
 ## Module map
 
@@ -102,6 +102,15 @@ Implements PettingZoo's `ParallelEnv` — all agents act simultaneously each ste
   splitting), logged as `mean_brake_passes`/`max_brake_violation`/`mean_brake_solo`/
   `mean_brake_multi`. `brake_reduction` (speed actually removed) is also fed back into the
   reward as `r_brake` (see below), not just logged.
+  **Relative velocity since 2026-08-22**: `v_closing` is `dot(v_a - v_b, dir_to_b)` — the true
+  mutual closing rate between a pair — not `dot(v_a, dir_to_b)` (a's own velocity toward b,
+  silently treating b as stationary). The correction mechanism itself is unchanged (agent a
+  still unilaterally corrects only its own velocity); only what's measured changed. See
+  `DECISIONS.md` for why this mattered (motivated by real evidence, not just the deployment
+  workstream's theoretical concern about external vehicles) and
+  `test_brake_relative_velocity.py` for the committed regression test. **Adversarially
+  verified; not yet confirmed to reduce `collision_rate` at training scale** — see
+  `EXPERIMENT_LOG.md`.
 - **Ground clamp** (`_apply_ground_clamp`, Phase 3, 2026-08-20): the ground-plane counterpart
   to the brake, added because the sim had no ground plane/failure mode at all until this
   point. Single-pass, not multi-pass — the ground doesn't move and can't conflict with itself
@@ -132,10 +141,19 @@ Implements PettingZoo's `ParallelEnv` — all agents act simultaneously each ste
   `reset()` uses) every `TARGET_REDIRECT_INTERVAL_STEPS` (500 steps = 25s), so a mid-episode
   redirect while a drone is out of contact can genuinely mislead its dead-reckoned estimate —
   the grace period is now actually being tested against real estimate drift.
-  **`LOST_TIMEOUT_SEC` is env-overridable since 2026-08-20** (was a flat `2.0`) — see
-  `CURRENT_STATE.md`/`EXPERIMENT_LOG.md` for why (a fixed grace period tuned against
-  `MAX_STEPS=200` broke badly once `MAX_STEPS` grew to 1800, and a sweep is in progress to
-  find a working value at the new episode length).
+  **`LOST_TIMEOUT_SEC` is env-overridable since 2026-08-20** (was a flat `2.0`, now defaults to
+  `6.0`) — see `EXPERIMENT_LOG.md` for the sweep that found no clean dose-response and settled
+  on this default.
+  **Active search since 2026-08-21** (`_assign_search_directions`, called once per
+  loss-of-contact event, not every step): once the whole swarm loses contact, each agent is
+  assigned its own fixed heading (evenly spread from a randomized base angle) rather than every
+  agent coasting toward the same, increasingly stale shared dead-reckoned point. Feeds a
+  per-agent `_effective_pos_est`/`_effective_vel_est` — equal to the shared track estimate
+  whenever anyone has contact, a per-agent receding search waypoint otherwise — into `_get_obs`/
+  `_get_reward` in place of the shared estimate. Reuses the existing `r_track`/`r_velocity`
+  reward math unchanged; no new reward term. Validated as a real, major improvement
+  (`contact_fraction` ~16-21% → 85-90.7% at the 6s timeout) — see `DECISIONS.md`/
+  `EXPERIMENT_LOG.md`.
 - **Neighbor graph — mutual k-NN with connectivity repair** (`_compute_all_candidates`,
   `_relock_all`, `_repair_connectivity`): unchanged since the vision-tracking redesign — each
   agent's `k` nearest neighbors are computed from ground-truth positions, only *mutual* locks
@@ -308,13 +326,25 @@ has grown incrementally each phase and wasn't re-counted for this pass.
 
 ## Evaluation (`training/evaluate.py`)
 
-Deterministic (no sampling) rollout of a saved actor. `load_actors(model_dir, run_id, device,
-best=False)` loads the single shared-actor file, `{agent_name: actor}` with the same object
-for every key. Per-episode metrics written to CSV: `collided, target_lost` and now
-`ground_strike` (Phase 3), read explicitly from `infos`, not inferred from `terms` (all three
-set `terms[a]=True`). `episode_len, min_dist, tracking_rmse, avg_spacing_std, avg_diameter,
-avg_speed, avg_confidence`. `tracking_rmse` remains deliberately ground-truth-based. CLI:
-`--episodes, --model-dir, --run-id, --seed (default 0), --device, --save-trajectory, --best`.
+Deterministic (no sampling, `actor.get_action(o, deterministic=True)`) rollout of a saved actor
+— see `DECISIONS.md` for why this specific choice (vs. stochastic) now matters more than it used
+to. `load_actors(model_dir, run_id, device, best=False)` loads the single shared-actor file,
+`{agent_name: actor}` with the same object for every key. Per-episode metrics written to CSV:
+`collided, target_lost` and `ground_strike` (Phase 3), read explicitly from `infos`, not
+inferred from `terms` (all three set `terms[a]=True`). `episode_len, min_dist, tracking_rmse,
+avg_spacing_std, avg_diameter, avg_speed, avg_confidence`. `tracking_rmse` remains deliberately
+ground-truth-based.
+**Extended 2026-08-21/22** with contact/recovery diagnostics: `contact_fraction`,
+`longest_contact_streak`/`longest_loss_streak`, `loss_events`, `reacquisitions_total`/
+`reacquisitions_within_timeout`, and — added specifically for the search-t10 5M-resume
+comparison — pooled (not per-episode-averaged) `mean/p95/max_true_track_err` and a
+reacquisition-**time** distribution (`mean/median/p95/max_reacquisition_steps` +
+seconds, `n_reacquisitions_observed`) — the earlier fields were counts/rates only, with no
+duration measure. Run-level stats are pooled across the whole episode batch (concatenating raw
+per-step/per-event samples before computing a percentile), not averaged from 100 per-episode
+percentiles — see the inline comment in `main()` for why that distinction matters statistically.
+CLI: `--episodes, --model-dir, --run-id, --seed (default 0), --device, --save-trajectory,
+--best`.
 
 ## Sustained-horizon diagnostic (`training/diagnose_horizon.py`, added 2026-08-20)
 
@@ -357,10 +387,13 @@ config.py  ──constants──▶  envs/formation_env.py  ◀──actions─�
 - No sensing noise, occlusion, or directional FOV cone on the target reading itself (item 11).
 - No literal cross-agent-count weight transfer (`OBS_DIM` differs between `NUM_AGENTS=2` and
   `3`/`4` — see `DECISIONS.md`).
-- The brake's no-crossing guarantee uses each agent's *own* velocity toward another, not
-  relative velocity — a known gap once independently-controlled real vehicles are involved
-  (not yet reformulated — see `KNOWN_ISSUES.md` and `deployment/docs/PHASE2_HANDOFF.md`).
+- No active-search coordination *between* agents (each picks its heading independently from an
+  evenly-spread pattern) — no communication of what another agent has already searched, or
+  reactive re-planning if a heading turns out to be a poor choice mid-search.
 - **What used to be true and no longer is**: target motion is no longer constant-velocity
   (Phase 3 added periodic redirects); `r_spread` is no longer horizontal-only (now true 3D);
-  the brake is no longer single-pass; there is no longer "no ROS2/Gazebo/PX4 integration" —
-  see the `deployment/` section at the top of this document.
+  the brake is no longer single-pass, and (since 2026-08-22) no longer based on each agent's
+  own velocity alone — it now uses true relative velocity, adversarially verified though not
+  yet training-scale-confirmed; there is no longer "no active search when the swarm loses
+  contact"; there is no longer "no ROS2/Gazebo/PX4 integration" — see the `deployment/` section
+  at the top of this document.

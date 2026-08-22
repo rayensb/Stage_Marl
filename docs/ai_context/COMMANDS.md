@@ -137,6 +137,45 @@ Multiple seeds/configs can run as separate kernels in parallel (each is an indep
 session — no `OMP_NUM_THREADS`-style contention between separate kernels the way there is
 between `subprocess.Popen`-launched processes *within* one kernel).
 
+### Resuming a training run from an existing checkpoint (added 2026-08-22)
+
+`train.py` already resumes automatically (`load_checkpoint` at the start of `main()`) whenever
+`checkpoints/latest[_<run_id>].pt` exists in the working directory and `TOTAL_STEPS` is higher
+than what's saved in it — no code change needed, just get the checkpoint file into place before
+`train.py` runs. Since each Kaggle kernel does a fresh `git clone`, the checkpoint has to be
+supplied separately as a Kaggle Dataset:
+
+```bash
+# one-time: package the checkpoint(s) and upload as a private dataset
+mkdir -p ckpt_upload && cp checkpoints/latest_1.pt ckpt_upload/
+cat > ckpt_upload/dataset-metadata.json << 'EOF'
+{"title": "My Resume Checkpoints", "id": "rayensboui/my-resume-ckpts", "licenses": [{"name": "CC0-1.0"}]}
+EOF
+~/.kaggle-venv/bin/kaggle datasets create -p ckpt_upload
+~/.kaggle-venv/bin/kaggle datasets status rayensboui/my-resume-ckpts  # wait for "ready"
+```
+
+Then reference it from `kernel-metadata.json`'s `dataset_sources: ["rayensboui/my-resume-ckpts"]`,
+and in `verify.py`, **before** running `train.py`, copy the file from the dataset's mount path
+into `checkpoints/` — note the path (see `ENVIRONMENT.md` for why this isn't the classically-
+documented shorter form):
+
+```python
+import os, subprocess
+os.makedirs("checkpoints", exist_ok=True)
+subprocess.run(["cp", "/kaggle/input/datasets/rayensboui/my-resume-ckpts/latest_1.pt",
+                "checkpoints/latest_1.pt"], check=True)
+```
+
+Set `TOTAL_STEPS` to the new (higher) target in `verify.py`'s env — everything else (`SEED`,
+`NUM_AGENTS`, any other override) should match the original run exactly, or the resumed run is a
+different experiment, not a continuation of the same one. **Caveat**: `train.py`'s LR and
+entropy-coefficient schedules are driven by `total_steps / TOTAL_STEPS` — if the original run's
+schedule had already annealed to its floor (i.e. it ran to completion), resuming with a higher
+`TOTAL_STEPS` makes both jump back up rather than continuing one smooth anneal. Real, not a bug,
+but means the resumed portion isn't quite equivalent to an uninterrupted single run at the new
+step count — see `EXPERIMENT_LOG.md`'s search-t10 5M-resume entry for a worked example.
+
 ## Evaluate a trained model (deterministic rollout)
 
 Regular final model, default settings:

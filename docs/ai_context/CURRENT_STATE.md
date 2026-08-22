@@ -1,8 +1,8 @@
 # Current State
 
-As of commit `62a685d` on `phase3-resilience`, 2026-08-20. `main` is still at `b59c139`,
-substantially behind — see `TODO.md`. Working tree has a few untracked `deployment/`-side
-files (not this doc suite's concern — see `ARCHITECTURE.md`).
+As of commit `94216fd`/`3eae55b` on `phase3-resilience`, 2026-08-22. `main` is still at
+`b59c139`, substantially behind — see `TODO.md`. Working tree has a few untracked
+`deployment/`-side files (not this doc suite's concern — see `ARCHITECTURE.md`).
 
 ## Confirmed working (verified against completed, multi-seed-replicated Kaggle runs)
 
@@ -44,42 +44,57 @@ files (not this doc suite's concern — see `ARCHITECTURE.md`).
   `LOST_TIMEOUT_SEC` env vars all work as designed (`ROLLOUT_LEN` now derives from `MAX_STEPS`
   automatically rather than needing independent tuning).
 - **Evaluation and diagnostics**: `evaluate.py` now reports `ground_strike` alongside
-  `collided`/`target_lost`. A new tool, `training/diagnose_horizon.py`, runs a frozen
-  checkpoint well past its training horizon without stopping on first failure — this is what
-  originally surfaced the tracking-degradation evidence that motivated the whole Phase 3
-  bundle (see below).
+  `collided`/`target_lost`, plus (2026-08-21/22) contact/loss-streak tracking, reacquisition
+  counts, pooled true-tracking-error percentiles (mean/P95/max, not just RMSE), and a
+  reacquisition-*time* distribution (steps/seconds, not just counts). A new tool,
+  `training/diagnose_horizon.py`, runs a frozen checkpoint well past its training horizon
+  without stopping on first failure — this is what originally surfaced the tracking-degradation
+  evidence that motivated the whole Phase 3 bundle (see below).
+- **Active search (2026-08-21), validated as a real, major improvement.** When the whole swarm
+  loses contact, each agent now fans out in its own fixed heading instead of every agent
+  coasting toward the same increasingly stale point. `contact_fraction` improved from ~16-21%
+  to 85-90.7% at the original 6s timeout; a follow-up bracket (8s/10s timeout) showed the
+  mechanism can reach 99%+ contact / ~2-4% `target_lost_rate` when a seed converges well — see
+  "Known broken" below for the two things this surfaced, not fixed by it.
+- **Closing-speed brake reformulated with relative velocity (2026-08-22), adversarially
+  verified, Kaggle-scale validation in progress.** See "Known broken" below.
 
 ## Known broken / open problems
 
-**Headline: Phase 3's longer episodes broke target tracking almost completely, root cause
-diagnosed, fix in progress.** The Phase 3 bundle (longer episodes, larger network, ground
-awareness, per-axis dynamics, dynamic target motion) was tested together as an explicit,
-user-directed "leap of faith." Ground awareness and per-axis dynamics succeeded cleanly.
-Collision stayed at ~0% (unaffected, as expected — an independent mechanism). But
-`target_lost_rate` was 89-100% across all 3 seeds, flat from the very first logged rollout
-through the full 3M-step run, never once improving. **Diagnosed, not just observed**:
-`LOST_TIMEOUT_SEC` (a fixed 2.0s dead-reckoning grace period) was never rescaled when
-`MAX_STEPS` grew 9x (200→1800) — an ordinary, recoverable contact gap now has ~9x more
-independent opportunities per episode to exceed a still-2-second window. See
-`KNOWN_ISSUES.md` item 12 and `EXPERIMENT_LOG.md` for the full reasoning and data.
-**Fix in progress, not yet confirmed**: `LOST_TIMEOUT_SEC` is now env-overridable; a 5-kernel
-sweep (6s x2, 10s x2, 18s x1) is running. 4 of 5 kernels confirmed `RUNNING`; the 5th is
-blocked by an unrelated Kaggle platform issue (see `KNOWN_ISSUES.md` item 15) — likely to
-resolve on its own or need the user to check Kaggle's web UI directly.
+**Headline, now two-part: `target_lost_rate` is much better but not solved, and solving it
+exposed a new collision-safety cost.** Active search closed most of Phase 3's `target_lost`
+catastrophe (89-100% → 60-81% at the same 6s timeout, and down to ~2-4% for well-converged
+seeds at 8-10s) — see `KNOWN_ISSUES.md` item 12 for the full history. But when a seed *does*
+converge to that tight, confident tracking behavior, **deterministic execution exposes a real
+collision-safety cost (8-14%) not seen at this magnitude since the original `N=4` brake gap.**
+Investigated directly (not assumed): the same frozen checkpoint run deterministically vs.
+stochastically on identical eval seeds shows determinism itself explains most/all of this —
+a policy shaped by exploration noise can converge its mean action to a knife-edge equilibrium
+riskier than the noise-perturbed behavior actually seen during training. This is why
+deterministic eval numbers, not training-time rolling numbers, should be trusted for safety
+claims going forward — see `DECISIONS.md`.
 
-**Secondary, same branch: vertical jiggling — fixed in code, not yet re-verified.** A trained
-Phase 3 checkpoint showed 8-25% of steps per agent flipping vertical-velocity sign (measured
-directly, not assumed, after a user report). A cruise-altitude reward preference plus
-deterministic Z-velocity smoothing were implemented and smoke-tested, bundled into the same
-branch/sweep under explicit time pressure. **Nobody has yet loaded a post-fix checkpoint and
+**Fix implemented and adversarially verified, Kaggle-scale confirmation in progress.** The
+brake's closing-speed check (`v_closing`) now uses the true mutual closing rate
+(`dot(v_a - v_b, dir_to_b)`) instead of each agent's own velocity alone — the old formula's
+adversarial-test guarantee only held because every agent ran the identical symmetric formula
+with nothing to perturb it, exactly the condition deterministic execution reproduces. Both
+adversarial stress tests (now a committed regression test, `test_brake_relative_velocity.py`)
+still pass. **Not yet confirmed to reduce `collision_rate` at training scale** — a 3-seed/3M-step
+Kaggle validation is running. See `KNOWN_ISSUES.md` item 13, `EXPERIMENT_LOG.md`.
+
+**Two seeds resumed to 5M steps to test "does more training help" — partially yes, not fully.**
+The two `t10`-bracket seeds that got stuck in a bad tracking regime were resumed (not retrained)
+from their ~3.01M-step checkpoints to 5M steps. Both improved substantially (70-72%→41% and
+92-96%→83% `target_lost_rate`) but neither closed the gap to the well-converged seeds' ~2-4%.
+More training is a real, contributing factor, not the whole story. See `EXPERIMENT_LOG.md`.
+
+**Secondary: vertical jiggling — fixed in code, still not re-verified.** Unchanged from the
+last pass — a cruise-altitude reward preference plus deterministic Z-velocity smoothing were
+implemented and smoke-tested after confirming an 8-25% per-step vertical-velocity sign-flip
+rate on a trained Phase 3 checkpoint. **Still nobody has loaded a post-fix checkpoint and
 re-measured the sign-flip rate** — don't treat this as confirmed-fixed until that happens. See
 `KNOWN_ISSUES.md` item 14.
-
-**Brake's relative-vs-absolute-velocity gap, now concretely relevant.** `_apply_brake` assumes
-each agent runs the identical symmetric correction formula — an assumption `deployment/
-inference_node.py` breaks by calling it against real PX4/Gazebo telemetry, where the other
-vehicle's actual behavior isn't controlled by this code. Not yet reformulated. See
-`KNOWN_ISSUES.md` item 13.
 
 **`main` is far behind.** `phase2-combined` (the fully-validated reference point) has not been
 fast-forwarded to `main` — needs the user to run the push themselves (permission-classifier
@@ -87,8 +102,10 @@ blocked from the agent). See `TODO.md`.
 
 ## Unverified (implemented, not yet confirmed by a completed run)
 
-- The `LOST_TIMEOUT_SEC` sweep and the altitude/jiggling fix (both above — this is the main
-  unverified surface right now).
+- The relative-velocity brake fix's actual effect on training-time `collision_rate` (adversarial
+  tests pass; Kaggle validation running) — this is the main unverified surface right now.
+- The vertical-jiggling fix (still not re-measured against a trained checkpoint, unchanged from
+  the last pass).
 - UWB-realistic neighbor sensing, sensing noise/occlusion, a directional FOV cone — all still
   deliberately deferred, unchanged from before. See `KNOWN_ISSUES.md` items 10-11.
 
