@@ -190,6 +190,94 @@ it's the best single result of the whole investigation once actually tested.
 timeout, bracketing the fix suggested by the near-miss finding above): `stage-marl-search-
 t8-s{1,2}` (8s timeout, 2 seeds), `stage-marl-search-t10-s{1,2,3}` (10s timeout, 3 seeds).
 
+## Update 2026-08-22: search-t10 seed1/seed2 identified as the underperforming pair; 5M-step resume attempt in progress (blocked on Kaggle dataset mount, not yet running)
+
+Read the actual downloaded `stage-marl-search-t10-s{1,2,3}` results (not memory) to confirm
+which seeds are "the two underperforming ones" referenced above: **seed1** (`target_lost_rate`
+0.70-0.72, `contact_fraction` 0.84) and **seed2** (`target_lost_rate` 0.92-0.96,
+`contact_fraction` 0.68-0.71) are underperforming; **seed3** (`target_lost_rate` 0.04-0.10,
+`contact_fraction` 0.97-0.99, `success_rate` 0.85-0.90) is the good one and is *not* part of
+this retest. (An earlier config.py comment guessing "seed2" was the good one referred to a
+different, older experiment — don't trust that comment for this bracket.)
+
+**Verified before touching anything else** (per explicit user instruction): no ground-truth
+leakage into obs/reward (`self.pos_t`/`_target_dir`/`_target_speed` are only read in `reset()`,
+the direct-contact sensor check, and diagnostic-only `infos` fields — grep-confirmed), and the
+eval loop already respects the full 90s horizon (relies on `env.agents` emptying, which honors
+`MAX_STEPS` and `DISABLE_TARGET_LOST_TERMINATION` correctly).
+
+**`training/evaluate.py` extended** (commit `c4206eb`, pushed): added pooled (not per-episode-
+averaged) `mean/p95/max_true_track_err`, and a proper reacquisition-**time** distribution
+(`mean/median/p95/max_reacquisition_steps` + seconds, `n_reacquisitions_observed`) — previously
+only reacquisition *counts/rates* existed, no duration. Diagnostic-only, doesn't touch brake or
+tracking mechanism. Smoke-tested locally against the real seed1 checkpoint before use.
+
+**5M-step resume attempt for seed1/seed2** (continuing from their existing ~3.01M checkpoints,
+not retraining from scratch — `TOTAL_STEPS=5000000`, `LOST_TIMEOUT_SEC=10` preserved, no other
+config change, per explicit user instruction not to touch the brake or tracking mechanism yet):
+checkpoints `latest_1.pt`/`latest_2.pt` uploaded as Kaggle dataset
+`rayensboui/stage-marl-t10-resume-ckpts`, kernels `stage-marl-search-t10-s{1,2}-resume-5m`
+pushed referencing it. **Both failed twice** (`cp: cannot stat
+'/kaggle/input/stage-marl-t10-resume-ckpts/latest_1.pt': No such file or directory`) even
+though the kernel's own stored metadata correctly lists the dataset in `dataset_sources` and
+`kaggle datasets files` confirms both files are really there — the dataset is just not showing
+up under `/kaggle/input/` at all. Not a propagation-delay issue (failed identically on a retry
+several minutes later). A tiny diagnostic kernel (`stage-marl-diag-input-path`, just
+`os.listdir("/kaggle/input")`) is running now to find the actual mount path/cause before
+retrying again. **If you're picking this up: do not assume the resume kernels above are
+training anything — they are not, both errored in the first ~8 seconds.**
+
+**Resolved**: the diagnostic kernel (`stage-marl-diag-input-path`, just `os.listdir`/`os.walk`
+on `/kaggle/input`) showed datasets now mount at `/kaggle/input/datasets/<owner>/<dataset-
+slug>/...`, not the classically-documented `/kaggle/input/<dataset-slug>/...` (confirmed
+against the current kaggle-cli docs, which still describe the old path -- this looks like an
+undocumented platform change). Fixed both `verify.py` scripts' `cp` source path and re-pushed
+as v3; both confirmed `RUNNING` well past the ~8s mark where the old path failed twice, so the
+checkpoint copy succeeded this time. A persistent background monitor is polling both every
+2.5 min for completion/failure. **Worth remembering for any future Kaggle dataset_sources use
+in this project**: use `/kaggle/input/datasets/<owner>/<dataset-slug>/`, not the shorter form.
+
+## Update 2026-08-22: train-vs-eval collision-rate discrepancy explained (mostly)
+
+Investigated why deterministic eval collision_rate has consistently run higher than the
+trailing train-time (stochastic) rate across many runs project-wide (checked ~50 downloaded
+runs, not just one) -- clearest example, `search-t8-s{1,2}`: train ~1-1.2% vs eval 8-14%.
+
+**Direct test** (`/tmp/.../scratchpad/collision_discrepancy_test.py`, kept local/scratch, not
+merged into `evaluate.py`): took the exact same frozen `actor_1.pt`/`actor_2.pt` weights from
+`search-t8-s1`/`s2` and ran 100 fresh episodes twice each -- once deterministic (`tanh(mu)`,
+matches `evaluate.py`), once stochastic (sampled, matches `train.py`'s own rollout collection)
+-- same eval seeds both times, only the action-selection mode differs.
+
+- **seed1**: deterministic 11% vs stochastic 2% -- alone reproduces the originally-observed
+  gap almost exactly. Determinism vs stochasticity is a real, demonstrated cause here, not
+  speculation.
+- **seed2**: deterministic 13% vs stochastic 10% -- determinism only explains a small slice;
+  stochastic-replayed-after-training (10%) is still far above what training itself logged
+  near the end (~1.2%).
+
+**Conclusion**: two separate, stacking effects, not one. (1) A policy shaped by entropy-driven
+exploration can converge its *mean* action to a knife-edge equilibrium riskier than the noise-
+perturbed behavior actually seen during training -- deterministic eval consistently exploits
+that mean. Weak secondary signal (small-N, not confirmed): deterministic collisions involved
+2+ simultaneously-close agents more often than stochastic ones (seed2: 54% vs 30%) -- consistent
+with the brake's already-documented gap (multi-pass convergence stress-tested only for exactly-
+symmetric cases, not proven for arbitrary 3+-agent conflicts) being easier to trigger without
+noise breaking up a persistent near-symmetric closing pattern. (2) For less-converged policies
+specifically (seed2's tracking was itself badly broken, 92-98% target_lost), train.py's logged
+number is a rolling average over its *last* ~50 episodes of a still-unstable tail, which can
+catch a locally lucky patch that a fresh, frozen 100-episode re-evaluation doesn't reproduce --
+a measurement-window artifact layered on top of the real determinism effect, worse for noisier/
+less-converged seeds (matches: seed1, better-converged, ~fully explained by determinism alone;
+seed2, worse-converged, isn't).
+
+**Practical implication**: deterministic eval is the number to trust for real deployment (a
+flight controller runs the mean policy, not a sampled one) -- the higher eval collision rates
+are the honest ones, not the more optimistic training-time rolling numbers. Also strengthens
+the case for the already-queued brake relative-velocity reformulation (`TODO.md`) -- a
+persistent, un-perturbed near-symmetric closing pattern is exactly what a deterministic policy
+can produce and exactly what the brake's proof gap is about.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,

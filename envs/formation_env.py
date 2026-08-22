@@ -457,7 +457,16 @@ class FormationEnv3D(ParallelEnv):
         self._last_brake_k_active (dict, how many other agents were within
         SAFE_DIST_ENTER of each agent -- lets callers split brake_reduction
         by whether it happened solo (1 active neighbor) or under multi-
-        neighbor competition (2+), the mechanism N-aware margin targets."""
+        neighbor competition (2+), the mechanism N-aware margin targets.
+
+        Relative-velocity closing speed (2026-08-22): v_closing (here and in
+        the post-hoc check below) is dot(v_a - v_b, dir_to_b) -- the TRUE
+        rate the distance between a and b is shrinking -- not dot(v_a,
+        dir_to_b) (a's own velocity toward b, silently treating b as
+        stationary). See the CAUTION comment in step() for why the old
+        one-sided version mattered. This changes what's measured, not the
+        correction mechanism: agent a still unilaterally corrects only its
+        own velocity, same multi-pass loop, same max_closing shape."""
         raw_vel = {a: v.copy() for a, v in raw_vel.items()}
         brake_reduction = {a: 0.0 for a in self.agents}
 
@@ -483,7 +492,7 @@ class FormationEnv3D(ParallelEnv):
                     d = float(np.linalg.norm(diff))
                     if d < SAFE_DIST_ENTER and d > 1e-6:
                         dir_to_b = diff / d
-                        v_closing = float(np.dot(v, dir_to_b))
+                        v_closing = float(np.dot(v - raw_vel[b], dir_to_b))
                         if v_closing > 0:
                             max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
                             if v_closing > max_closing:
@@ -509,7 +518,7 @@ class FormationEnv3D(ParallelEnv):
                 d = float(np.linalg.norm(diff))
                 if d < SAFE_DIST_ENTER and d > 1e-6:
                     dir_to_b = diff / d
-                    v_closing = float(np.dot(raw_vel[a], dir_to_b))
+                    v_closing = float(np.dot(raw_vel[a] - raw_vel[b], dir_to_b))
                     max_closing = MAX_ACTION_SPEED * max(0.0, (d - COLLISION_DIST) / (SAFE_DIST_ENTER - COLLISION_DIST))
                     max_violation = max(max_violation, v_closing - max_closing)
         self._last_brake_violation = max_violation
@@ -602,15 +611,30 @@ class FormationEnv3D(ParallelEnv):
         # other/the centroid every step -- minimum distance asymptotically
         # approached but never crossed COLLISION_DIST, zero residual
         # constraint violation after _apply_brake on every step of both
-        # tests. Not a proof, and specific to this system: v_closing below is
-        # each agent's OWN velocity component toward the other, not the
-        # relative closing velocity (v_a - v_b) -- the two adversarial tests
-        # hold because every agent goes through this identical symmetric
-        # formula, with no way for one side to be unconstrained while the
-        # other closes at speed. That symmetry assumption stops holding once
-        # a real vehicle (whose actual velocity this code doesn't control)
-        # is involved -- see deployment/docs/PHASE2_HANDOFF.md. Reformulating
-        # this with explicit relative velocity is queued, not yet done.
+        # tests. Not a proof: NUM_AGENTS passes is a cheap iteration bound,
+        # not a convergence guarantee -- the early-exit above is what
+        # actually stops the loop in practice, same caveat as before.
+        #
+        # UPDATED (2026-08-22): v_closing is now the TRUE mutual closing
+        # rate, dot(v_a - v_b, dir_to_b), not dot(v_a, dir_to_b) (a's own
+        # velocity toward b, silently treating b as stationary). The old
+        # formula's adversarial-test guarantee only held because both
+        # agents ran the identical symmetric one-sided formula, with no way
+        # for one side to be unconstrained while the other closed at speed
+        # -- that assumption breaks for any real, independently-moving
+        # vehicle on the other side of the pair (see
+        # deployment/docs/PHASE2_HANDOFF.md), which is exactly the gap this
+        # closes. Partly motivated by the deterministic-vs-stochastic
+        # collision-rate investigation (PHASE2_CHECKPOINT.md, 2026-08-22):
+        # deterministic rollouts run every agent's identical policy with no
+        # noise to break symmetry, and still showed collisions this
+        # formula's own symmetry argument says shouldn't happen -- real
+        # evidence the one-sided assumption was being stressed, not just a
+        # theoretical gap. Both adversarial tests above re-verified against
+        # the new formula in test_brake_relative_velocity.py -- still zero
+        # residual violation. Kaggle validation (3 seeds, 3M steps) launched
+        # to check this actually reduces collision_rate in training, not
+        # just in the two hand-picked adversarial scenarios.
         # Per-axis action scaling (Phase 3, 2026-08-20): was a single
         # isotropic MAX_ACTION_SPEED across all 3 components -- real drones
         # have different vertical (climb) vs horizontal (lateral) speed
