@@ -328,6 +328,40 @@ to confirm from here whether that workstream is still active. Whoever picks this
 first re-run `verify_obs_adapter.py` (per its own docstring, needs ROS2 sourced but no daemon/
 simulator running) to get a current pass/fail before assuming anything about Phase 7's status.
 
+## Update 2026-08-23 (later): NUM_AGENTS=3 deployment-compatible training launched; first brake-relvel-t8/t10 results in, seed-reuse assumption didn't hold
+
+**Why**: `deployment/inference_node.py` hard-asserts `NUM_AGENTS == 3` -- confirmed by reading
+the code, not assumed. Every checkpoint produced this whole session (timeout sweep, active
+search, the t8/t10 bracket, both brake-relvel batches) was trained at `NUM_AGENTS=4` and is
+therefore **not loadable** by the real 3-drone deployment (different `OBS_DIM`, no weight
+transfer -- see `docs/ai_context/DECISIONS.md`). None of Phase 3's fixes (ground awareness --
+the crash's #1 hypothesized cause in `deployment/docs/PHASE2_HANDOFF.md` -- active search, or
+the brake reformulation) have ever been trained at N=3. Adapting the deployment side to 4
+instead was considered and rejected: `SPAWN_XY`/`AGENT_NAMESPACE` are hardcoded 3-entry dicts
+tuned to N=3's exact 120-degree planar geometry, N=4's ideal formation is a non-planar regular
+tetrahedron (a real, previously-confirmed project finding), and it would add a new variable to
+a deployment stack that's currently mid-crash-diagnosis -- worse methodology, not just more work.
+
+**Launched**: `stage-marl-deploy-n3-s{1,2}` (`NUM_AGENTS=3`, `TOTAL_STEPS=3000000`,
+`LOST_TIMEOUT_SEC=8` -- the only timeout value with a clean N=4 convergence record so far, current
+`phase3-resilience` code). Both confirmed `RUNNING`, launched one at a time as brake-relvel
+slots freed up (Kaggle's 5-session cap). **Whoever picks up the deployment side next**: these
+will be the first Phase-3-era, ground-aware, N=3-compatible checkpoints once complete -- check
+`kaggle kernels status rayensboui/stage-marl-deploy-n3-s{1,2}` before assuming either is ready.
+
+**First brake-relvel-t8/t10 results, and an important negative finding about the seed-reuse
+design**: `t8-s3` (fresh seed, no old-brake counterpart): 10% collision, 6% `target_lost`, 1.97
+tracking_rmse -- excellent tracking, but collision still double-digit even training with the new
+brake from scratch. `t8-s1` (same seed as the original `search-t8-s1`, which had 8% collision /
+2-3% `target_lost` under the *old* brake): **90% `target_lost_rate`** under the new brake -- a
+completely different outcome, not just a different collision number. Reusing a seed does not
+give a clean "only collision changes" comparison the way it was expected to: the brake's
+behavior differs the moment two agents are close enough for `v_closing` to differ between
+formulas, and since training is on-policy, everything downstream of that first divergence can
+send the whole run to a different outcome entirely. **Don't treat the seed-1/seed-3(t10) pairings
+as clean before/after comparisons** -- read each new result on its own terms, not as a paired
+diff against its old-brake counterpart. Still waiting on `t8-s2`, `t10-s3`, `t10-s4`.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
