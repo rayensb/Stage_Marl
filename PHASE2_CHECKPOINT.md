@@ -362,6 +362,48 @@ send the whole run to a different outcome entirely. **Don't treat the seed-1/see
 as clean before/after comparisons** -- read each new result on its own terms, not as a paired
 diff against its old-brake counterpart. Still waiting on `t8-s2`, `t10-s3`, `t10-s4`.
 
+## Update 2026-08-23 (later still): relative-velocity brake looks net-harmful to training convergence -- 6 of 7 seeds failed, root mechanism unclear, no deployment-ready checkpoint exists
+
+**Full result, all 7 seeds trained with the new (relative-velocity) brake code, this update
+session**:
+
+| seed | config | old-brake baseline | new-brake result |
+|---|---|---|---|
+| t8-s1 | N=4, 8s | 2-3% target_lost (converged) | **90% target_lost (failed)** |
+| t8-s2 | N=4, 8s | 2% target_lost (converged) | **86% target_lost (failed)** |
+| t8-s3 | N=4, 8s | (fresh, no baseline) | 6% target_lost, 10% collision (converged) |
+| t10-s3 | N=4, 10s | 4% target_lost (converged) | **95% target_lost (failed)** |
+| t10-s4 | N=4, 10s | (fresh, no baseline) | **90% target_lost (failed)** |
+| deploy-n3-s1 | N=3, 8s | (no N=3 Phase-3 baseline exists) | **99% target_lost (failed)** |
+| deploy-n3-s2 | N=3, 8s | (no N=3 Phase-3 baseline exists) | **96% target_lost (failed)** |
+
+**6 of 7 failed to converge on tracking at all -- including both `NUM_AGENTS=3` deployment-
+target seeds.** The 3 seeds with a direct old-brake baseline (t8-s1, t8-s2, t10-s3) all had a
+**clean 3/3 success record under the old brake and a clean 0/3 record under the new one, same
+seeds, deterministic training** -- not the usual bimodal seed-variance pattern this project has
+seen elsewhere, a genuine reversal on repeat, strong evidence the brake change itself is
+causally responsible, not incidental.
+
+**Leading hypothesis (fires harder per unit of tight tracking, since the new formula reads
+~2x the closing speed under symmetric approach) was tested directly and REFUTED**: compared
+`search-t8-s1` (old brake, converged) against `brake-relvel-t8-s1` (new brake, same seed,
+failed) at the final training row. `r_brake` was only marginally more negative (-0.091 vs
+-0.129, not dramatically larger), and **`mean_brake_reduction` was actually *smaller* in the
+failed run** (0.0025 vs 0.0008) -- the brake is barely engaging in the failed run, most likely
+because the swarm never gets close enough to need it (`avg_min_dist` 6.57 vs 8.14, wider not
+tighter). This rules out "harsher direct penalty" as the mechanism. **The actual cause is not
+yet understood** -- would need reward-component *trajectories* over the course of training
+(not just the final snapshot) to see where/when the two runs' paths actually diverge, not yet
+done.
+
+**Bottom line**: the relative-velocity brake fix, in its current form, looks like a net
+negative for training convergence, not a clean safety improvement -- and there is currently
+**no deployment-ready (`NUM_AGENTS=3`, Phase-3-era) checkpoint**, since both attempts at that
+config also failed to converge under the new brake. **Open question posed to the user, not yet
+answered**: dig further into the mechanism, or revert the brake to the old (one-sided-velocity)
+formula and treat this as a dead end for now. Whoever picks this up next should check for that
+answer before doing either.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
