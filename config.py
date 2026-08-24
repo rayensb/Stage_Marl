@@ -25,6 +25,16 @@ NUM_AGENTS  = int(os.environ.get("NUM_AGENTS", 4))
 # stale to relock.
 K_NEIGHBORS = NUM_AGENTS - 1
 
+# Actor/Critic hidden width (2026-08-23) -- env-var overridable like
+# NUM_AGENTS/N_REACT above, so a network-capacity sweep can run as separate
+# Kaggle sessions without hand-editing training/networks.py per launch.
+# Defaults (128/256) match Phase 3's "starting guess, not measured" bump
+# from the original 64/128 -- see training/networks.py's Actor docstring.
+# train.py and evaluate.py both read these (not just train.py) since a
+# saved checkpoint's shape must match the network reconstructed to load it.
+ACTOR_HIDDEN  = int(os.environ.get("ACTOR_HIDDEN", 128))
+CRITIC_HIDDEN = int(os.environ.get("CRITIC_HIDDEN", 256))
+
 # Single source of truth for network I/O shapes -- train.py and evaluate.py
 # both need these to match exactly (evaluate.py loads weights saved by
 # train.py), so this is not duplicated in either file. Must use the same

@@ -20,7 +20,7 @@ import torch
 
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, LOST_TIMEOUT_STEPS, DT
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, LOST_TIMEOUT_STEPS, DT, ACTOR_HIDDEN
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
@@ -37,7 +37,7 @@ def load_actors(model_dir, run_id, device, best=False):
     tag = "_best" if best else ""
     path = os.path.join(model_dir, f"actor{tag}{suffix}.pt")
 
-    actor = Actor(OBS_DIM, ACT_DIM).to(device)
+    actor = Actor(OBS_DIM, ACT_DIM, hidden=ACTOR_HIDDEN).to(device)
     if os.path.exists(path):
         actor.load_state_dict(torch.load(path, map_location=device))
     else:

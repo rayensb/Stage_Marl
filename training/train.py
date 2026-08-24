@@ -12,7 +12,7 @@ from training.networks import Actor, CentralCritic
 from training.buffer import RolloutBuffer
 from training.checkpoint import save_checkpoint, load_checkpoint, save_best_actor
 from training.logger import init_logger, log_row
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_STEPS
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_STEPS, ACTOR_HIDDEN, CRITIC_HIDDEN
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 # Phase 3 (2026-08-20): derived from MAX_STEPS instead of hardcoded
@@ -165,8 +165,8 @@ def main():
     # separate actors each learning from only 1/NUM_AGENTS of the data.
     # The critic already shares a trunk across a per-agent head, so it's
     # untouched -- this only pools the actor's training.
-    actor = Actor(OBS_DIM, ACT_DIM).to(DEVICE)
-    critic = CentralCritic(OBS_DIM * len(AGENTS), num_agents=len(AGENTS)).to(DEVICE)
+    actor = Actor(OBS_DIM, ACT_DIM, hidden=ACTOR_HIDDEN).to(DEVICE)
+    critic = CentralCritic(OBS_DIM * len(AGENTS), num_agents=len(AGENTS), hidden=CRITIC_HIDDEN).to(DEVICE)
     agent_idx = {a: i for i, a in enumerate(AGENTS)}
     opt_actor = optim.Adam(actor.parameters(), lr=LR)
     opt_critic = optim.Adam(critic.parameters(), lr=LR)

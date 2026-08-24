@@ -1,8 +1,13 @@
-"""Adversarial regression test for _apply_brake's relative-velocity closing
-speed (see the CAUTION comment in envs/formation_env.py's step(), 2026-08-22
-update). Rebuilds the two hand-picked worst-case scenarios that comment
-already describes testing manually -- committed here so they're re-runnable,
-not just a one-off claim in a comment.
+"""Adversarial regression test for _apply_brake's closing-speed guarantee --
+originally built to verify the relative-velocity reformulation (see
+envs/formation_env.py's step() CAUTION comment), which was later tried,
+found to break training convergence at Kaggle scale for reasons still not
+understood, and reverted. Kept as a general regression test: both scenarios
+are exactly symmetric (every agent runs the identical formula), which is
+precisely the condition under which the reverted one-sided formula was
+already proven to hold too -- see DECISIONS.md. Still passes against
+whichever formula is currently active; re-verify after any future brake
+change, not just this one.
 
 Both scenarios start every agent outside SAFE_DIST_ENTER, always commanding
 MAX_ACTION_SPEED directly at another agent/the shared centroid, every step,

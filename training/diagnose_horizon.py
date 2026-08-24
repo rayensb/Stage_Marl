@@ -26,7 +26,7 @@ from matplotlib.collections import LineCollection
 
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, DT
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, TARGET_DIST, DT, ACTOR_HIDDEN
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 
@@ -41,7 +41,7 @@ def main():
     args = parser.parse_args()
 
     steps = int(round(args.seconds / DT))
-    actor = Actor(OBS_DIM, ACT_DIM).to(args.device)
+    actor = Actor(OBS_DIM, ACT_DIM, hidden=ACTOR_HIDDEN).to(args.device)
     actor.load_state_dict(torch.load(args.model, map_location=args.device))
     actor.eval()
     actors = {a: actor for a in AGENTS}

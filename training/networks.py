@@ -10,7 +10,9 @@ class Actor(nn.Module):
     # resilience test alongside the longer horizon/ground/per-axis changes --
     # a starting guess that more capacity helps the policy hold formation
     # over a much longer episode than it saw at NUM_AGENTS=4's already-good
-    # 64-wide results at 200 steps, not a measured need.
+    # 64-wide results at 200 steps, not a measured need. Env-var overridable
+    # since 2026-08-23 (config.py's ACTOR_HIDDEN) specifically to test that
+    # "not measured" gap -- see EXPERIMENT_LOG.md for the sweep.
     def __init__(self, obs_dim, act_dim, hidden=128):
         super().__init__()
         self.net = nn.Sequential(
