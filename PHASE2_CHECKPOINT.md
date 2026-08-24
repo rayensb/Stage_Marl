@@ -404,6 +404,36 @@ answered**: dig further into the mechanism, or revert the brake to the old (one-
 formula and treat this as a dead end for now. Whoever picks this up next should check for that
 answer before doing either.
 
+## Update 2026-08-24: brake reverted, network-capacity sweep launched
+
+Per explicit user decision: reverted the relative-velocity brake to the old, proven one-sided
+formula (commit `55e7232`) rather than keep chasing the unexplained convergence-breaking
+mechanism -- deployment-readiness took priority, and the new brake had no confirmed safety
+benefit to weigh against the cost anyway (its one converged run still showed 10% collision,
+no better than before). `test_brake_relative_velocity.py` kept as a general regression test --
+still passes, since both its scenarios are symmetric and the reverted formula already handles
+those cleanly. `_apply_brake`'s CAUTION comment records the full tried-and-reverted story for
+whoever revisits this later.
+
+Also added `ACTOR_HIDDEN`/`CRITIC_HIDDEN` env-var overrides (`config.py`, `training/networks.py`,
+threaded through `train.py`/`evaluate.py`/`diagnose_horizon.py`) -- the 128/256 hidden width has
+been Phase 3's default since it was bundled in as "a starting guess... not measured," never
+actually isolated. `deployment/sim_demo.py`/`inference_node.py` were deliberately **not** touched
+(still hardcode `Actor(OBS_DIM, ACT_DIM)`, i.e. assume the 128 default) -- fine for now since
+nothing has been deployment-tested yet, but whoever wires up the eventual winning checkpoint
+needs to either match its hidden width there or update those two files the same way.
+
+**Launched** (5 kernels, all `RUNNING`, fills Kaggle's cap): a network-capacity sweep on the
+reverted brake, `LOST_TIMEOUT_SEC=8` (the best-evidenced timeout so far), 3M steps each --
+`stage-marl-netsweep-n4-{small,medium,large}` (Actor/Critic hidden 64/128, 128/256, 256/512;
+`NUM_AGENTS=4`) and `stage-marl-netsweep-n3-{medium,large}` (128/256, 256/512; `NUM_AGENTS=3`,
+this project's first Phase-3-era N=3 attempt on a *working* brake -- the two prior N=3 attempts
+both used the since-reverted broken brake and both failed). `netsweep-n4-medium` deliberately
+reuses `SEED=1` with the exact same config as the original `search-t8-s1` (which converged
+cleanly under the old brake before the relative-velocity detour) -- a free sanity check that
+the revert actually reproduces that result; if it doesn't, something is more wrong than just
+the brake formula, worth flagging as a red flag if it comes back non-converged.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
