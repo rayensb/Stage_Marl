@@ -6,6 +6,7 @@ import numpy as np
 import torch
 import torch.optim as optim
 from collections import deque
+from scipy.stats import spearmanr
 
 from envs.formation_env import FormationEnv3D
 from training.networks import Actor, CentralCritic
@@ -27,6 +28,25 @@ ROLLOUT_LEN = MAX_STEPS * ROLLOUT_EPISODES
 EPOCHS = 10
 BATCH_SIZE = 256
 LR = 3e-4
+# Critic-LR recovery experiment (2026-08-25): the critic-collapse
+# investigation (see PHASE2_CHECKPOINT.md / EXPERIMENT_LOG.md) found the
+# production critic's second Tanh layer saturates 100% within the first
+# rollout of training at CRITIC_LR=LR, and that a per-update trajectory +
+# LR sweep on a short (2250-update) reproduction showed this is
+# LR-dependent -- 1e-5 (30x smaller) fully prevented saturation over that
+# same budget, where 3e-4/1e-4 still reached 100%. A corrected, properly
+# stratified (not temporally-contiguous) diagnostic then found the
+# critic's anti-correlation with real returns shrinks toward zero as LR
+# drops (-0.263 at 3e-4 -> -0.042 at 1e-5, statistically indistinguishable
+# from noise at n=896), though still far from confirmed-positive at that
+# short budget. This is deliberately kept SEPARATE from the actor's LR --
+# only the critic's optimizer step size is in question, not policy
+# learning rate -- so this is its own env-var-overridable constant,
+# defaulting to the unchanged, original behavior (same value as LR)
+# unless explicitly set. Override with CRITIC_LR=1e-5 for the treatment
+# arm of the matched-seed comparison this was built for; do not change
+# this default without the comparison's own result in hand.
+CRITIC_LR = float(os.environ.get("CRITIC_LR", LR))
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
@@ -152,7 +172,7 @@ def joint(obs_dict):
 
 def main():
     global _stop_requested
-    print(f"[run] device={DEVICE} seed={SEED}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
+    print(f"[run] device={DEVICE} seed={SEED} critic_lr={CRITIC_LR}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -169,7 +189,7 @@ def main():
     critic = CentralCritic(OBS_DIM * len(AGENTS), num_agents=len(AGENTS), hidden=CRITIC_HIDDEN).to(DEVICE)
     agent_idx = {a: i for i, a in enumerate(AGENTS)}
     opt_actor = optim.Adam(actor.parameters(), lr=LR)
-    opt_critic = optim.Adam(critic.parameters(), lr=LR)
+    opt_critic = optim.Adam(critic.parameters(), lr=CRITIC_LR)
 
     total_steps, ep_count = load_checkpoint(actor, critic, opt_actor, opt_critic, RUN_ID, DEVICE)
 
@@ -381,10 +401,22 @@ def main():
             # in the back half of every prior run instead of settling.
             frac = min(1.0, total_steps / TOTAL_STEPS)
             lr_now = LR * (1.0 - frac)
+            # Critic-LR recovery experiment (2026-08-25): this anneal used
+            # to set BOTH optimizers to the same lr_now (derived only from
+            # the actor's LR) every rollout -- silently overwriting
+            # CRITIC_LR back to a LR-derived value on the very first
+            # rollout, regardless of what it was constructed with. Caught
+            # by a local smoke test producing bit-identical critic-health
+            # output under CRITIC_LR=3e-4 vs CRITIC_LR=1e-5 before any
+            # Kaggle spend. Each optimizer now anneals from its OWN base
+            # LR by the same (1-frac) ratio, preserving the original
+            # shared-schedule behavior exactly when CRITIC_LR==LR (the
+            # unset/default case) while actually respecting an override.
+            critic_lr_now = CRITIC_LR * (1.0 - frac)
             for g in opt_actor.param_groups:
                 g["lr"] = lr_now
             for g in opt_critic.param_groups:
-                g["lr"] = lr_now
+                g["lr"] = critic_lr_now
 
             scheduled_ent_coef = ENT_COEF_START + frac * (ENT_COEF_END - ENT_COEF_START)
             ent_coef = ENTROPY_RECOVERY_ENT_COEF if entropy_recovery else scheduled_ent_coef
@@ -463,6 +495,37 @@ def main():
             steps_per_sec = ROLLOUT_LEN / total_elapsed if total_elapsed > 0 else 0.0
             collect_sps = ROLLOUT_LEN / rollout_elapsed if rollout_elapsed > 0 else 0.0
 
+            # Critic-health diagnostic (critic-LR recovery experiment,
+            # 2026-08-25) -- see CRITIC_LR's comment above for the full
+            # investigation this is checking. Computed on a random
+            # subsample of this rollout's own already-pooled (jo, ret)
+            # batch -- spans this whole rollout's real, mixed episodes
+            # (contact + loss at every depth), not a narrow temporal
+            # slice, avoiding the sampling artifact the
+            # diagnostic work found in an earlier, contiguous-batch
+            # version of this same check. Does not affect training in any
+            # way -- read-only forward passes on already-computed tensors,
+            # logged for analysis only.
+            with torch.no_grad():
+                diag_idx = torch.randperm(n)[:min(2000, n)]
+                v_diag = critic(jo[diag_idx])[torch.arange(len(diag_idx)), head_idx[diag_idx]]
+                ret_diag = ret[diag_idx]
+                pre_h1 = critic.trunk[0](jo[diag_idx])
+                h1 = critic.trunk[1](pre_h1)
+                pre_h2 = critic.trunk[2](h1)
+                h2 = critic.trunk[3](pre_h2)
+            v_diag_np, ret_diag_np = v_diag.numpy(), ret_diag.numpy()
+            if v_diag_np.std() > 1e-8:
+                critic_pearson = float(np.corrcoef(v_diag_np, ret_diag_np)[0, 1])
+                critic_spearman = float(spearmanr(v_diag_np, ret_diag_np).correlation)
+            else:
+                critic_pearson = critic_spearman = 0.0
+            critic_v_mean, critic_v_std = float(v_diag.mean()), float(v_diag.std())
+            critic_v_min, critic_v_max = float(v_diag.min()), float(v_diag.max())
+            critic_target_mean, critic_target_std = float(ret_diag.mean()), float(ret_diag.std())
+            critic_final_sat_frac = float((h2.abs() > 0.999).float().mean())
+            critic_final_pre_std = float(pre_h2.std())
+
             avg_reward = float(np.mean(recent_rewards)) if recent_rewards else 0.0
             avg_min_dist = float(np.mean(recent_min_dist)) if recent_min_dist else 0.0
             avg_ep_len = float(np.mean(recent_ep_len)) if recent_ep_len else 0.0
@@ -503,13 +566,16 @@ def main():
                   f"entropy={last_entropy:.2f} log_std={log_std_mean:.3f} act_abs={mean_action_abs:.3f} "
                   f"brake={mean_brake_reduction:.4f} "
                   f"kl={last_approx_kl:.4f} clip_frac={last_clip_frac:.2f} "
-                  f"lr={lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
+                  f"lr={lr_now:.2e} critic_lr={critic_lr_now:.2e} ent_coef={ent_coef:.4f}{' [RECOVERY]' if entropy_recovery else ''} "
                   f"sps={steps_per_sec:.0f} (collect={collect_sps:.0f}) "
                   f"[track={comp_avgs['track']:.1f} spread={comp_avgs['spread']:.1f} "
                   f"safety={comp_avgs['safety']:.1f} cohesion={comp_avgs['cohesion']:.1f} "
                   f"coll_pen={comp_avgs['collision']:.1f} vel={comp_avgs['velocity']:.1f} "
                   f"joint={comp_avgs['joint']:.1f} contact={comp_avgs['contact']:.1f} "
-                  f"brake_pen={comp_avgs['brake']:.1f}]")
+                  f"brake_pen={comp_avgs['brake']:.1f}] "
+                  f"critic[v={critic_v_mean:.1f}±{critic_v_std:.2f} tgt={critic_target_mean:.1f}±{critic_target_std:.1f} "
+                  f"pearson={critic_pearson:.3f} spearman={critic_spearman:.3f} "
+                  f"final_sat={critic_final_sat_frac*100:.0f}% pre_std={critic_final_pre_std:.2f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, target_lost_rate=target_lost_rate,
@@ -531,7 +597,12 @@ def main():
                      log_std_mean=log_std_mean, mean_action_abs=mean_action_abs,
                      mean_brake_reduction=mean_brake_reduction,
                      mean_brake_passes=mean_brake_passes, max_brake_violation=max_brake_violation,
-                     mean_brake_solo=mean_brake_solo, mean_brake_multi=mean_brake_multi)
+                     mean_brake_solo=mean_brake_solo, mean_brake_multi=mean_brake_multi,
+                     critic_lr=CRITIC_LR, critic_v_mean=critic_v_mean, critic_v_std=critic_v_std,
+                     critic_v_min=critic_v_min, critic_v_max=critic_v_max,
+                     critic_target_mean=critic_target_mean, critic_target_std=critic_target_std,
+                     critic_pearson=critic_pearson, critic_spearman=critic_spearman,
+                     critic_final_sat_frac=critic_final_sat_frac, critic_final_pre_std=critic_final_pre_std)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 
