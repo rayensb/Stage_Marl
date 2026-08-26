@@ -670,6 +670,33 @@ started** -- awaiting a final go-ahead from the user before spending Kaggle comp
 project's standing practice of treating "implement/commit" and "spend real compute" as two
 separate approval gates.
 
+## Update 2026-08-26 (later still): matched 3-seed baseline-vs-treatment launched (5 Kaggle + 1 local)
+
+Explicit user go-ahead received ("5 to kaggle and 1 locally"). Pushed the 7 pending local commits
+to `origin/phase3-resilience` first (standing pre-launch rule). Launched, same structure as the
+CRITIC_LR ablation: `stage-marl-auxdir-control-s{1,2,3}` (AUX_DIR_COEF unset/default) and
+`stage-marl-auxdir-treat-s{1,2}` (AUX_DIR_COEF=0.01) on Kaggle -- all 5 confirmed `RUNNING`.
+Treatment seed 3 run locally instead (Kaggle's 5-session cap, matching the CRITIC_LR ablation's
+exact precedent).
+
+**Caught before it could silently corrupt the experiment**: the local `SEED=3`/`run_id=3` launch
+first tried to resume from `checkpoints/latest_3.pt` -- a **leftover checkpoint from the earlier,
+unrelated CRITIC_LR=1e-5 local treatment-seed-3 run** (same run_id, same worktree, already fully
+consumed at 3,009,600 steps), and since that's already past this run's `TOTAL_STEPS=3,000,000`,
+`train.py` exited instantly without training anything. Caught by checking the log/process, not
+assumed. Fixed by moving the old `checkpoints/latest_3.pt`, `models/actor_3.pt`,
+`models/actor_best_3.pt`, `logs/training_log_3.csv`, `logs/eval_3.csv` aside (preserved, not
+deleted) before relaunching cleanly -- confirmed via `ps` that the process is now actually
+training (real CPU usage, elapsed time advancing). All 6 arms (5 Kaggle + 1 local) confirmed
+running as of this update.
+
+**Status**: launched, in progress. Next step once complete: download all 6, run
+`training/evaluate.py --episodes 100` (both final and `--best`) already happens inside each
+Kaggle kernel and will be run locally for the 6th; compare `target_lost_rate`, `contact_fraction`,
+`reacquire_rate_eventual`, `mean_reacquisition_steps`, `collision_rate`, `productive_agent_fraction`
+per the pre-agreed decision rule (≥2/3 seeds improve without unacceptable safety regression -> keep;
+otherwise abandon and move to the next intervention).
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
