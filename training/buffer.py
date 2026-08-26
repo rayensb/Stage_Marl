@@ -21,9 +21,19 @@ class RolloutBuffer:
         self.rewards = {a: np.zeros(n, np.float32) for a in self.agents}
         self.dones = np.zeros(n, np.float32)
         self.values = {a: np.zeros(n, np.float32) for a in self.agents}
+        # Search-direction auxiliary objective (2026-08-26): aux_dir is the
+        # unit direction the auxiliary loss encourages the actor toward
+        # (unit(_last_known_vel), swarm-wide so identical across agents at a
+        # given row -- stored per-agent anyway to match every other field's
+        # shape/indexing); in_search flags which rows it actually applies to
+        # (steps_since_contact > 0). Both are inert (never read) unless
+        # AUX_DIR_COEF > 0 in training/train.py.
+        self.aux_dir = {a: np.zeros((n, 3), np.float32) for a in self.agents}
+        self.in_search = {a: np.zeros(n, np.float32) for a in self.agents}
         self.ptr = 0
 
-    def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value_dict):
+    def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value_dict,
+              aux_dir_dict, in_search_dict):
         i = self.ptr
         for a in self.agents:
             self.obs[a][i] = obs_dict[a]
@@ -31,6 +41,8 @@ class RolloutBuffer:
             self.logp[a][i] = logp_dict[a]
             self.rewards[a][i] = rew_dict[a]
             self.values[a][i] = value_dict[a]
+            self.aux_dir[a][i] = aux_dir_dict[a]
+            self.in_search[a][i] = in_search_dict[a]
         self.joint_obs[i] = joint_obs
         self.dones[i] = done
         self.ptr += 1
@@ -59,4 +71,6 @@ class RolloutBuffer:
             torch.as_tensor(self.logp[agent]),
             torch.as_tensor(adv),
             torch.as_tensor(ret),
+            torch.as_tensor(self.aux_dir[agent]),
+            torch.as_tensor(self.in_search[agent]),
         )

@@ -47,6 +47,40 @@ LR = 3e-4
 # arm of the matched-seed comparison this was built for; do not change
 # this default without the comparison's own result in hand.
 CRITIC_LR = float(os.environ.get("CRITIC_LR", LR))
+
+# Search-direction auxiliary objective (2026-08-26): follow-on to the
+# actor-search-dynamics investigation (see PHASE2_CHECKPOINT.md /
+# EXPERIMENT_LOG.md). A correction-quality diagnostic on natural loss
+# events found PPO's directional corrections beat a same-state random
+# rotation 61-62% of the time (real, non-random judgment) but only
+# converted to sustained positive progress 3.3-4.5% of the time for
+# agents that stayed unproductive, vs 61.6-69.8% for agents that
+# eventually became productive -- weak but genuine directional judgment,
+# not "no objective at all." A quick separability check (logistic
+# regression on the raw pre-correction observation, AUC=0.834 vs a 0.5
+# chance/0.786 majority-class baseline) confirmed the agent-observable
+# state already contains substantial information the policy isn't fully
+# exploiting -- ruling out "the observation doesn't contain enough
+# information" as the explanation. This adds a small auxiliary actor loss
+# term, active only during search (steps_since_contact > 0), encouraging
+# the actor's current mean action direction toward unit(_last_known_vel)
+# -- a cue already shown to correlate with PPO's own successful corrections
+# (0.292 vs 0.175 pooled, 0.410 vs 0.256 on matched failure states) and
+# available to the agent without touching ground truth. Deliberately NOT
+# a reward-shaping term (the credit-assignment diagnostic found the
+# analogous ground-truth-free reward proxy has ~44.8% sign mismatch with
+# true progress -- too unreliable to reward) and NOT imitation of the
+# scripted controller (no hard-coded action target, only a directional
+# nudge the policy can override). Env-var overridable, defaults to 0.0 (a
+# verified no-op -- see AUX_DIR_COEF's use below, the term is multiplied
+# by this coefficient and contributes exactly nothing when it's 0).
+# 0.01 (the treatment value used for the matched-seed comparison this was
+# built for) was sized by comparing to this project's own logged
+# actor_loss magnitude (median 0.04, p90 0.11 across a real run) rather
+# than guessed outright -- a starting point, not a tuned value; the first
+# thing to revisit if the ablation shows a real but under- or over-shot
+# effect.
+AUX_DIR_COEF = float(os.environ.get("AUX_DIR_COEF", 0.0))
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
@@ -264,6 +298,18 @@ def main():
                 values = critic(jobs).squeeze(0)
                 value_dict = {a: values[agent_idx[a]].item() for a in AGENTS}
 
+                # Search-direction auxiliary objective (2026-08-26): captured
+                # from the state the action above was actually chosen from,
+                # before stepping -- steps_since_contact/_last_known_vel are
+                # swarm-wide (identical for every agent this step), see
+                # AUX_DIR_COEF's comment above. Inert data (never read) when
+                # AUX_DIR_COEF is left at its default 0.0.
+                in_search_now = float(env._steps_since_contact > 0)
+                lkv_norm = float(np.linalg.norm(env._last_known_vel))
+                aux_dir_now = (env._last_known_vel / lkv_norm).astype(np.float32) if lkv_norm > 1e-6 else np.zeros(3, np.float32)
+                aux_dir_dict = {a: aux_dir_now for a in AGENTS}
+                in_search_dict = {a: in_search_now for a in AGENTS}
+
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
             done = any(terms.values()) or any(truncs.values())
             # any(terms.values()) is true for EITHER a real collision or a
@@ -292,7 +338,8 @@ def main():
                 for a in AGENTS:
                     rewards[a] = rewards[a] + GAMMA * boot_values[agent_idx[a]].item()
 
-            buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict)
+            buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict,
+                      aux_dir_dict, in_search_dict)
             # Sum across whichever agents were alive this step -- same
             # agent-step denominator as action_count, so mean_brake_reduction
             # (below) is directly comparable to mean_action_abs: how much of
@@ -393,6 +440,7 @@ def main():
 
         last_actor_loss, last_critic_loss = 0.0, 0.0
         last_approx_kl, last_clip_frac = 0.0, 0.0
+        last_aux_loss, last_aux_cos, last_aux_frac = 0.0, float("nan"), 0.0
         if buf.ptr == ROLLOUT_LEN:
             # Linear LR anneal to 0 over training -- constant with a
             # collapsing action std means the same gradient step moves the
@@ -426,11 +474,13 @@ def main():
             # reward stream and critic head), only the actor's training
             # batch is combined.
             o_list, jo_list, act_list, old_logp_list, adv_list, ret_list, head_list = [], [], [], [], [], [], []
+            aux_dir_list, in_search_list = [], []
             for a in AGENTS:
-                o, jo, act, old_logp, adv, ret = buf.get_tensors(a, last_value_dict[a])
+                o, jo, act, old_logp, adv, ret, aux_dir_a, in_search_a = buf.get_tensors(a, last_value_dict[a])
                 o_list.append(o); jo_list.append(jo); act_list.append(act)
                 old_logp_list.append(old_logp); adv_list.append(adv); ret_list.append(ret)
                 head_list.append(torch.full((o.shape[0],), agent_idx[a], dtype=torch.long))
+                aux_dir_list.append(aux_dir_a); in_search_list.append(in_search_a)
 
             o = torch.cat(o_list).to(DEVICE)
             jo = torch.cat(jo_list).to(DEVICE)
@@ -439,6 +489,8 @@ def main():
             adv = torch.cat(adv_list).to(DEVICE)
             ret = torch.cat(ret_list).to(DEVICE)
             head_idx = torch.cat(head_list).to(DEVICE)
+            aux_dir = torch.cat(aux_dir_list).to(DEVICE)
+            in_search = torch.cat(in_search_list).to(DEVICE) > 0.5
 
             n = o.shape[0]
             stop_early = False
@@ -447,11 +499,31 @@ def main():
                 epoch_kls = []
                 for start in range(0, n, BATCH_SIZE):
                     b = idx[start:start + BATCH_SIZE]
-                    logp, entropy = actor.evaluate(o[b], act[b])
+                    logp, entropy, mean_dir = actor.evaluate(o[b], act[b])
                     ratio = torch.exp(logp - old_logp[b])
                     s1 = ratio * adv[b]
                     s2 = torch.clamp(ratio, 1 - CLIP, 1 + CLIP) * adv[b]
-                    actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean()
+
+                    # Search-direction auxiliary objective (2026-08-26) --
+                    # see AUX_DIR_COEF's comment above. mean_dir is
+                    # gradient-connected to the actor's CURRENT parameters
+                    # (unlike the buffer's stored, already-sampled action),
+                    # which is what an objective on "what does the policy
+                    # currently intend" must use. Restricted to in-search
+                    # rows only (in_search[b]) -- inert (mask never true)
+                    # outside active search, by construction.
+                    search_mask = in_search[b]
+                    if search_mask.any():
+                        aux_cos = torch.nn.functional.cosine_similarity(
+                            mean_dir[search_mask], aux_dir[b][search_mask], dim=-1)
+                        aux_loss = (1.0 - aux_cos).mean()
+                        last_aux_cos = aux_cos.mean().item()
+                    else:
+                        aux_loss = torch.zeros((), device=o.device)
+                        last_aux_cos = float("nan")
+                    last_aux_frac = search_mask.float().mean().item()
+
+                    actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean() + AUX_DIR_COEF * aux_loss
 
                     value_pred = critic(jo[b])[torch.arange(len(b)), head_idx[b]]
                     critic_loss = ((value_pred - ret[b]) ** 2).mean()
@@ -478,6 +550,7 @@ def main():
                     last_actor_loss = actor_loss.item()
                     last_critic_loss = critic_loss.item()
                     last_entropy = entropy.mean().item()
+                    last_aux_loss = aux_loss.item()
 
                     # Per-minibatch check, not just per-epoch: the previous
                     # version only stopped between epochs, so a single bad
@@ -575,7 +648,8 @@ def main():
                   f"brake_pen={comp_avgs['brake']:.1f}] "
                   f"critic[v={critic_v_mean:.1f}±{critic_v_std:.2f} tgt={critic_target_mean:.1f}±{critic_target_std:.1f} "
                   f"pearson={critic_pearson:.3f} spearman={critic_spearman:.3f} "
-                  f"final_sat={critic_final_sat_frac*100:.0f}% pre_std={critic_final_pre_std:.2f}]")
+                  f"final_sat={critic_final_sat_frac*100:.0f}% pre_std={critic_final_pre_std:.2f}] "
+                  f"aux[coef={AUX_DIR_COEF:.3f} loss={last_aux_loss:.4f} cos={last_aux_cos:.3f} frac_insearch={last_aux_frac:.3f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, target_lost_rate=target_lost_rate,
@@ -602,7 +676,9 @@ def main():
                      critic_v_min=critic_v_min, critic_v_max=critic_v_max,
                      critic_target_mean=critic_target_mean, critic_target_std=critic_target_std,
                      critic_pearson=critic_pearson, critic_spearman=critic_spearman,
-                     critic_final_sat_frac=critic_final_sat_frac, critic_final_pre_std=critic_final_pre_std)
+                     critic_final_sat_frac=critic_final_sat_frac, critic_final_pre_std=critic_final_pre_std,
+                     aux_dir_coef=AUX_DIR_COEF, aux_loss=last_aux_loss, aux_cos=last_aux_cos,
+                     aux_frac_insearch=last_aux_frac)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 

@@ -64,7 +64,14 @@ class Actor(nn.Module):
         # overstates true action-space randomness. -logp is a Monte Carlo
         # estimate of entropy under the real (squashed) distribution.
         entropy = -logp
-        return logp, entropy
+        # mean_dir (2026-08-26, search-direction auxiliary objective): the
+        # policy's current mean action direction, gradient-connected to
+        # THIS forward pass -- unlike the buffer's stored `action` (sampled
+        # during rollout collection under old parameters, detached from the
+        # actor being updated now), this is what an auxiliary loss on
+        # "which direction does the policy currently intend" must use.
+        mean_dir = torch.tanh(mu)
+        return logp, entropy, mean_dir
 
 
 class CentralCritic(nn.Module):

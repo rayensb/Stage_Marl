@@ -14,7 +14,8 @@ FIELDS = ["total_steps", "episode", "avg_reward", "collision_rate", "target_lost
           "mean_brake_passes", "max_brake_violation", "mean_brake_solo", "mean_brake_multi",
           "critic_lr", "critic_v_mean", "critic_v_std", "critic_v_min", "critic_v_max",
           "critic_target_mean", "critic_target_std", "critic_pearson", "critic_spearman",
-          "critic_final_sat_frac", "critic_final_pre_std"]
+          "critic_final_sat_frac", "critic_final_pre_std",
+          "aux_dir_coef", "aux_loss", "aux_cos", "aux_frac_insearch"]
 
 def init_logger(run_id=""):
     """run_id suffixes the log filename so parallel runs (e.g. different
