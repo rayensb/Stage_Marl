@@ -100,6 +100,17 @@ def run_episode(env, actors, device, seed, record=False):
     reacquisition_times = []
     was_in_contact = True  # episodes always start in contact by construction (see reset())
 
+    # Productive-agent diagnostic (2026-08-26, added to evaluate the
+    # search-direction auxiliary objective) -- per loss event, an agent
+    # counts as "productive" if its own true distance to the target ever
+    # dropped below its distance at the moment contact was lost
+    # (start_dist - min_dist > 0), matching the definition used throughout
+    # the actor search-dynamics investigation (see EXPERIMENT_LOG.md).
+    # Ground-truth-based, diagnostic/eval-only, same as tracking_rmse above
+    # -- never fed into reward or observation.
+    productive_agent_counts = []  # one entry per loss event this episode, 0..NUM_AGENTS
+    event_start_dist, event_min_dist = {}, {}
+
     while True:
         act_dict = {}
         with torch.no_grad():
@@ -108,8 +119,11 @@ def run_episode(env, actors, device, seed, record=False):
                 act, _ = actors[a].get_action(o, deterministic=True)
                 act_dict[a] = act.squeeze(0).cpu().numpy()
 
+        true_dists_this_step = {}
         for a in env.agents:
-            track_errors.append(abs(float(np.linalg.norm(env.pos[a] - env.pos_t)) - TARGET_DIST))
+            d = float(np.linalg.norm(env.pos[a] - env.pos_t))
+            true_dists_this_step[a] = d
+            track_errors.append(abs(d - TARGET_DIST))
             speeds.append(float(np.linalg.norm(env.vel[a])))
         swarm = env.get_swarm_stats()
         spacing_stds.append(swarm["std_pairwise"])
@@ -138,12 +152,22 @@ def run_episode(env, actors, device, seed, record=False):
                 reacquisition_times.append(current_loss_streak)
                 if current_loss_streak <= LOST_TIMEOUT_STEPS:
                     reacquisitions_within_timeout += 1
+                if event_start_dist:
+                    productive_agent_counts.append(sum(
+                        1 for a in event_start_dist
+                        if event_start_dist[a] - event_min_dist.get(a, event_start_dist[a]) > 0))
+                event_start_dist, event_min_dist = {}, {}
             current_contact_streak += 1
             current_loss_streak = 0
             contact_steps += 1
         else:
             if was_in_contact:
                 loss_events += 1
+                event_start_dist = dict(true_dists_this_step)
+                event_min_dist = dict(true_dists_this_step)
+            else:
+                for a, d in true_dists_this_step.items():
+                    event_min_dist[a] = min(event_min_dist.get(a, d), d)
             current_loss_streak += 1
             current_contact_streak = 0
         longest_contact_streak = max(longest_contact_streak, current_contact_streak)
@@ -156,6 +180,15 @@ def run_episode(env, actors, device, seed, record=False):
         # directly (which would stop this loop even when the env itself
         # was told to keep going).
         if not env.agents:
+            # Episode ended mid-loss-event (never reacquired) -- finalize
+            # that event's productive-agent count too, same as the normal
+            # reacquisition path above, so it isn't silently dropped from
+            # the distribution.
+            if event_start_dist:
+                productive_agent_counts.append(sum(
+                    1 for a in event_start_dist
+                    if event_start_dist[a] - event_min_dist.get(a, event_start_dist[a]) > 0))
+                event_start_dist, event_min_dist = {}, {}
             break
 
     track_errors_arr = np.array(track_errors, dtype=float)
@@ -195,6 +228,7 @@ def run_episode(env, actors, device, seed, record=False):
     raw = {
         "track_errors": track_errors_arr,
         "reacquisition_times": np.array(reacquisition_times, dtype=float),
+        "productive_agent_counts": np.array(productive_agent_counts, dtype=float),
     }
     return metrics, trajectory, raw
 
@@ -228,12 +262,14 @@ def main():
     rows = []
     all_track_errors = []
     all_reacquisition_times = []
+    all_productive_agent_counts = []
     for ep in range(args.episodes):
         metrics, traj, raw = run_episode(env, actors, args.device, seed=args.seed + ep,
                                            record=(ep == 0 and args.save_trajectory is not None))
         rows.append(metrics)
         all_track_errors.append(raw["track_errors"])
         all_reacquisition_times.append(raw["reacquisition_times"])
+        all_productive_agent_counts.append(raw["productive_agent_counts"])
         if traj is not None:
             np.savez(args.save_trajectory,
                      **{k: np.array([t[k] for t in traj]) for k in traj[0]})
@@ -270,6 +306,7 @@ def main():
     # statistic than the true P95 over every sample actually observed).
     pooled_track_errors = np.concatenate(all_track_errors) if all_track_errors else np.array([])
     pooled_reacq_times = np.concatenate(all_reacquisition_times) if all_reacquisition_times else np.array([])
+    pooled_productive_counts = np.concatenate(all_productive_agent_counts) if all_productive_agent_counts else np.array([])
 
     summary = {
         "episodes": args.episodes,
@@ -322,6 +359,15 @@ def main():
         "max_reacquisition_steps": float(pooled_reacq_times.max()) if len(pooled_reacq_times) else 0.0,
         "mean_reacquisition_sec": float(pooled_reacq_times.mean() * DT) if len(pooled_reacq_times) else 0.0,
         "p95_reacquisition_sec": float(np.percentile(pooled_reacq_times, 95) * DT) if len(pooled_reacq_times) else 0.0,
+        # --- productive-agent diagnostic (2026-08-26) ---
+        # One sample per loss event (pooled across the whole batch, same
+        # "pool first" reasoning as reacquisition times above): how many of
+        # NUM_AGENTS ever closed on the true target during that event.
+        # productive_agent_fraction is mean_productive_agents / NUM_AGENTS,
+        # a 0-1 scale matching the other rate metrics in this summary.
+        "mean_productive_agents": float(pooled_productive_counts.mean()) if len(pooled_productive_counts) else 0.0,
+        "productive_agent_fraction": float(pooled_productive_counts.mean() / NUM_AGENTS) if len(pooled_productive_counts) else 0.0,
+        "frac_events_zero_productive": float((pooled_productive_counts == 0).mean()) if len(pooled_productive_counts) else 0.0,
     }
 
     print("\n=== Evaluation summary (deterministic, no exploration) ===")
