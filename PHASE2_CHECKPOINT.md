@@ -573,6 +573,59 @@ near-constant function of state. All three pieces point the same direction indep
 numbers reported to the user directly; not yet written into `docs/ai_context/EXPERIMENT_LOG.md`
 (gated to explicit "document all" requests) or acted on.
 
+## Update 2026-08-26 (later still): three more diagnostics narrow the actor-execution problem to "weak but real directional judgment," not heading choice or entrenchment
+
+Before proposing the estimate-progress reward the credit-assignment diagnostic motivated, a design
+catch stopped it: that reward would have to use ground truth (`env.pos_t`) to compute boundary
+progress, which the project's established rule forbids (`_get_reward`/`_get_obs` must never read
+`self.pos_t` -- the same class of bug a supervisor review caught once for `r_safety`). The only
+legitimate (agent-observable) proxy -- progress toward the agent's own synthetic waypoint -- turned
+out much weaker (r~0.09-0.11 vs ground-truth's r~0.29-0.31), and a sign-mismatch check found an
+estimate-progress reward would reward a step actually moving away from the true target ~44.8% of
+the time. Reward shaping was shelved pending further diagnosis, not implemented.
+
+**Search-heading quality** (`search_heading_quality_diagnostic.py`): the assigned search heading's
+own alignment with the true target is statistically indistinguishable between successful and
+failed events (-0.040 vs -0.045 pooled; -0.007 vs -0.006 on the 16/12 exact matched states) --
+heading *choice* isn't the differentiator. A last-known-velocity-vs-random-heading counterfactual
+from the same 16 real failure states confirmed this directly: both reach 100% reacquisition in a
+mean 1.4 steps, identically -- heading source doesn't matter at all this close to the sensor
+boundary (min true dist ~7.88-7.90m either way). What *is* real and consistent across two datasets:
+PPO's actual action aligns more with true target velocity and with last-known-velocity in
+successful events than failed ones (last-known-vel: 0.292 vs 0.175 pooled, 0.410 vs 0.256 on the
+matched states) -- confidence-bucketed, this alignment *increases* as confidence falls in
+target_lost events (0.163->0.180->0.197), the opposite of losing access to the cue.
+
+**Directional entrenchment, tested and rejected** (`directional_entrenchment_diagnostic.py`): the
+rising alignment above looked like escalating commitment to a (mediocre) heading. Directly
+measured instead: P(a >45deg direction change at step t | consecutive bad streak ending at t-1)
+spikes right after progress turns negative (14.4% at streak 1-5) then flattens at a low, roughly
+constant 5.5-6.8% for streak 6-10/11-20/21+ -- no escalating refusal to reconsider. Per-agent,
+persistently-unproductive agents actually correct *more* than eventually-productive ones (42.3% vs
+31.1% ever-corrected during a sustained bad streak; 5.77 vs 1.76 mean corrections each) -- the
+opposite of the entrenchment hypothesis. Retired.
+
+**Correction quality -- the decisive result** (`correction_quality_diagnostic.py`, n=2006 real
+corrections + a 150-correction branched null test against random-direction rotations from the
+identical state): corrections made by eventually-productive agents lead to sustained positive
+progress 62-70% of the time (5/10/20-step windows); corrections made by persistently-unproductive
+agents lead to sustained positive progress only 3.3-4.5% of the time -- a ~15-20x gap, the cleanest
+split in this whole investigation. The null test shows PPO's actual chosen direction beats a
+same-state random rotation 61-62% of the time, consistently across window lengths -- real,
+non-random directional judgment, not pure noise -- but absolute success remains low even for real
+corrections (pooled P(sustained+) ~12-13%, matching a weighted blend of the two agent classes
+above). **Synthesis: PPO exercises genuine but weak directional judgment during search --
+meaningfully better than chance, but not good enough, especially exactly for the agents already in
+trouble.** Not "wandering" (beats random) and not "purposeful and effective" (mostly fails anyway)
+-- a real middle case.
+
+**Status**: no fix proposed or attempted at any point in this chain, per explicit instruction each
+time. The investigation has now localized the problem about as precisely as diagnosis alone can:
+target_lost during active search traces to the learned actor's own directional judgment during
+correction being real-but-weak, not to heading initialization, timeout, critic, or entrenchment/
+persistence. What (if anything) to do about it is an open question for the user -- no direction
+chosen yet.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
