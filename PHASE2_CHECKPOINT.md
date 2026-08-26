@@ -529,6 +529,50 @@ user request. Also corrected a stale claim that had persisted across three days 
 `origin/main` was actually fast-forwarded to `phase2-combined` (`8b724bb`) on 2026-08-23, not
 "still behind" as several files continued to say.
 
+## Update 2026-08-26 (later still): credit-assignment diagnostic -- confirms a long-horizon signal problem, not yet a fix
+
+Direct follow-on to the decisive counterfactual above, per explicit supervisor-style request:
+"why does PPO learn such an ineffective search policy, given the states are demonstrably
+recoverable." Used the identical 16 real PPO-failure loss-onset states, the real trained critic
+(`checkpoints/latest_1.pt` for `search_v2_seed1`, not a substitute), and training's own exact
+GAE formula (`gamma=0.99`, `lambda=0.95`, copied from `training/buffer.py`) -- all local,
+read-only, no production changes (`/tmp/.../scratchpad/credit_assignment_diagnostic.py`).
+
+**Bug caught and fixed before trusting any number**: `counterfactual_from_ppo_states.py`'s
+`BRANCH_CAP = LOST_TIMEOUT_STEPS` (120) is one step short of where `_target_lost` actually
+fires (`steps_since_contact > LOST_TIMEOUT_STEPS`, i.e. step 121) -- doesn't change that
+experiment's 0%-vs-100% reacquisition conclusion (nothing reacquires on one extra ramp-maxed
+no-op step), but this diagnostic specifically needed the true terminal step, so `BRANCH_CAP` is
+`+1` here. Confirmed fixed: terminal-step `contact` component now reads exactly -230.00 for
+still-lost PPO branches (-30 ramp + -200 `TARGET_LOST_PENALTY`, matches `config.py` exactly).
+
+**Result**: one-step reward difference (scripted - PPO) is small but real, mean +0.36 (vs. mean
+rewards around -11 to -12) -- not literally indistinguishable, but roughly 3-4 orders of
+magnitude smaller than the multi-step gap: mean discounted return difference +1716, undiscounted
++3460. Component breakdown of the multi-step gap: `contact` (+2045, the terminal penalty plus
+~120 steps of ramp difference) and `track` (+1513, PPO's swarm keeps accumulating tracking-error
+cost while still lost) are the two dominant drivers; `safety` actually runs slightly the other
+way (-112, a secondary effect, not investigated further). GAE advantage of the actual first
+action taken: PPO's own first action scores -110.7 on average; scripted's counterfactual first
+action from the identical state scores -4.2 -- scripted's advantage is higher in 16/16 states.
+**V(s) at the loss-onset state is -876.51 with std=0.0000 across all 16 -- a fresh, independent
+reconfirmation of the critic-saturation finding** (the critic assigns literally the same value
+regardless of which of these 16 different states it's looking at).
+
+Separately, across a fresh natural-event sample (1608 reacquired-event steps, 8092 target_lost-
+event steps), per-step reward barely correlates with a simple progress proxy (reduction in
+distance to the sensor boundary) at all: pearson ~-0.04 to -0.08 in both outcome groups. The
+reward doesn't reward the one thing that actually matters for search, step by step.
+
+**Conclusion (diagnosis only, no fix proposed or attempted, per explicit instruction)**: this is
+real, converging evidence for a long-horizon credit-assignment problem, not (or not only) a
+reward-shaping gap in the ordinary sense -- the per-step reward doesn't discriminate a good
+search step from a bad one, the only real signal is a huge, ~120-step-delayed, all-or-nothing
+outcome, and the critic that's supposed to help propagate that signal has collapsed to a
+near-constant function of state. All three pieces point the same direction independently. Full
+numbers reported to the user directly; not yet written into `docs/ai_context/EXPERIMENT_LOG.md`
+(gated to explicit "document all" requests) or acted on.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
