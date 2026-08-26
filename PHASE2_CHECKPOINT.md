@@ -626,6 +626,50 @@ correction being real-but-weak, not to heading initialization, timeout, critic, 
 persistence. What (if anything) to do about it is an open question for the user -- no direction
 chosen yet.
 
+## Update 2026-08-26 (later still): first actor-side intervention implemented, smoke-tested, awaiting launch go-ahead
+
+Per explicit user decision to leave diagnosis mode: one more small offline check first, then the
+first real intervention. **Separability check** (`separability_check.py`): logistic regression on
+the raw 39-dim pre-correction observation predicting sustained-positive-progress-after-correction
+-- test AUC=0.834 vs a 0.786 majority-class baseline / 0.5 chance. Confirms the agent-observable
+state already contains substantial exploitable information the policy isn't fully using, ruling
+out "not enough information" and justifying an actor-side (not observation-side) intervention.
+
+**Implemented** (commit `a2322ca`): `AUX_DIR_COEF`, a new env-overridable constant in
+`training/train.py` (default `0.0`, verified no-op), adds a small auxiliary actor loss term --
+active only during search (`steps_since_contact > 0`), encouraging the actor's current mean action
+direction toward `unit(_last_known_vel)` -- a cue already shown (this investigation) to correlate
+with PPO's own successful corrections, agent-observable, no ground truth involved. Not reward
+shaping (the credit-assignment diagnostic found the ground-truth-free reward-proxy equivalent has
+~44.8% sign mismatch with true progress) and not imitation of the scripted controller (a directional
+nudge the policy can override via its own gradient, not a hard-coded target). Required threading
+`aux_dir`/`in_search` through `RolloutBuffer` (`training/buffer.py`) and extending
+`Actor.evaluate()` to also return the current mean action direction (`training/networks.py`, the
+only call site, in `train.py`'s minibatch loop, was updated to match) so the auxiliary loss uses a
+gradient-connected quantity, not the buffer's already-sampled (and by then stale) action.
+
+**Smoke-tested, three configurations, all local**: `AUX_DIR_COEF` unset -- clean, `coef=0.000` in
+every logged row, no crash. `AUX_DIR_COEF=1.0` (deliberately exaggerated) -- `aux_cos` climbs
+0.363→0.468→0.969→0.909 across 4 rollouts, confirming the mechanism is correctly wired and
+functionally effective end-to-end, not just non-crashing. `AUX_DIR_COEF=0.01` (the actual intended
+treatment value, sized by comparing to this project's own logged `actor_loss` magnitude -- median
+0.04, p90 0.11 -- rather than guessed outright) -- produces a modest, non-dominating nudge as
+intended. `test_env.py` (N=2/3/4) and `test_geometry.py` both still pass.
+
+**Also added** (commit `3b9a73d`): `productive_agent_fraction`/`mean_productive_agents`/
+`frac_events_zero_productive` to `training/evaluate.py`'s summary output -- per loss event, how
+many of `NUM_AGENTS` ever closed on the true target during that event, ground-truth-based and
+eval-only exactly like `tracking_rmse`, needed to evaluate this intervention against the same
+metric this whole investigation has used to characterize search quality. Smoke-tested against an
+already-trained checkpoint: internally consistent (`mean_productive_agents / NUM_AGENTS ==
+productive_agent_fraction` exactly), sane values for a near-random policy.
+
+**Status**: implementation complete and smoke-tested; **the actual Kaggle launch (matched 3-seed
+baseline-vs-treatment, 3M steps each, current `phase3-resilience` HEAD config) has not been
+started** -- awaiting a final go-ahead from the user before spending Kaggle compute, per this
+project's standing practice of treating "implement/commit" and "spend real compute" as two
+separate approval gates.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
