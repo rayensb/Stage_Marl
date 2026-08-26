@@ -437,9 +437,8 @@ of the project to that point; 1/1 `N=3` clean collision with some `target_lost` 
 seed (a second `N=3` seed, `phase2_n3_seed2`, was run afterward specifically to check whether
 that noise was real or seed-variance — it wasn't, see `EXPERIMENT_LOG.md`); 1/1 `N=2` clean.
 **Status**: this is the validated reference point Phase 3 (below) branches from. `main` itself
-was not fast-forwarded to it in this pass — a manual `git push origin phase2-combined:main` is
-still pending (blocked by the permission classifier on a direct push from the agent; verified
-as a clean fast-forward, no conflicts) — see `TODO.md`.
+was not fast-forwarded to it in this pass, but was in a later one (`origin/main` reached
+`8b724bb` on 2026-08-23, a clean fast-forward, no conflicts) — see `ENVIRONMENT.md`.
 
 ## Phase 3: bundling five sustained-flight changes as an explicit "leap of faith," not a lapse
 
@@ -654,7 +653,99 @@ committed regression test, `test_brake_relative_velocity.py`, instead of re-runn
 one-off manual check. Both pass: `COLLISION_DIST` never breached, residual violation ~0
 (exactly 0 for the 2-agent case, ~4e-8 — float-precision noise — for the 4-agent case). Standard
 local smoke tests (`test_geometry.py`, `test_env.py` at `N=2/3/4`) also pass clean.
-**Status**: implemented and adversarially verified; **not yet confirmed at training scale** — a
-3-seed/3M-step Kaggle validation is in progress (`stage-marl-brake-relvel-s{1,2,3}`,
-`LOST_TIMEOUT_SEC` left at its current default so this isolates the brake change alone). See
-`EXPERIMENT_LOG.md`/`SESSION_HANDOFF.md` for live status.
+**Status**: implemented and adversarially verified, but **reverted after full-scale testing found
+it net-harmful to training convergence** — see the dedicated entry below for the full result and
+reasoning. The relative-velocity idea itself isn't disproven as a concept (the mechanism for why
+it broke convergence was never found), just deprioritized. See `EXPERIMENT_LOG.md` for the
+per-seed data.
+
+## Relative-velocity brake reverted after full-scale testing found it net-harmful to convergence
+
+**Decision**: reverted `_apply_brake`'s relative-velocity `v_closing` formulation back to the
+original one-sided `dot(v_a, dir_to_b)` formula (commit `55e7232`), after a 7-seed Kaggle
+validation found it broke training convergence far more often than the old formula did on
+matched seeds.
+**What the validation found**: all 3 seeds with a direct old-brake baseline (`t8-s1`, `t8-s2`,
+`t10-s3`) flipped from a clean 3/3 convergence record under the old brake to a clean 0/3 record
+under the new one, on identical seeds, deterministic training — not the usual bimodal
+seed-variance pattern this project has seen elsewhere, strong evidence the brake change itself
+was causally responsible, not incidental. 6 of 7 total seeds failed to converge at all, including
+both `NUM_AGENTS=3` deployment-target seeds (99%/96% `target_lost`) — the fix left no
+deployment-ready checkpoint at any tested configuration.
+**Leading hypothesis tested directly and refuted**: that the new formula reads roughly 2x the
+closing speed under symmetric approach and so engages/penalizes much harder, pushing the policy
+away from the tight convergence it needs. Compared `search-t8-s1` (old brake, converged) against
+`brake-relvel-t8-s1` (new brake, same seed, failed) at the final training row: `r_brake` was only
+marginally more negative (-0.091 vs -0.129), and `mean_brake_reduction` was actually *smaller* in
+the failed run (0.0025 vs 0.0008) — the brake barely engages in the failed run, most likely
+because the swarm never converges close enough to need it (`avg_min_dist` 6.57 vs 8.14, wider not
+tighter). This rules out "harsher direct penalty" as the mechanism.
+**Why revert rather than keep investigating**: the root cause is still not understood — would
+need reward-component *trajectories* over the course of training (not just a final-row snapshot)
+to see where the two runs' paths first diverge, not yet done. Given deployment-readiness was the
+more urgent priority (no working `N=3` checkpoint existed either way — see the network-capacity
+sweep below) and the new brake had no confirmed safety benefit to weigh against its cost (its one
+converged run, `t8-s3`, still showed 10% collision — no better than the old brake's typical
+range), continuing to chase an unexplained convergence-breaking mechanism was judged not worth
+delaying deployment-readiness work further.
+**What's kept**: `test_brake_relative_velocity.py` stays as a general regression test — both its
+scenarios are symmetric, so the reverted (old) formula already handles them cleanly; the test
+isn't tied to the new formula specifically. The full tried-and-reverted story is recorded in
+`_apply_brake`'s CAUTION comment for whoever revisits this.
+**Status**: reverted, not deleted. See `EXPERIMENT_LOG.md` for the full per-seed result table and
+`KNOWN_ISSUES.md` item 13.
+
+## ACTOR_HIDDEN/CRITIC_HIDDEN made env-overridable to isolate network capacity as a variable
+
+**Decision**: `config.py`'s Actor/Critic hidden widths, hardcoded at 128/256 since Phase 3,
+became `ACTOR_HIDDEN = int(os.environ.get("ACTOR_HIDDEN", 128))` / `CRITIC_HIDDEN =
+int(os.environ.get("CRITIC_HIDDEN", 256))` (commit `55e7232`), threaded through
+`train.py`/`evaluate.py`/`diagnose_horizon.py`.
+**Why now**: the 128/256 jump from Phase 3's original 64/128 was bundled into a 5-change "leap of
+faith" (see the Phase 3 entry above) and never isolated, even after the bundle was broadly
+accepted — "a starting guess... not measured" was still true of it after two more investigation
+passes. With the brake reverted and a stable baseline back in hand, isolating it became cheap: a
+5-kernel sweep (`n4-{small,medium,large}`, `n3-{medium,large}`) needed only an env var, not a
+code branch per size.
+**Deliberately not touched**: `deployment/sim_demo.py`/`inference_node.py` still hardcode
+`Actor(OBS_DIM, ACT_DIM)`, i.e. assume the 128 default — fine while nothing has been
+deployment-tested yet, but whoever wires up an eventual winning checkpoint needs to either match
+its hidden width there or update those two files the same way.
+**Result**: validated the 128/256 default was already correct for `N=4` — smaller (64/128)
+partially degrades tracking, larger (256/512) collapses learning almost entirely. See
+`EXPERIMENT_LOG.md`'s network-capacity-sweep entry.
+**Status**: resolved for `N=4` — defaults unchanged, env-override capability kept as useful
+infrastructure regardless. Still open for `N=3`, where neither tested size learns anything at
+all — see `KNOWN_ISSUES.md`.
+
+## CRITIC_LR ablation — tested and rejected as a general recovery fix
+
+**Decision**: added a separate, env-overridable `CRITIC_LR` (`training/train.py`, commit
+`71327be`, defaults to the actor's `LR` so default behavior is unchanged), specifically to test
+whether a smaller critic learning rate — found in local diagnostics to prevent the production
+critic's final-Tanh-layer saturation over a short reproduction budget — would also improve real
+training behavior at full scale. After a matched 3-seed Kaggle comparison, **decided not to
+adopt `CRITIC_LR=1e-5`, or any non-default value, and to stop pursuing further critic-LR/
+critic-loss/critic-architecture experiments without new evidence specifically motivating them.**
+**Why tested despite being a fairly deep, indirect hypothesis**: a chain of local diagnostics
+(forced-loss masking, PPO-vs-scripted instrumentation, a value/critic diagnostic, a mechanism
+diagnostic, a per-update-trajectory + architecture-variant sweep, a properly stratified LR
+sweep — see `EXPERIMENT_LOG.md` for each) had built up real, reproducible evidence that the
+critic's value predictions were collapsing to a near-constant early in training, and that critic
+LR specifically (not loss function, not architecture) controlled the onset. That's strong enough
+mechanistic evidence to justify a real, full-scale test rather than dismissing it on priors — but
+the instruction going in was explicit: don't declare it a fix before the data says so.
+**Why rejected despite the mechanism being real**: at full 3M-step scale, saturation was only
+*delayed*, not prevented (all 3 treatment seeds reached 100% final-layer saturation again by the
+end of the run), and behavioral results were a mixed bag rather than a clean win — one seed
+traded a real tracking improvement for a new collision cost, two seeds showed no improvement or a
+regression, and `mean_reacquisition_steps` was worse under `CRITIC_LR=1e-5` in all three matched
+pairs, the single most consistent effect in the entire dataset and one that points *against* the
+treatment. A real, measured, reproducible mechanism (critic saturation) does not automatically
+imply that fixing it is the dominant lever on behavior — this is the concrete case that taught
+that distinction in this project.
+**Status**: resolved — rejected. `CRITIC_LR`'s default is unchanged (still equals `LR`); the
+critic-health diagnostic columns added to `training_log.csv` alongside it stay, since they're
+useful instrumentation independent of this specific ablation's outcome. Investigation moved to
+the actor's own search-action dynamics, which located the dominant cause — see
+`EXPERIMENT_LOG.md`'s decisive counterfactual-from-PPO-states entry.

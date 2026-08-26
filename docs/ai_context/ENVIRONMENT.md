@@ -48,11 +48,13 @@ Verified via direct inspection this session:
 
 - Origin: `https://github.com/rayensb/Stage_Marl.git` (note: this is the *repo's* org/name —
   the Kaggle account username is different, see below, don't conflate the two).
-- Default branch: `main`, currently at `b59c139` — **substantially behind** the work described
-  in this doc suite. `phase2-combined` (validated) and `phase3-resilience` (in-progress) both
-  branch off points well past `main`. A manual `git push origin phase2-combined:main` is
-  still pending (blocked by the permission classifier on a direct push from the agent —
-  verified as a clean fast-forward, no conflicts) — see `TODO.md`.
+- Default branch: `main`. **`origin/main` was fast-forwarded to `phase2-combined` (`8b724bb`) on
+  2026-08-23** — no longer behind, correcting a claim ("still at `b59c139`, substantially
+  behind") that persisted across several doc passes after the push actually happened. Note that
+  a local `main` ref in a given worktree/clone can still show an older commit until someone
+  checks it out and pulls — check `origin/main` directly (`git log --oneline -1 origin/main`,
+  after a `git fetch`) rather than trusting a local `main` ref or an older doc claim.
+  `phase3-resilience` (current work) branches off `phase2-combined`, i.e. off this same point.
 - **Feature-branch workflow, now used repeatedly, not just once**: `vision-tracking` (merged),
   `n-aware-margin` and `xyz-spread` (hypothesis branches, merged into `phase2-combined`),
   `xyz-spread-fixed` (isolated angle-bug retest, not merged — its finding was "no measurable
@@ -143,7 +145,11 @@ Verified via direct inspection this session:
 | `DEVICE` | `cpu` | Training device (`cpu` or `cuda`); CPU is the measured-optimal default on Kaggle. |
 | `TOTAL_STEPS` | `600_000` | Total training steps; env-var overridable (this session has used up to 5,000,000). |
 | `MAX_STEPS` | `1800` (was `200`) | **New 2026-08-20 (Phase 3).** Episode length in steps (`1800` = 90s at `DT=0.05`, raised from the original 10s after `diagnose_horizon.py` showed tracking degrading past the old horizon). `ROLLOUT_LEN = MAX_STEPS * ROLLOUT_EPISODES` derives from this automatically — see `ARCHITECTURE.md`. |
-| `LOST_TIMEOUT_SEC` | `2.0` | **New 2026-08-20.** Vision-tracking dead-reckoning grace period before `target_lost` termination. Was hardcoded; made overridable after the flat 2.0s value broke badly once `MAX_STEPS` grew 9x (see `KNOWN_ISSUES.md` item 12) — a sweep of 6/10/18 is in progress to find a working value at the new episode length. |
+| `LOST_TIMEOUT_SEC` | `6.0` (was `2.0`) | **New 2026-08-20.** Vision-tracking dead-reckoning grace period before `target_lost` termination. Was hardcoded; made overridable after the flat 2.0s value broke badly once `MAX_STEPS` grew 9x (see `KNOWN_ISSUES.md` item 12). A 6/10/18s sweep found no clean dose-response; default resolved to `6.0` — active search (not this constant) turned out to be the real lever. |
+| `DISABLE_TARGET_LOST_TERMINATION` | `0` (off) | **New 2026-08-21.** Ablation flag — when `1`, `target_lost` still computes/penalizes identically but no longer ends the episode. Tested as a diagnostic (improved `contact_fraction` but made collision safety seed-dependent and unstable) and **not adopted** — leave at the default. See `DECISIONS.md`. |
+| `ACTOR_HIDDEN` | `128` | **New 2026-08-24.** Actor MLP hidden width. Validated by a 5-way network-capacity sweep as a genuine sweet spot for `NUM_AGENTS=4` — see `EXPERIMENT_LOG.md`. |
+| `CRITIC_HIDDEN` | `256` | **New 2026-08-24.** `CentralCritic` trunk hidden width, same sweep as above. |
+| `CRITIC_LR` | equals `LR` (`3e-4`) | **New 2026-08-25.** Separate critic optimizer learning rate. Tested at `1e-5` as a fix for critic-saturation (see `KNOWN_ISSUES.md` item 19) and **rejected** — mixed/inconsistent behavioral effects at full scale. Leave at the default. See `DECISIONS.md`. |
 
 No other env vars are read by the training/eval code as of this writing.
 

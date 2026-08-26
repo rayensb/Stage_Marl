@@ -1,9 +1,13 @@
 # Architecture
 
 Reference, not a copy: exact code lives in the files cited. Structural/conceptual
-descriptions below were verified directly against commit `94216fd`/`3eae55b` on
-`phase3-resilience` (2026-08-22) by reading the actual functions, not from memory of older code
-— trust the file over any specific line number here if it's drifted since.
+descriptions below were verified directly against commit `71327be` on `phase3-resilience`
+(2026-08-26) by reading the actual functions, not from memory of older code — trust the file over
+any specific line number here if it's drifted since. Since the last pass
+(`94216fd`/`3eae55b`): the relative-velocity brake was tested at scale and **reverted**;
+`ACTOR_HIDDEN`/`CRITIC_HIDDEN` and `CRITIC_LR` were added as env-overridable training knobs, the
+former now validated by a network-capacity sweep, the latter tested and rejected as a fix for
+critic saturation (see `DECISIONS.md`/`EXPERIMENT_LOG.md`).
 
 ## Module map
 
@@ -102,15 +106,17 @@ Implements PettingZoo's `ParallelEnv` — all agents act simultaneously each ste
   splitting), logged as `mean_brake_passes`/`max_brake_violation`/`mean_brake_solo`/
   `mean_brake_multi`. `brake_reduction` (speed actually removed) is also fed back into the
   reward as `r_brake` (see below), not just logged.
-  **Relative velocity since 2026-08-22**: `v_closing` is `dot(v_a - v_b, dir_to_b)` — the true
-  mutual closing rate between a pair — not `dot(v_a, dir_to_b)` (a's own velocity toward b,
-  silently treating b as stationary). The correction mechanism itself is unchanged (agent a
-  still unilaterally corrects only its own velocity); only what's measured changed. See
-  `DECISIONS.md` for why this mattered (motivated by real evidence, not just the deployment
-  workstream's theoretical concern about external vehicles) and
-  `test_brake_relative_velocity.py` for the committed regression test. **Adversarially
-  verified; not yet confirmed to reduce `collision_rate` at training scale** — see
-  `EXPERIMENT_LOG.md`.
+  **Relative-velocity formulation tried and reverted (2026-08-22/24)**: `v_closing` was
+  briefly changed to `dot(v_a - v_b, dir_to_b)` (the true mutual closing rate between a pair)
+  instead of `dot(v_a, dir_to_b)` (a's own velocity toward b, silently treating b as stationary).
+  Adversarially verified (`test_brake_relative_velocity.py` still exists as a general regression
+  test — both its scenarios are symmetric, so the reverted formula also passes cleanly), but a
+  7-seed full-scale Kaggle validation found it **net-harmful to training convergence** (6 of 7
+  seeds failed to converge at all, including a clean 3/3→0/3 flip on 3 seeds with direct
+  old-brake baselines) for a mechanism that was never identified. **Reverted to the original
+  one-sided formula (commit `55e7232`)** — current production code again uses `dot(v_a,
+  dir_to_b)`. See `DECISIONS.md`/`EXPERIMENT_LOG.md` for the full result and
+  `KNOWN_ISSUES.md` item 13.
 - **Ground clamp** (`_apply_ground_clamp`, Phase 3, 2026-08-20): the ground-plane counterpart
   to the brake, added because the sim had no ground plane/failure mode at all until this
   point. Single-pass, not multi-pass — the ground doesn't move and can't conflict with itself
@@ -228,25 +234,42 @@ Notable derivations beyond what's already described above (see the file for full
 - `MAX_ACTION_SPEED_Z = 0.6 * MAX_ACTION_SPEED` (Phase 3): a starting guess at a real-ish
   climb-vs-lateral speed ratio, not measured — flagged as the first thing to retune if it
   doesn't move the needle.
-- `LOST_TIMEOUT_SEC`: env-overridable since 2026-08-20 (default still `2.0`, but a sweep of
-  6/10/18s is in progress — see `CURRENT_STATE.md`).
+- `LOST_TIMEOUT_SEC`: env-overridable since 2026-08-20; default resolved to **`6.0`** after a
+  6/10/18s sweep found no clean dose-response (raised from the original flat `2.0`, not all the
+  way to 10/18 — see `EXPERIMENT_LOG.md`). Active search, not the timeout constant, turned out to
+  be the real lever — see `CURRENT_STATE.md`/`KNOWN_ISSUES.md` item 12.
+- `ACTOR_HIDDEN`/`CRITIC_HIDDEN` (2026-08-24): env-overridable Actor/Critic hidden widths,
+  default `128`/`256` (Phase 3's values). Added to isolate network capacity as a variable after a
+  5-way sweep confirmed the default is a genuine sweet spot for `N=4` — see `EXPERIMENT_LOG.md`'s
+  network-capacity-sweep entry.
+- `CRITIC_LR` (2026-08-25): env-overridable critic optimizer learning rate, defaults to the
+  actor's `LR` (so default behavior is unchanged). Added to test whether a smaller critic LR
+  prevents the central critic's value-collapse pathology (see the Training loop section below) —
+  tested and **rejected** as a general fix; default unchanged. See `DECISIONS.md`.
 - `CRUISE_ALT_MIN=1.5`, `CRUISE_ALT_COEF=-10.0`, `Z_SMOOTHING_ALPHA=0.3`: the altitude-comfort
   and vertical-smoothing constants (Phase 3, 2026-08-20) — see `DECISIONS.md`.
 - `TARGET_REDIRECT_INTERVAL_STEPS=500`: dynamic target motion cadence (Phase 3).
 
 ## Networks (`training/networks.py`)
 
-- **`Actor`**: 2-layer MLP, hidden width **128** (raised from 64 in Phase 3, 2026-08-20, as
-  part of the sustained-flight bundle — a larger network was hypothesized as needed to handle
-  the longer episodes/richer dynamics, not measured in isolation). Outputs mean + log_std
-  (clamped to `[LOG_STD_MIN=-2.0, LOG_STD_MAX=0.5]`). Policy is a **tanh-squashed Gaussian** —
-  `get_action()`/`evaluate()` both apply the correct Jacobian log-probability correction.
-  `entropy` in `evaluate()` is `-logp` (Monte Carlo estimate under the true squashed
+- **`Actor`**: 2-layer MLP, hidden width **`ACTOR_HIDDEN`** (env-overridable since 2026-08-24,
+  default **128**, raised from 64 in Phase 3 as part of the sustained-flight bundle). **Now
+  measured, not just hypothesized**: a 5-way network-capacity sweep (2026-08-24) confirmed 128 is
+  a genuine sweet spot for `NUM_AGENTS=4` — a smaller network (64) partially degrades tracking, a
+  larger one (256) collapses learning almost entirely (see `EXPERIMENT_LOG.md`). Outputs mean +
+  log_std (clamped to `[LOG_STD_MIN=-2.0, LOG_STD_MAX=0.5]`). Policy is a **tanh-squashed
+  Gaussian** — `get_action()`/`evaluate()` both apply the correct Jacobian log-probability
+  correction. `entropy` in `evaluate()` is `-logp` (Monte Carlo estimate under the true squashed
   distribution), deliberately not `dist.entropy()` on the pre-squash Gaussian.
-- **`CentralCritic`**: shared `trunk` (hidden width **256**, raised from 128 in Phase 3,
-  same bundle) taking the joint observation (`OBS_DIM * NUM_AGENTS`), then `heads =
-  nn.Linear(hidden, num_agents)` — one scalar value output per agent. Kept at 2x the Actor's
-  hidden width, same ratio as before Phase 3.
+- **`CentralCritic`**: shared `trunk` (hidden width **`CRITIC_HIDDEN`**, env-overridable, default
+  **256**, kept at 2x the Actor's hidden width, same ratio as before Phase 3) taking the joint
+  observation (`OBS_DIM * NUM_AGENTS`), then `heads = nn.Linear(hidden, num_agents)` — one scalar
+  value output per agent. **Known pathology (2026-08-25, confirmed real, demoted to secondary)**:
+  the trunk's final Tanh layer saturates 100% within the first rollout of training regardless of
+  hidden width, collapsing value predictions to a near-constant — a separate, env-overridable
+  `CRITIC_LR` optimizer learning rate (`training/train.py`, defaults to the actor's `LR`) delays
+  but doesn't prevent this over a full run, and a matched Kaggle ablation found no reliable
+  behavioral benefit from lowering it — see `KNOWN_ISSUES.md` item 19, `DECISIONS.md`.
 - **`Actor.get_log_std()`**: returns the clamped `log_std` directly — the diagnostic that
   originally distinguished exploration-noise collapse from action-magnitude saturation and led
   to the closing-speed brake. Unchanged.
@@ -300,6 +323,16 @@ safe on the older criteria but frequently strikes the ground isn't actually the 
 Additional per-rollout diagnostics logged: `log_std_mean`, `mean_action_abs`,
 `mean_brake_reduction`, `target_lost_rate`, and since Phase 1/3: `mean_brake_passes`,
 `max_brake_violation`, `mean_brake_solo`, `mean_brake_multi`, `ground_strike_rate`.
+
+**Critic-health diagnostics (2026-08-25, commit `71327be`)**: every rollout, a random 2000-sample
+subsample of that rollout's own pooled `(joint_obs, return, head_idx)` tensors is used to compute
+`critic_v_mean/std/min/max` (the critic's own value predictions), `critic_target_mean/std` (the
+real returns being regressed toward), `critic_pearson`/`critic_spearman` (value-vs-return
+correlation), and `critic_final_sat_frac`/`critic_final_pre_std` (fraction of the trunk's last
+hidden layer with `|activation| > 0.999`, and that layer's pre-activation standard deviation) —
+built to make the critic-saturation pathology (`KNOWN_ISSUES.md` item 19) checkable against every
+real training rollout, not just diagnostic scripts. Present in `training_log.csv` for any run
+after this commit; absent from older logs.
 
 ## Buffer (`training/buffer.py`)
 
@@ -392,8 +425,16 @@ config.py  ──constants──▶  envs/formation_env.py  ◀──actions─�
   reactive re-planning if a heading turns out to be a poor choice mid-search.
 - **What used to be true and no longer is**: target motion is no longer constant-velocity
   (Phase 3 added periodic redirects); `r_spread` is no longer horizontal-only (now true 3D);
-  the brake is no longer single-pass, and (since 2026-08-22) no longer based on each agent's
-  own velocity alone — it now uses true relative velocity, adversarially verified though not
-  yet training-scale-confirmed; there is no longer "no active search when the swarm loses
+  the brake is no longer single-pass; there is no longer "no active search when the swarm loses
   contact"; there is no longer "no ROS2/Gazebo/PX4 integration" — see the `deployment/` section
   at the top of this document.
+- **What was tried and reverted, so it's worth not assuming**: the brake briefly used true
+  relative velocity (`v_a - v_b`) instead of each agent's own velocity alone (2026-08-22), but
+  this was found net-harmful to training convergence at full scale and **reverted** (2026-08-24,
+  commit `55e7232`) — production code is back to each agent's own velocity toward the other. See
+  `KNOWN_ISSUES.md` item 13.
+- **What's now understood but not fixed**: `target_lost` failures during active search are
+  localized to the learned actor's own search execution — not the environment, search geometry,
+  heading-assignment strategy, timeout length, or critic (all directly ruled out by experiment).
+  No fix has been designed yet. See `KNOWN_ISSUES.md` item 12, `EXPERIMENT_LOG.md`'s decisive
+  counterfactual entry.

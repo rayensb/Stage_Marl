@@ -74,6 +74,15 @@ they're the values currently being swept):
 MAX_STEPS=1800 LOST_TIMEOUT_SEC=10 NUM_AGENTS=4 SEED=1 TOTAL_STEPS=3000000 python training/train.py
 ```
 
+Network-capacity override and a non-default critic learning rate (both added 2026-08-24/25 for
+the critic-collapse/network-capacity investigations — see `ARCHITECTURE.md`/`DECISIONS.md`;
+neither is recommended for routine use, `CRITIC_LR` specifically was tested and rejected as a
+general fix, shown here only as a worked example of the override):
+
+```bash
+ACTOR_HIDDEN=128 CRITIC_HIDDEN=256 CRITIC_LR=1e-5 NUM_AGENTS=4 SEED=1 TOTAL_STEPS=3000000 python training/train.py
+```
+
 Parallel multi-seed runs (the pattern used on Kaggle — run from separate processes/sessions,
 each with its own `SEED`, pinning single-threaded math libs to avoid CPU contention):
 

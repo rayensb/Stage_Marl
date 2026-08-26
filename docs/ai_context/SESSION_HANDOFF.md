@@ -6,256 +6,243 @@ session ends mid-task or reaches a natural checkpoint.
 
 ## Last updated
 
-2026-08-22. Prior entry (2026-08-20) covered the session that resolved the `N=4` collision
-problem, validated it alongside two formation-quality fixes (`phase2-combined`), then bundled
-five sustained-flight changes (`Phase 3`) whose one serious failure (`target_lost_rate` near
-100%) was diagnosed to a stale dead-reckoning timeout and swept on Kaggle. **Since then**: the
-plain timeout sweep concluded with no clean dose-response; active search was built and (after a
-build/launch discipline lapse, caught and corrected) validated as a real, major improvement; a
-`DISABLE_TARGET_LOST_TERMINATION` ablation was tested and not adopted; an active-search + longer
--timeout bracket found the mechanism can reach excellent tracking but exposed a **new**
-collision-safety cost under deterministic execution; that discrepancy was investigated directly
-and explained; the closing-speed brake was reformulated with true relative velocity in response
-and is now in Kaggle validation; two stuck seeds were resumed to 5M steps to test "does more
-training help" (partially yes); and this doc update itself — "document all" — is the most
-recent action.
+2026-08-26. Prior entry (2026-08-22) covered resolving the `N=4` collision problem, validating it
+alongside two formation-quality fixes (`phase2-combined`), bundling five sustained-flight changes
+(Phase 3) whose one serious failure (`target_lost_rate` near 100%) was diagnosed and improved by
+active search, and reformulating the closing-speed brake with relative velocity in response to a
+newly-discovered collision-safety cost under deterministic execution. **Since then, in brief**:
+`main` was fast-forwarded to `phase2-combined` (no longer behind); the relative-velocity brake
+was tested at full scale across 7 seeds and found to break training convergence for an
+unidentified reason — **reverted**; a `NUM_AGENTS=3` deployment-training attempt failed under
+both brake formulations; a network-capacity sweep confirmed Phase 3's hidden-width default is a
+genuine sweet spot for `N=4` but found `N=3` doesn't learn *at all* regardless of size — a new,
+unexplained deployment blocker; a deep supervisor-guided investigation traced `target_lost`
+failures through a real-but-secondary critic-saturation pathology (tested and rejected as a fix)
+to a decisive finding: **the root cause is the learned actor's own search execution, not the
+environment** — proven by branching non-learned controllers from PPO's own real failure states
+and watching them succeed 100% of the time where PPO fails 100% of the time. This doc-update pass
+("document all") is the most recent action.
 
-## What was happening (the short version)
+## What was happening (the condensed history, through 2026-08-22)
 
-Starting from the `N=4` collision problem confirmed at the end of the last session: two fixes
-were implemented together (multi-pass POCS-style brake convergence; a brake-engagement reward
-penalty) and validated on `N=4` — collision fixed, but a first, linear-from-zero version of the
-penalty (Phase 1) pushed the formation wider and hurt tracking. A refined threshold-based
-version (Phase 1b) fixed that side effect without losing the collision fix. In parallel, two
-formation-quality hypotheses — an N-aware safety margin, and a true-3D (not horizontal-only)
-`r_spread` — were each tested standalone, then merged with the Phase 1b brake fixes into
-`phase2-combined` for a full 5-seed validation across `N=2/3/4`. Result: the best `N=4` numbers
-of the project (0% collision in all 3 seeds, 0% `target_lost`, `tracking_rmse` averaging 1.91).
-**A real bug was caught mid-stream by supervisor review**: the first `r_spread` implementation
-used the wrong angle (a global, target-viewpoint quantity where a local, drone-viewpoint one
-was needed) — caught, fixed, and given a permanent regression test (`test_geometry.py`) before
-it was trusted, though an isolated re-test found the bug hadn't visibly cost anything in that
-one run.
+Two fixes (multi-pass POCS-style brake convergence; a thresholded brake-engagement reward
+penalty) resolved the original `N=4` collision problem. Two formation-quality hypotheses
+(N-aware safety margin; true-3D `r_spread`, after a geometry-conflation bug was caught by review
+and fixed) were validated alongside it as `phase2-combined` — 3/3 `N=4` seeds clean at 0%
+collision, the best tracking numbers of the project to that point. A sustained-flight diagnostic
+then showed the best checkpoint's tracking error nearly quadrupling once flown 60s instead of its
+10s training horizon, in a window matching where the real PX4/Gazebo deployment (a concurrent
+conversation's work, sharing this worktree) actually crashed — real evidence, not a hunch. The
+user made an explicit, informed call to bundle five sustained-flight changes at once (longer
+episodes, a larger network, ground awareness, per-axis Z/XY speed limits, dynamic target motion,
+`phase3-resilience`) rather than isolate each first. Ground awareness and per-axis dynamics
+worked cleanly; `target_lost_rate` came back catastrophic (89-100%, flat from rollout 1) because
+`LOST_TIMEOUT_SEC` (a flat 2s) was never rescaled for 9x-longer episodes. A 6/10/18s sweep found
+no clean dose-response; **active search** (each agent fans out on its own heading when the swarm
+loses contact, instead of coasting toward a stale shared point) was built instead and validated
+as the real fix — `contact_fraction` ~16-21%→85-90.7% at 6s, up to 99%+ at 8-10s for seeds that
+converge well. That same tight convergence then exposed a **new** collision-safety cost (8-14%)
+invisible in training-time numbers but real at deterministic eval — traced to a policy's mean
+action converging to a knife-edge equilibrium that training-time noise had been perturbing away
+from. The closing-speed brake was reformulated with true relative velocity in direct response,
+adversarially verified, and queued for Kaggle-scale validation — this is where the last handoff
+ended. (Two process lessons from this era, still standing: confirm `git status` is up to date
+with `origin` before every Kaggle launch, and a one-time autonomy grant covers exactly the round
+it was given for, not follow-on rounds — both in `KNOWN_ISSUES.md`/persistent memory.)
 
-With `phase2-combined` validated, a sustained-flight diagnostic
-(`training/diagnose_horizon.py`, built specifically for this check) ran the best checkpoint for
-60 simulated seconds instead of its 10-second training horizon — tracking error nearly
-quadrupled (0.95 → 3.66) in a 20-30s window that lines up *directly* with where the real
-PX4/Gazebo deployment (a concurrent conversation's work, sharing this worktree) actually
-crashed (15-40s). Given that evidence and limited time, the user made an explicit, informed
-call to bundle five sustained-flight changes together (longer episodes, a larger network,
-ground awareness, per-axis Z/XY speed limits, dynamic target motion) rather than isolate each
-first — with an agreed fallback already in place if it didn't work. It partially didn't:
-ground awareness and per-axis dynamics succeeded cleanly (0 ground strikes across every
-validation rollout), collision stayed unaffected (~0%), but `target_lost_rate` came back at
-89-100%, flat from the very first rollout through the entire 3M-step run in all 3 seeds — a
-new failure at a severity matching the original collision problem.
+## What happened this session (full detail — 2026-08-22 through 2026-08-26)
 
-The user asked for a plain-language explanation of what the "grace period" (`LOST_TIMEOUT_SEC`)
-actually does, then, once it clicked, gave a precise, multi-part request: increase the grace
-period and sweep several values to find a working one (6s/10s/18s, specific seed counts given);
-add a coordinated "active search" behavior for when the swarm loses the target entirely
-(queued, not yet built); and fix reported vertical jiggling, preferring a real altitude floor
-or top-down tracking over letting the drone bob. Under an explicit time-pressure instruction
-("include the altitude thing then test all we don't have much time"), the altitude/jiggling
-fix (empirically confirmed first, then fixed with a graduated reward preference plus
-deterministic Z-velocity smoothing) was bundled into the same branch and Kaggle sweep as the
-`LOST_TIMEOUT_SEC` fix, rather than tested separately. 4 of the 5 sweep kernels launched
-successfully; the 5th hit a Kaggle platform quirk (session-cap error despite only 4 kernels
-confirmed running) that wasn't resolved before time pressure was lifted.
+**`main` fast-forwarded.** `git push origin phase2-combined:main` finally ran clean (no
+conflicts) — `origin/main` is now at `8b724bb`, no longer far behind. Several docs across this
+suite had continued to claim "`main` still at `b59c139`" for three days after this actually
+happened; corrected in this pass. Check `origin/main` directly rather than trusting a doc's
+claim about it if this matters for what you're about to do.
 
-Once time pressure was lifted, the user asked for two things in order: bring `docs/ai_context/`
-fully up to date, then go back and resolve the stuck 5th kernel. The stuck-kernel investigation
-confirmed the 4 real kernels were running and everything else on the account was genuinely
-complete, narrowed the likely cause to an orphaned session from an earlier interrupted push, and
-found no CLI/API way to list or cancel it directly — it cleared on its own after ~4-4.5 hours
-(see `KNOWN_ISSUES.md` item 15, resolved).
+**Relative-velocity brake: inconclusive at 6s, then reverted after full testing.** The 6s-timeout
+validation batch came back inconclusive — all 3 seeds landed in the same bad-tracking regime the
+plain-6s sweep already showed, never reaching the tight convergence where the original 8-14%
+collision problem was ever observed, so nothing stressed the brake either way. Retested at 8-10s
+(5 more seeds, 3 with direct old-brake baselines): **all 3 baseline-matched seeds flipped from a
+clean 3/3 convergence record under the old brake to a clean 0/3 record under the new one** — not
+the project's usual bimodal seed-variance, a genuine reversal on repeat. 6 of 7 total seeds
+failed to converge, including both `NUM_AGENTS=3` deployment-target attempts (99%/96%
+`target_lost`). The leading hypothesis (the new formula reads ~2x the closing speed and
+penalizes/engages harder) was tested directly against a matched pair and **refuted** — the failed
+run's brake barely engaged at all, because the swarm never converged close enough to need it. The
+actual mechanism was never found. Given deployment-readiness was the more urgent priority (no
+`N=3` checkpoint existed either way) and the new brake had no confirmed safety benefit to weigh
+against its convergence cost, it was **reverted to the original one-sided formula** (commit
+`55e7232`) rather than continuing to chase an unexplained effect. `test_brake_relative_velocity.py`
+stays as a general regression test since both its scenarios are symmetric and pass under either
+formula.
 
-**What happened next (this session's main arc)**: the plain `LOST_TIMEOUT_SEC` sweep completed
-with no clean dose-response — 3 of 5 runs stayed catastrophically broken regardless of timeout
-length. The user asked for active search to be implemented next. It was, and (separately)
-smoke-tested and committed — but then **launched on Kaggle without a fresh explicit go-ahead**,
-which the user corrected twice over the course of this arc: once for launching validation
-immediately after implementing (conflating "approved to build" with "approved to spend Kaggle
-compute"), and again for reusing an earlier one-time "find a hypothesis and launch" grant to
-launch a *second*, different round of kernels without re-checking. Both corrections are recorded
-in persistent memory (`feedback_discuss_before_action.md`), not just this doc.
+**Network-capacity sweep, bundled with the revert.** `ACTOR_HIDDEN`/`CRITIC_HIDDEN` were made
+env-overridable in the same commit as the revert, and a 5-kernel sweep launched immediately:
+3x `N=4` (64/128, 128/256, 256/512) and, for the first time on a *working* brake, 2x `N=3`
+(128/256, 256/512). Result: `N=4`'s Phase 3 default (128/256) is a genuine sweet spot — smaller
+partially hurts (45% `target_lost`), larger collapses learning almost entirely (97%
+`target_lost`, flat from rollout 1, the same shape as a badly broken run, not a slow-converging
+one). **`N=3` failed completely at both sizes tested** — flat ~100% `target_lost_rate` from the
+very first rollout. This is a new, still-unexplained deployment blocker: `deployment/
+inference_node.py` hard-requires `NUM_AGENTS=3`, and there is currently no Phase-3-era checkpoint
+at that agent count that learns anything at all, under either brake formulation or either network
+size tried.
 
-**A second, more consequential problem surfaced alongside the first correction**: the active-
-search and ablation commits had never been pushed to `origin` before several Kaggle kernels
-claiming to test them had already run — those kernels silently tested stale, pre-feature code.
-Caught via a missing-columns anomaly in the downloaded eval CSVs, not assumed. Fixed by pushing
-and relaunching the affected kernels; "confirm `git status` is up to date with origin before
-every Kaggle launch" is now a standing pre-launch check, not a one-off fix.
+**The critic-collapse investigation.** A supervisor-guided review noticed something suspicious:
+active search's `target_lost` failures (79-100%) persisted even though a scripted, non-learned
+controller solves the identical forced-loss task 96-100% of the time using the same search
+mechanism. A chain of local diagnostics followed: forced-loss masking (confirmed the search
+mechanism itself is usable — rules out "the mechanism is broken"), PPO-vs-scripted action/reward
+instrumentation on a real checkpoint (PPO's actions diverge substantially from scripted, but
+one-step rewards are nearly identical — points at credit assignment, not reward shaping), then a
+value/critic diagnostic that found the production critic's value predictions are **essentially
+constant regardless of state** across 90 real loss-states. Traced to the critic's final Tanh
+layer saturating 100% within the first rollout of training (confirmed via from-scratch
+reproduction), not specific to any one layer position, not caused by reward heavy-tails
+(loss-function-invariant), but controlled by critic learning rate: `CRITIC_LR=1e-5` (30x smaller)
+fully prevented saturation over a short reproduction. A corrected, properly stratified diagnostic
+(the first attempt used a temporally-contiguous reference batch, a sampling artifact caught
+before being trusted) confirmed the earlier-measured critic/return anti-correlation was
+substantially a sampling artifact, not a severe real effect.
 
-**With the corrected code actually running**, active search turned out to be a real, major
-improvement (`contact_fraction` ~16-21%→85-90.7%), and a follow-up 8s/10s timeout bracket showed
-it can reach ~99% contact when a seed converges well — but 2 of 3 `t10` seeds got stuck in a
-much worse regime, and **the seeds that did converge well showed a new collision-safety cost
-(8-14%) under deterministic eval that their training-time numbers never showed.** The user asked
-for a plain explanation of what this meant and whether it was actionable; the explanation
-correctly identified the mechanism (determinism can exploit a knife-edge equilibrium the
-training-time noise never sat at) but, in trying to explain a secondary, smaller residual gap
-for one specific seed, **incorrectly attributed a different run's `target_lost_rate` figure to
-it** — caught and corrected before it entered the permanent record (see `AI_CONTEXT.md`'s
-working-pattern note and `DECISIONS.md` for the corrected account).
+**The real CRITIC_LR experiment — rejected, not simply "failed."** `CRITIC_LR` was added as a
+separate, env-overridable optimizer LR (commit `71327be`, defaults to the actor's `LR`, so
+default behavior is unchanged) along with per-rollout critic-health diagnostics in
+`training_log.csv`. **A real bug was caught before any Kaggle spend**: the pre-existing LR-anneal
+block unconditionally overwrote `CRITIC_LR` back to an `LR`-derived value every rollout — found
+via a smoke test producing bit-identical output under two different `CRITIC_LR` settings, fixed,
+reverified. A matched 3-seed comparison (`CRITIC_LR` unset vs. `1e-5`, following the user's
+explicit "whenever it's better to use Kaggle do it, keep it local if simple and quick" rule — 5
+seeds on Kaggle, treatment-seed3 run locally since local throughput measured faster) found
+saturation **delayed, not prevented** (all 3 treatment seeds reached 100% saturation again by the
+end of the run), and behavior was a mixed bag: one seed traded a real tracking improvement for a
+new collision cost, two showed no improvement or regression, and `mean_reacquisition_steps` was
+worse under the treatment in all three pairs — the single most consistent effect in the dataset,
+pointing against it. Per the user's own framing: **"rejected as a general solution;
+seed-dependent behavioral redistribution observed" — not simply "failed."** `CRITIC_LR`'s default
+stays unchanged; the diagnostic columns stay as useful instrumentation regardless.
 
-The user then explicitly directed the next three actions, in order: resume the two stuck `t10`
-seeds to 5M steps (with upfront verification of the eval code and a disclosed LR/entropy-
-schedule caveat from resuming rather than retraining from scratch); implement and validate the
-relative-velocity brake fix the collision-discrepancy finding motivated; and bring
-`docs/ai_context/` fully up to date again (this pass). The 5M resume completed first (both seeds
-improved substantially but didn't fully close the gap) and is folded into this update; the brake
-fix's 3-seed/3M Kaggle validation is still running as this document is written.
+**Actor search-action dynamics, in increasing precision.** With the critic demoted to a secondary
+pathology, investigation moved to the actor's own behavior during search, in four escalating
+passes, all against real natural loss events from `search_v2_seed1`/`actor_1.pt` (no
+environment/training changes, read-only instrumentation throughout):
+1. Per-(event, step, agent) action dynamics: scripted's own action persistence is *higher* than
+   PPO's (0.999 vs 0.906-0.930) — the "PPO freezes" hypothesis doesn't hold. Per-step progress
+   toward the sensor boundary is negative on average in both outcomes but ~4x worse in failures.
+   One fully-detailed failure case: one agent closing correctly and steadily, ~30 steps from
+   success, while three teammates drifted the wrong way the entire event — not oscillation, not
+   frozen, confidently wrong headings that never get corrected.
+2. Best-agent/productive-agent reanalysis (correcting a pooled-4-agent-mean caveat from pass 1):
+   reacquired events average **2.25** productive agents (0% have zero); target_lost events
+   average **0.41** (**70.6% have zero**) — the cleanest single signature in the whole
+   investigation. Confidence-response: the actor's mean action direction changes sharply
+   entering search mode (confidence high→mid, cosine=0.198) but barely adapts further as things
+   get worse (mid→low, cosine=0.922) — it reacts once, then stops adjusting.
+3. A scripted-controller A/B/C search-strategy comparison (fixed heading / last-known-velocity /
+   adaptive reassignment) plus a 6/8/10/12s timeout-margin sweep, both forced-loss from a
+   well-formed warmup: **every condition hit a 100% reacquisition ceiling.** Rules out heading
+   strategy and timeout length as standalone bottlenecks when execution is already good, but is
+   structurally blind to PPO's own worse-formed states — motivates the final experiment.
+4. **The decisive experiment**: branched PPO / scripted / adaptive controllers from the *exact*
+   states (via `copy.deepcopy(env)`, full RNG-included snapshot) PPO's own policy produced at 28
+   real loss-onset moments — not an artificial mask. From the 16 states where PPO's real
+   trajectory actually failed, **PPO replayed from that state fails again 100% of the time, but
+   both scripted and adaptive reacquire from every single one (100%)**, typically within 1-2
+   steps, at distances right at the sensor boundary (not hard states). This holds environment,
+   geometry, timeout, and starting state exactly fixed — only the controller differs — and
+   resolves the entire investigation's central question: **the problem is the learned actor's own
+   search execution.**
 
-## What changed this session (chronological, key commits on `phase3-resilience` and its
-ancestor branches)
+All four passes and the network-capacity sweep are written up in full in `EXPERIMENT_LOG.md`;
+this doc-update pass is what added them there.
 
-- `0b6278d`/`09e3038`/`dc1de73`/`b59c139`: pre-date this session's start — the original brake +
-  vision-tracking work, already on `main`. Listed here only for orientation.
-- `3f251b9`: Phase 1 — multi-pass brake convergence + linear brake-engagement penalty.
-  **Fixed collision, widened the formation as a side effect** — see `EXPERIMENT_LOG.md`.
-- `f042fb2`: Phase 1b — thresholded the brake-engagement penalty (only excess above a derived
-  threshold is taxed). Fixed the side effect without losing the collision fix.
-- `2c7c296` (branch `n-aware-margin`), `4c13f86` (branch `xyz-spread`): the two Phase 2
-  formation-quality hypotheses, each tested standalone first.
-- `ac98d67`: fixed `r_spread`'s ideal angle (60° local, not 109.47°/120° global) — a real bug
-  caught by supervisor review, given a permanent regression test (`test_geometry.py`).
-- `4bd4146`/`3f9069c`: merged `n-aware-margin` and `xyz-spread` into `phase2-combined`.
-- `ad4c483`: brake instrumentation (`brake_passes`/`brake_violation`/solo-multi split) — pure
-  logging, no behavior change.
-- `8b724bb`: added `training/diagnose_horizon.py`; checkpointed Phase 2 as a reference point in
-  `PHASE2_CHECKPOINT.md`.
-- `85f0615`: Phase 3 — the 5-change sustained-flight bundle (longer episodes, larger network,
-  ground awareness, per-axis dynamics, dynamic target motion), on branch `phase3-resilience`.
-  **Ground/per-axis clean; `target_lost_rate` catastrophic** — see `EXPERIMENT_LOG.md`.
-- `ad2de3a`: checkpoint doc update recording Phase 3's launch.
-- `ed2f92d`: made `LOST_TIMEOUT_SEC` env-overridable, diagnosed and documented the episode-
-  length/grace-period mismatch.
-- `62a685d`: added `CRUISE_ALT_MIN`/`CRUISE_ALT_COEF` (altitude preference) and
-  `Z_SMOOTHING_ALPHA` (deterministic Z-velocity smoothing), bundled with the timeout fix under
-  time pressure. **Current `HEAD`.**
-- `bebe232` and other commits interleaved in this same branch's history: the concurrent
-  deployment conversation's PX4/Gazebo/ROS2 work — a separate workstream, not detailed here,
-  see `ARCHITECTURE.md`'s `deployment/` section and `deployment/docs/`.
-- `13b9e38`: active search + `LOST_TIMEOUT_SEC` default raised to 6s. **Initially tested by
-  several Kaggle kernels before being pushed** — see the incident note above and
-  `PHASE2_CHECKPOINT.md`.
-- `b15f391`: `DISABLE_TARGET_LOST_TERMINATION` ablation flag. Same unpushed-commit incident as
-  above; corrected the same way.
-- `c4206eb`: extended `evaluate.py` with pooled true-tracking-error percentiles and a
-  reacquisition-time distribution, ahead of the 5M-resume comparison below.
-- `94216fd`: relative-velocity brake reformulation, plus `test_brake_relative_velocity.py` (new
-  committed regression test).
-- `3eae55b`: checkpoint-doc update recording the brake validation launch.
+## What changed this session (chronological, key commits since the last handoff's `3eae55b`)
+
+- `2e7a826`: the last full "document all" pass (already covered by the prior handoff entry).
+- `eedda7e`: recorded the 6s brake-relvel batch as inconclusive.
+- `6a03bdd`: recorded the `main` fast-forward, the 8s/10s brake-relvel relaunch, and a
+  `deployment/` diagnostic-trio check.
+- `5941364`: recorded the `NUM_AGENTS=3` deployment-training launch and first brake-relvel
+  t8/t10 partial results (the seed-reuse-isn't-a-clean-comparison finding).
+- `97ffc23`: recorded the full brake-relvel result — 6/7 seeds failed, `r_brake` hypothesis
+  refuted, no deployment-ready checkpoint exists.
+- `55e7232`: **reverted** the relative-velocity brake; added `ACTOR_HIDDEN`/`CRITIC_HIDDEN` env
+  overrides for the network-capacity sweep.
+- `6b31baf`: recorded the revert and the network-capacity sweep launch.
+- `71327be`: added `CRITIC_LR` override + per-rollout critic-health diagnostics (the critic-LR
+  ablation experiment itself, and the entire actor-search-dynamics investigation chain, were run
+  from local/Kaggle scratch scripts and analysis, not further commits to production code).
 - This doc-update pass itself (uncommitted as of this writing) — updates all 11
   `docs/ai_context/` files to reflect everything above.
 
 ## Discoveries worth knowing
 
-- **A real, ship-before-cost-was-measured bug was caught by review, not by testing.** The
-  `r_spread` angle conflation (global vs. local) passed a full single-seed test with no
-  visible harm — it was still wrong, and the fix was still correct to make. Don't take "the
-  test looked fine" as proof a piece of reasoning was sound; `test_geometry.py` exists
-  specifically because a plausible-looking test result isn't the same as a verified derivation.
-- **Eval-time numbers keep understating real problems — this happened again.** The `N=4`
-  collision problem last session was invisible at eval-time (0-2%) and only visible in the
-  training-time rolling-window data. This session, the pattern repeated in a different form:
-  Phase 3's `target_lost_rate` was so severe it was obvious even at eval-time, but the
-  *diagnosis* (that it was flat from step 1, not a mid-training regression) came from the
-  training-time data, not the eval CSV. Keep checking both.
-- **The bundling-multiple-changes risk is real, but managed differently each time it comes
-  up.** `phase2-combined` bundled two already-individually-tested pairs (brake fixes;
-  formation-quality fixes) for a final validation — a lower-risk kind of bundling. Phase 3
-  bundled five genuinely untested-together changes as an explicit, informed user decision under
-  real time pressure, with an agreed fallback already in place. Both are documented as
-  deliberate trade-offs in `DECISIONS.md`, not lapses — but Phase 3's partial failure (tracking
-  broke while safety didn't) is exactly the attribution cost that kind of bundling risks, even
-  though this particular failure turned out to be diagnosable without un-bundling.
-- **Kaggle's per-kernel `status` check and its account-wide `list` command both have real,
-  non-obvious gaps.** `status` appears to report only a kernel's latest-version session, so an
-  interrupted-then-repushed kernel can leave an old version's session running invisibly. `list`
-  sorts by a `lastRunTime` that isn't reliably newest-first across the whole account. Both are
-  documented in detail in `ENVIRONMENT.md`/`KNOWN_ISSUES.md` item 15 — read those before
-  troubleshooting a similar Kaggle issue rather than re-discovering these the slow way.
-- **The Kaggle account username is `rayensboui`, not `rayensb`** (the GitHub org name, one
-  letter off) — a wrong-owner guess produces a permission-denied error that reads like a slug
-  typo, not an owner typo. Cost real time this session before being caught.
-- **Two requested tracking behaviors turned out to already exist.** When the user asked for
-  dead-reckoning to last-known position/velocity and instant swarm-wide sharing on contact,
-  both were already fully implemented in `_update_target_track()` from the original
-  vision-tracking work — confirmed by reading the code before building anything, avoiding
-  redundant/conflicting reimplementation. The genuinely new piece (active search) has since been
-  built and validated — see below.
-- **A one-time grant of autonomy covers exactly the round it was given for, not every
-  subsequent round that follows from it.** The user explicitly authorized one round of
-  "analyze, pick a hypothesis, launch" while busy. A new hypothesis emerging from that round's
-  results was launched under the same grant without re-checking — corrected, and now recorded
-  in persistent memory (`feedback_discuss_before_action.md`), not just this doc, since it
-  generalizes beyond this specific session.
-- **Building/committing code and launching real Kaggle compute are two separate approval
-  gates.** Implementing and smoke-testing a feature does not itself authorize spending Kaggle
-  session slots on it — that needs its own explicit go-ahead every time, even when the code
-  change was already discussed and even when earlier launches in the same session went
-  unquestioned.
-- **Unpushed commits can silently invalidate an entire batch of Kaggle results** — found via a
-  missing-columns anomaly in downloaded eval CSVs, not assumed. Confirming `git status` is up to
-  date with `origin` immediately before every Kaggle launch is now a standing pre-launch check.
-  See `KNOWN_ISSUES.md` item 17.
-- **A confidently-stated causal explanation can still be wrong, even when nothing about it
-  "sounds off."** Mid-session, one seed's residual train-vs-eval collision gap was explained by
-  citing a different run's `target_lost_rate` figure as if it were that seed's own — internally
-  consistent-sounding, factually wrong. Caught before it entered the permanent record. Re-verify
-  a causal story against the specific numbers it cites, not just its narrative plausibility —
-  see `AI_CONTEXT.md`'s working-pattern note.
-- **Deterministic execution can hide a safety cost that training-time numbers never reveal, in
-  the *opposite* direction from the project's earlier eval-vs-train lesson.** The `N=4` brake
-  gap was originally invisible at eval-time and only visible in training-time rolling data; this
-  time, a policy's mean action converged to a knife-edge equilibrium that only stochastic
-  (training-time) noise had been perturbing away from — removing the noise (what real deployment
-  does) revealed the risk. Both directions are real; check both, always, and don't assume which
-  one will be the misleading one.
-- **Kaggle datasets now mount at `/kaggle/input/datasets/<owner>/<dataset-slug>/`, not the
-  classic `/kaggle/input/<dataset-slug>/`** the current `kaggle-cli` docs still describe —
-  confirmed by a throwaway diagnostic kernel (`os.walk("/kaggle/input")`) after two failed
-  attempts assuming the documented path. See `ENVIRONMENT.md`.
+- **A real, measured, reproducible mechanism (critic saturation) does not automatically mean
+  fixing it is the dominant behavioral lever.** The critic-LR ablation is the concrete case that
+  taught this distinction — every diagnostic confirmed the mechanism was real, and fixing it
+  still didn't reliably improve behavior. Don't skip the full-scale behavioral test just because
+  a mechanism diagnostic came back clean.
+- **A scripted-controller ceiling effect can hide the exact thing you're trying to measure.** The
+  search-strategy/timeout sweep's 100%-across-the-board result initially looks like "nothing
+  matters," but it actually means "not from an easy starting state" — branching from the
+  learned policy's own real (harder, worse-formed) states was what actually distinguished the
+  hypotheses. When a diagnostic saturates at a ceiling, check whether it's testing the state
+  distribution that actually matters before concluding the variable doesn't matter.
+- **Pooled-mean metrics across cooperating agents can hide the real signature.** The original
+  action-dynamics pass's 4-agent pooled progress numbers were far less informative than the
+  best-agent/productive-agent-count reframing that came right after — worth defaulting to a
+  "does at least one agent succeed" framing for any swarm task where one success is enough,
+  rather than an average that dilutes the one agent that mattered.
+- **A doc claiming "`main` is far behind" was stale for three days after the push actually
+  happened.** `git status`/`git log` on the actual ref beats trusting a doc's claim about
+  cross-branch state, even a recently-updated one — worth spot-checking this kind of claim
+  directly when it matters for what you're about to do, not just when something looks obviously
+  wrong.
+- **Network capacity sweeps can produce a "never learns" failure mode that looks identical
+  whether the cause is "too big" or "wrong agent count."** `n4-large` (256/512) and both `n3`
+  attempts (128/256, 256/512) all show the identical flat-from-rollout-1 shape — worth explicitly
+  checking the training curve's *shape* (flat from step 1 vs. a mid-training regression), not
+  just its final value, before assuming two failures share a cause.
+- Carried forward, still true: unpushed commits can silently invalidate a Kaggle batch (confirm
+  `git status` before every launch); deterministic eval, not training-time rolling numbers, is
+  the trusted safety signal; a confidently-stated causal explanation can still be wrong even when
+  nothing about it "sounds off" — re-verify against the specific numbers cited, including your
+  own prior statements in the same session.
 
 ## Unresolved / pending as of this handoff
 
-1. **The relative-velocity brake fix — the real open question now.** 3 seeds/3M steps running
-   (`stage-marl-brake-relvel-s{1,2,3}`, commit `94216fd`, `LOST_TIMEOUT_SEC` at its 6s default).
-   A background `Monitor` task is watching all 3. **Next step for whoever picks this up**: once
-   complete, download and analyze `collision_rate` (both eval-time and training-time
-   rolling-window) against the pre-fix baseline this was meant to address — `search-t8-s1`/`s2`
-   and `search-t10-s3`'s 6-14% eval collision on well-converged checkpoints. If it doesn't help,
-   reconsider the rejected reciprocal/50-50-split alternative (see `DECISIONS.md`) rather than
-   assuming the mechanism-level fix must be enough.
-2. **Vertical-jiggling fix still unverified** — implemented since Phase 3, still not re-measured
-   against any trained checkpoint across multiple doc passes now. Load any current checkpoint,
-   run the same 400-deterministic-step sign-flip measurement used to confirm the original
-   problem, compare.
-3. **`target_lost_rate` isn't fully solved, but isn't the priority right now.** Active search
-   gets well-converged seeds to ~2-4%, but 2 of 3 `t10` seeds needed a 5M-step resume to only
-   partially improve (still 41%/83%). Options not yet tried are in `TODO.md` High — not urgent
-   relative to item 1 above.
-4. **`phase2-combined` → `main` fast-forward still blocked** on the permission classifier;
-   needs the user to run `git push origin phase2-combined:main` themselves.
-5. **`readme.txt`** and **`envs/formation_env.py`'s stale "4-agent study" docstring
-   paragraph** — both still not fixed, still low priority, flagged across several doc passes
-   now without anyone getting to them.
+1. **The actor-search-execution problem — the real open question now, and the most important one
+   in the project.** Root cause localized (learned actor's own search execution, not the
+   environment) but **no fix has been designed or attempted**. Candidate directions, both
+   untested: a training signal that specifically rewards heading correction/reassignment, or a
+   credit-assignment change that makes a productive search action more clearly attributable
+   across the many steps between committing to a heading and actually reacquiring. This is an
+   open question for the user, not a decided next step.
+2. **`NUM_AGENTS=3` cannot learn at all under Phase 3's mechanisms, at any tested network size.**
+   A real deployment blocker, not yet under active investigation. Untried: a smaller network at
+   `N=3` specifically (only 128/256 and 256/512 were tested), more training steps, or isolating
+   which single Phase 3 mechanism (if any one) is responsible by testing `N=3` against the
+   pre-Phase-3 mechanism set (which is known to have worked).
+3. **The collision-safety cost under deterministic execution (8-14%) is still real and still
+   unaddressed.** The fix built for it was reverted for unrelated reasons (it broke convergence);
+   the underlying safety question itself was never actually resolved either way.
+4. **Vertical-jiggling fix still unverified** — implemented since Phase 3, still not re-measured
+   against any trained checkpoint across now several doc passes.
+5. **`readme.txt`** and **`envs/formation_env.py`'s stale "4-agent study" docstring paragraph** —
+   still not fixed, still low priority, flagged across several doc passes now.
 6. **`PHASE2_CHECKPOINT.md`** (repo root, shared coordination doc with the deployment
-   conversation) is up to date as of this pass — includes the brake-fix launch, the 5M-resume
-   result, and the Kaggle dataset-mount-path gotcha.
+   conversation) is up to date as of this pass, including the decisive actor-localization
+   finding (which was not yet written into `EXPERIMENT_LOG.md` when that checkpoint entry was
+   made — it is now, as of this doc pass).
 
 ## Exact recommended next step for a new session
 
-Check `git log`/`git status` on `phase3-resilience`, and check the 3 brake-relvel kernels'
-status directly (`kaggle kernels status rayensboui/stage-marl-brake-relvel-s{1,2,3}`). If all 3
-are complete, download and analyze `collision_rate` (both eval-time and training-time
-rolling-window) against the pre-fix baseline (`search-t8-s1`/`s2`, `search-t10-s3`) and update
-`KNOWN_ISSUES.md` item 13 / `EXPERIMENT_LOG.md` with the result — this is the single most
-informative next result to know once it lands. If it works, consider this closed and revisit
-`target_lost_rate` (item 3 above) or the vertical-jiggling re-verification (item 2) next. If the
-user has instead moved on to something else (the deployment thread, a new feature), read
-`PHASE2_CHECKPOINT.md` first to check what the other concurrent session has in flight before
-touching shared files (`envs/formation_env.py`, `config.py`, `training/*.py`).
+This is now a decision point for the user, not a mechanical next step: the root cause of
+`target_lost` is understood, but no fix direction has been chosen. If picking this up cold, first
+confirm the two candidate fix directions above still look right (re-read `EXPERIMENT_LOG.md`'s
+decisive counterfactual entry), then either (a) propose a concrete fix design for the actor's
+search-execution problem and discuss before implementing anything in `envs/formation_env.py` or
+`training/train.py`, or (b) if the user wants to prioritize deployment-readiness instead, pivot to
+item 2 above (`N=3` won't learn at all) since that's the more concrete blocker for actually flying
+a Phase-3-era checkpoint. Check `PHASE2_CHECKPOINT.md` first if the deployment thread has moved in
+the meantime — this worktree is still shared.

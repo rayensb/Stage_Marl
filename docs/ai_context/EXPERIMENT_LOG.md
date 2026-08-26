@@ -860,3 +860,311 @@ hasn't found the knife-edge behavior that trades into collision risk either.
 **Status**: resolved for this specific question (more training helps but isn't sufficient alone
 within a 5M budget); whether even more steps, a different seed, or a design change would close
 the remaining gap is open, not further pursued in this pass.
+
+## Critic-LR ablation — rejected as a general recovery fix; seed-dependent behavioral redistribution observed
+
+**Objective**: a supervisor-guided investigation (not recorded step-by-step in this file — see
+`PHASE2_CHECKPOINT.md`'s 2026-08-25 entry for the full diagnostic chain) traced active search's
+`target_lost` failures to the production `CentralCritic`'s second Tanh layer saturating 100%
+within the first rollout of training, collapsing its value predictions to an near-constant
+regardless of state. A per-update trajectory and LR sweep on a short (2250-update) reproduction
+found `CRITIC_LR=1e-5` (30x smaller than the shared actor/critic default) fully prevented that
+saturation over the sweep's own budget. This entry tests whether that holds, and whether it
+actually improves recovery behavior, in a real, full-length training run.
+**Configuration**: matched 3-seed comparison, `NUM_AGENTS=4`, default 6s `LOST_TIMEOUT_SEC`,
+`TOTAL_STEPS=3,000,000`, active search, reverted (one-sided) brake -- identical to the original
+`search_v2` baseline in every respect except `CRITIC_LR` (now a separate, env-var-overridable
+constant in `train.py`, added for this experiment; defaults to the actor's `LR` when unset, so
+the control arm is unchanged production behavior). Control: `CRITIC_LR` unset (=3e-4). Treatment:
+`CRITIC_LR=1e-5`. Seeds 1/2/3 for both arms (seed 3's treatment run was executed locally rather
+than on Kaggle -- faster local throughput measured at ~700 steps/sec vs Kaggle's ~330 -- control
+seeds 1-3 and treatment seeds 1-2 ran on Kaggle). Also added per-rollout critic-health logging
+to `training_log.csv` (`critic_v_mean/std/min/max`, `critic_target_mean/std`, `critic_pearson`/
+`critic_spearman` against real returns, final-layer saturation fraction/preactivation std).
+**Bug caught before any Kaggle spend**: the pre-existing LR-anneal block unconditionally set
+both `opt_actor` and `opt_critic` to the same actor-derived `lr_now` every rollout, silently
+overwriting `CRITIC_LR` back to a `LR`-derived value on the very first update regardless of what
+it was constructed with. Caught by a local smoke test producing bit-identical critic-health
+output under `CRITIC_LR=3e-4` vs `CRITIC_LR=1e-5` before pushing anything to Kaggle. Fixed --
+each optimizer now anneals from its own base LR -- and reverified (divergent `final_sat=0%` vs
+`100%` output) before launching.
+**Result 1, critic health**: saturation is delayed, not prevented, over a full run. All 3
+treatment seeds show `final_sat=0%` at the first rollout but **100% by the final rollout**
+(confirmed independently in all 3 -- e.g. the local seed-3 run reached 100% by step 288,000,
+~rollout 20 of 209). `critic_pearson`/`critic_spearman` against real in-sample returns stayed
+small and sign-mixed (roughly -0.1 to +0.3) for the entire 3M-step run in every seed, both arms
+-- no seed, in either condition, ever developed a durable positive value/return relationship.
+**Result 2, behavior** (100 deterministic eval episodes, final model, each):
+
+| seed | condition | success | collision | target_lost | contact_fraction | reacquire_rate | mean_reacq_steps |
+|---|---|---|---|---|---|---|---|
+| 1 | control | 0.050 | 0.000 | 0.950 | 0.831 | 0.842 | 3.30 |
+| 1 | 1e-5 | 0.080 | 0.000 | 0.920 | 0.846 | 0.696 | 8.43 |
+| 2 | control | 0.130 | 0.010 | 0.860 | 0.832 | 0.813 | 6.70 |
+| 2 | 1e-5 | 0.050 | 0.000 | 0.950 | 0.821 | 0.520 | 11.43 |
+| 3 | control | 0.020 | 0.000 | 0.980 | 0.753 | 0.698 | 9.54 |
+| 3 | 1e-5 | 0.200 | 0.050 | 0.750 | 0.866 | 0.688 | 16.84 |
+
+Seed 3 improved substantially on `target_lost`/`contact_fraction` under the treatment, but
+`collision_rate` rose from 0% to 5% and `mean_reacquisition_steps` nearly doubled. Seeds 1-2
+showed no improvement (seed 1, within noise) or outright regression (seed 2) on `target_lost`,
+`reacquire_rate`, and `mean_reacquisition_steps`. **`mean_reacquisition_steps` was worse under
+`CRITIC_LR=1e-5` in all three matched pairs** -- the single most consistent effect in the whole
+dataset, and it points against the treatment.
+**Conclusion**: critic saturation is a confirmed, real, LR-sensitive training pathology --
+directly measured, reproduced across independent seeds and checkpoints, mechanistically traced
+to the last nonlinear layer before the value head. But reducing `CRITIC_LR` to delay it does
+**not** reliably fix recovery behavior: critic health didn't even durably improve (saturation
+returns in every treatment seed by the end of a full run), and behavioral results were mixed --
+one seed traded a real tracking improvement for a new collision cost, two seeds showed no
+improvement or regression, and reacquisition speed was uniformly worse. Record this as **critic
+saturation confirmed as a secondary/contributing pathology, not the dominant behavioral
+bottleneck** -- not simply "the fix failed," since seed 3's redistribution (better tracking,
+worse safety, slower reacquisition) suggests `CRITIC_LR` does interact with what the actor
+learns, just not in a consistently beneficial direction, and there isn't yet evidence for why.
+**Status**: resolved -- rejected as a general recovery solution. Further critic-LR sweeps
+(`3e-6`, `1e-6`, ...), critic-loss variants, or critic-architecture experiments are not
+justified without new evidence specifically motivating them. Investigation moved to the actor's
+own action dynamics during search (see the entry below) rather than continuing to chase the
+critic.
+
+## Actor search-action dynamics — natural loss events, PPO vs scripted at the action level
+
+**Objective**: with critic saturation demoted to a secondary pathology, return to the actor's
+own behavior during search with more precision than the original "bad `SEARCH_SPEED`/heading"
+hypothesis (already weakened by the forced-loss diagnostic showing the mechanism is usable) or
+the reward-economics framing (already shown to be a weak, same-step signal). Quantify what PPO's
+actions actually do, step by step, during a real loss event, and how that differs from the
+scripted controller beyond a single aggregate cosine-similarity number.
+**Configuration**: same checkpoint as the earlier loss-instrumentation entry (`search_v2_seed1`,
+`actor_1.pt`), 30 naturally-occurring loss events (real, deterministic, unforced -- driven
+entirely by the trained policy's own behavior) across 40 episodes. Per (event, step, agent):
+PPO action, previous PPO action and their cosine similarity/change magnitude (action
+persistence), the scripted controller's counterfactual action from the identical state and its
+own persistence, PPO-vs-scripted cosine, true distance to target, distance to the synthetic
+search waypoint, distance to the sensor boundary (`true_dist - SENSOR_RANGE`) and per-step
+progress toward it, real reward components, and `track_confidence`. No environment, reward,
+observation, or training changes -- read-only instrumentation of an already-trained checkpoint.
+**Result**: 13/30 events reacquired, 17/30 target_lost. Scripted's own action persistence
+(`mean cos=0.999`) is actually *higher* than PPO's (`0.906-0.930`) -- the "scripted continuously
+re-aims while PPO freezes" hypothesis does not hold; a smooth continuous controller naturally
+shows high step-to-step persistence too, since position barely moves in one 0.05s tick.
+Per-step progress toward the sensor boundary is negative on average in *both* outcome groups but
+far worse in failures (-0.0057/step reacquired vs -0.0246/step target_lost, a ~4x gap; 91% of
+target_lost steps show negative progress vs 59% for reacquired). One fully-detailed target_lost
+event (seed 3) resolved this into a concrete mechanism: drone1 closed steadily and correctly
+(`boundary_dist` 0.64->0.60m over the final 3 logged steps, positive progress throughout) and
+was within roughly 30 steps (~1.5s) of saving the whole swarm when the 120-step timeout hit --
+while drones 2-4 drifted consistently *away* from the boundary the entire final stretch, never
+close at all. Not oscillation, not a frozen action -- confidently wrong headings in 3 of 4
+agents, and one correct, promising trajectory that simply ran out of time.
+**Caveat**: the pooled cumulative-progress statistics mix all 4 agents per event, but swarm-wide
+reacquisition only needs one to succeed -- so a "reacquired" event's average can look weak even
+when the one agent that mattered was doing everything right, diluted by teammates who weren't.
+The per-event, per-agent breakdown (as above) is more informative than the pooled mean for
+exactly this reason; flagged, not silently smoothed over.
+**Conclusion**: the failure is not well described as "PPO can't compute the right direction" --
+one agent demonstrably could, consistently, in a real failure case. It looks more like (a) most
+agents' search headings, once assigned, never get corrected even when unproductive, so a
+4-random-heading swarm often has only 0-1 agents on a viable trajectory at any given time, and
+(b) even a successful trajectory closes slowly enough (~0.02 boundary-distance/step) that the
+120-step budget is a tight fit rather than a comfortable margin, not just a training-quality gap.
+**Status**: open. Both candidate mechanisms above are testable but distinct from what's already
+been ruled out (search geometry itself, critic saturation as the primary cause) -- next step not
+yet decided.
+
+## Network-capacity sweep — N=4 has a sweet spot at the Phase 3 default; N=3 fails to learn at any tested size
+
+**Objective**: Phase 3's hidden-width jump (Actor 64→128, Critic 128→256) was bundled into the
+original 5-change "leap of faith" and never isolated, even after the bundle was accepted. With
+`ACTOR_HIDDEN`/`CRITIC_HIDDEN` now env-overridable (commit `55e7232`), sweep network capacity
+directly, and use the same sweep to attempt the project's first `NUM_AGENTS=3` Phase-3-era
+checkpoint on a *working* (reverted, one-sided) brake — the two prior `N=3` attempts
+(`deploy-n3-s{1,2}`) both used the since-reverted relative-velocity brake and both failed to
+converge, leaving open whether the brake or something else was responsible.
+**Configuration**: 5 Kaggle kernels, reverted brake, `LOST_TIMEOUT_SEC=8` (best-evidenced timeout
+at the time), `TOTAL_STEPS=3,000,000` each. `stage-marl-netsweep-n4-{small,medium,large}`
+(`NUM_AGENTS=4`, hidden 64/128, 128/256, 256/512) and `stage-marl-netsweep-n3-{medium,large}`
+(`NUM_AGENTS=3`, hidden 128/256, 256/512). `netsweep-n4-medium` deliberately reuses `SEED=1` with
+otherwise the exact same config as the original `search-t8-s1` (which converged cleanly under the
+old brake before the relative-velocity detour) — a built-in sanity check that the revert actually
+reproduces that result rather than something else having silently changed too.
+**Result** (eval-time, final model, 100 episodes each):
+
+| run | hidden (actor/critic) | success | collision | target_lost | contact_fraction | tracking_rmse |
+|---|---|---|---|---|---|---|
+| n4-small | 64/128 | 53% | 2% | 45% | 0.908 | 5.03 |
+| n4-medium | 128/256 | 90% | 8% | 2% | 0.996 | 1.92 |
+| n4-large | 256/512 | 2% | 1% | 97% | 0.734 | 7.28 |
+| n3-medium | 128/256 | 0% | 0% | 100% | 0.647 | 7.15 |
+| n3-large | 256/512 | 0% | 0% | 100% | 0.659 | 7.76 |
+
+`n4-medium`'s sanity check passed: 8% collision / 2% `target_lost` reproduces `search-t8-s1`'s
+original 8% / 2-3% almost exactly. Training-curve check (`target_lost_rate` at rollout
+0/52/104/156/206 of 209): both `n3` runs are flat at 100% (one single 98% midpoint for
+`n3-large`) from the very first rollout (`total_steps=14,400`) straight through to the end —
+never showed any learning signal at all, not a failure to fully converge. `n4-large` is similarly
+flat around 92-98% the whole run.
+**Conclusion, two separate findings**: (1) for `NUM_AGENTS=4`, capacity is not monotonic — the
+Phase 3 default (128/256) is a genuine sweet spot, not an arbitrary starting guess that happened
+to work. Going smaller (64/128) partially degrades tracking (45% `target_lost`); going larger
+(256/512) doesn't just fail to help, it collapses learning almost entirely (97% `target_lost`,
+flat from rollout 1 — the same "never learns" shape as a badly-misconfigured run, not a
+slower-converging one). (2) for `NUM_AGENTS=3`, **neither tested network size ever learns
+anything** — both `n3-medium` and `n3-large` are flat at ~100% `target_lost_rate` from the first
+logged rollout, the same shape as `n4-large`'s failure, not a scaled-down version of
+`n4-medium`'s success. This is the first time `N=3` has been tried under Phase 3's full mechanism
+set (active search, ground awareness, dynamic target, per-axis dynamics) with a *working* brake,
+and it still doesn't learn at all — network capacity is ruled out as the explanation (two
+different sizes, same total failure), but no alternative explanation has been tested yet.
+**Status**: resolved for `N=4` — `ACTOR_HIDDEN=128`/`CRITIC_HIDDEN=256` stays the default, no
+reason to change it. **Open and newly concerning for `N=3`**: still no Phase-3-era
+`NUM_AGENTS=3` checkpoint exists that learns tracking at all, under either brake formulation.
+Since `deployment/inference_node.py` hard-requires `NUM_AGENTS=3`, this is a real blocker for the
+deployment track, not just an unexplored corner — see `KNOWN_ISSUES.md`.
+
+## Best-agent progress, productive-agent count, and confidence-response — re-analyzing the same 30 natural loss events with swarm-correct metrics
+
+**Objective**: the actor search-action dynamics entry above pooled all 4 agents' per-step
+progress into one mean per event — but swarm-wide reacquisition only needs ONE agent to succeed,
+so a pooled mean can look weak even when the one agent that mattered was doing everything right,
+diluted by three teammates who weren't (flagged as a caveat there, not yet corrected for).
+Re-analyze the identical 30 events (same checkpoint, same seeds, deterministic) with two
+swarm-correct lenses, plus a direct check of whether PPO's action actually changes as
+`track_confidence` falls or merely correlates with it by coincidence of when confidence is low.
+**Configuration**: `actor_progress_reanalysis.py`, re-harvesting the same 30 loss events via
+`actor_search_dynamics.py`'s own `run_episode` (imported, not reimplemented) against
+`search_v2_seed1`/`actor_1.pt`. (1) Best-agent cumulative boundary-progress: for each event, the
+single agent with the highest own cumulative progress over a window, at windows of 10/30/60/120
+steps. (2) Productive-agent count: number of agents with positive trailing 10-step progress at
+each event's own final point. (3) PPO action statistics bucketed by `track_confidence` (high
+>0.8, mid 0.4-0.6, low <0.2), and pairwise cosine similarity between buckets' mean action
+vectors.
+**Result**: best-agent cumulative progress @120 steps: reacquired events (n=12) mean=+0.467,
+100% of events positive; target_lost events (n=17) mean=-1.023, only 23.5% positive. The gap is
+present at every window size (10/30/60/120), widening as the window grows — reacquired events'
+best agent keeps making net progress the whole time; target_lost events' best agent is
+net-negative even at the 10-step window (mean=-0.076, 35.3% positive) and gets worse, not better,
+as the event goes on. Productive-agent count: reacquired events average **2.25** productive
+agents (0% of events have zero — every single reacquired event had at least one agent making net
+progress, usually two or more: 75% multi-productive). target_lost events average **0.41**
+(**70.6% have zero** productive agents at all — most failures aren't "one good agent ran out of
+time," they're "nobody was making progress"). Confidence-response: mean action norm is nearly
+flat across confidence levels (0.552 high, 0.535 mid, 0.509 low) — action *magnitude* barely
+changes. Mean action *direction* does not follow the same pattern: cosine(high, mid)=0.198,
+cosine(mid, low)=0.922. The actor's mean response changes sharply the moment confidence drops
+from "in contact" to "searching," then barely changes at all as confidence keeps falling from mid
+to low.
+**Conclusion**: the productive-agent-count split is the cleanest single signature in the whole
+investigation — reacquired events essentially always have at least one (usually 2+) agents doing
+real work; target_lost events usually have *none*. This reframes the failure mode away from "PPO
+sometimes searches badly" toward "PPO frequently has zero agents searching productively at all,"
+a stronger and more specific claim. The confidence-response result sharpens an open question from
+the entry above: the actor is not ignoring confidence (it reacts sharply on the high→mid
+transition, i.e. entering search mode) and is not continuously exploiting it either (mid→low is
+nearly a no-op, cos=0.922) — its response saturates immediately upon entering search and doesn't
+keep adapting as the situation deepens, consistent with (though not yet proof of) headings being
+assigned once and not meaningfully revisited.
+**Status**: resolved as a sharper characterization of the mechanism described in the entry above;
+motivated the search-strategy comparison and the decisive counterfactual experiment below, both
+aimed at testing the "headings aren't corrected" and "budget is tight even when things go right"
+candidate mechanisms directly.
+
+## Search-strategy comparison (A/B/C) and timeout-margin sweep — scripted controller hits a 100% ceiling regardless of condition
+
+**Objective**: test the two candidate mechanisms the actor-dynamics work flagged directly: (a)
+does the specific search-heading strategy (fixed-random vs. last-known-velocity vs. adaptive
+reassignment) matter, and (b) is the 120-step (6s) budget a tight margin even for good execution,
+by sweeping it wider. Uses the scripted controller (not PPO) as a best-case execution baseline,
+isolating the search-strategy/timeout question from the separate question of whether PPO executes
+well.
+**Configuration**: `search_strategy_comparison.py`, same forced-loss masking technique as
+`forced_loss_diagnostic.py` (fake `self.pos_t` far away for the duration of the real
+`_update_target_track()` call, forcing its own unmodified contact computation to return empty;
+the real, unmodified `_assign_search_directions`/receding-waypoint code runs underneath).
+Scripted controller only, 40 trials per condition, real random warmup (300-500 steps) before each
+forced-loss window. **Part 1** (forced 6s loss): condition A (current fixed heading, unmodified),
+B (last-known-velocity heading, same technique as the original forced-loss diagnostic), C
+(adaptive reassignment — every 20 steps/1s, each agent's own trailing boundary-progress is
+checked; redraw a fresh random heading for that agent only if progress ≤0). **Part 2** (condition
+A only): forced-loss duration swept 6/8/10/12s, measuring whether *any* agent's true distance
+crosses back under `SENSOR_RANGE` within the window.
+**Result**: all three conditions in Part 1 hit **100% reacquisition within 6s** (n=40 each), 0%
+collision, median time-to-first-reacquisition of 1 step in every condition. Productive-agent
+count differs (A: mean 2.45, 0% zero-productive; B: mean 3.60, 0% zero-productive; C: mean 3.23,
+2.5% zero-productive) but none of that variation shows up in the outcome — it's already saturated
+at the ceiling. Part 2: all four timeout durations (6/8/10/12s) also hit 100% reacquisition, 0%
+collision.
+**Conclusion**: neither candidate mechanism is the bottleneck **when execution quality is already
+good**. A scripted controller that never produces a "confidently wrong heading" reacquires from
+every single trial regardless of search-heading strategy or timeout window — this rules out "the
+fixed-heading strategy itself is inadequate" and "6s is too tight a margin in general" as
+standalone explanations. But this result is structurally uninformative about PPO specifically: a
+scripted controller starting from a well-formed random warmup never produces the kind of state
+the actor-dynamics entries showed PPO actually reaching (3-4 agents drifting confidently the
+wrong way at once) — this experiment can't tell us what happens from *those* states, only that
+the mechanism has enough headroom in the easy case. That gap is exactly what the next experiment
+closes.
+**Status**: resolved as a ceiling-effect result — informative for ruling out two mechanisms in
+the abstract, but motivates branching directly from PPO's own real states instead of a fresh
+scripted warmup, since that's the only way to test the states that actually matter. See the
+decisive experiment below.
+
+## Decisive experiment: branching PPO/scripted/adaptive controllers from PPO's own real loss-onset states
+
+**Objective**: close the one remaining gap the search-strategy comparison couldn't touch — what
+happens if a *non-PPO* controller is given the exact state PPO's own policy actually produced at
+the moment contact was lost, not a fresh well-formed scripted warmup? This is the experiment that
+can actually distinguish "the environment/timeout/search-geometry caps recovery at some rate
+below 100%" from "PPO's own execution is specifically worse than it needs to be."
+**Configuration**: `counterfactual_from_ppo_states.py`. Ran `search_v2_seed1`/`actor_1.pt` for 38
+episodes, using `copy.deepcopy(env)` to snapshot the *complete* environment state (positions,
+velocities, target state, RNG stream) at every natural steps-since-contact 0→1 transition — a
+real loss-onset moment produced entirely by the trained policy's own behavior, not an artificial
+mask. Collected 28 such snapshots. From each snapshot, branched three independent continuations
+for up to 120 steps (`LOST_TIMEOUT_STEPS`, the real timeout budget): (1) **ppo** — the actual
+trained actor continues, a direct replay-equivalent of what really happened; (2) **scripted** —
+the same hand-written radial+repulsion controller used throughout this investigation; (3)
+**adaptive** — the condition-C reassignment controller from the search-strategy comparison above.
+Cross-tabulated all three branches' outcomes against what the *real, unbranched* PPO trajectory
+actually did from that same state.
+**Result**: real PPO trajectory outcomes at these 28 snapshots: 12 reacquired, 16 `target_lost`.
+Aggregate reacquisition rate across all 28 branches: ppo 42.9% (matches the real split, as
+expected since it's the same policy), scripted 100.0%, adaptive 100.0% — both non-learned
+controllers reacquire from *every* snapshot, mean time-to-reacquire ~1.2 steps. **The decisive
+cross-tab**, conditioned on the real trajectory's own outcome:
+
+| real outcome | branch | reacquisition rate | mean n_productive | mean best-agent progress @120 |
+|---|---|---|---|---|
+| reacquired (n=12) | ppo | 100.0% | 1.67 | 0.422 |
+| reacquired (n=12) | scripted | 100.0% | 3.58 | 0.030 |
+| reacquired (n=12) | adaptive | 100.0% | 3.58 | 0.030 |
+| target_lost (n=16) | ppo | **0.0%** | 0.62 | 0.364 |
+| target_lost (n=16) | scripted | **100.0%** | 3.56 | 0.036 |
+| target_lost (n=16) | adaptive | **100.0%** | 3.56 | 0.036 |
+
+From the 16 states where PPO's real trajectory failed, **branching from that identical state,
+PPO fails again every time (0%) — but scripted and adaptive both reacquire every single time
+(100%)**, typically within 1-2 steps. `min_true_dist` reached during those recoveries averages
+7.88m, essentially exactly at the 7.91m sensor boundary — these are not unusually hard geometric
+states requiring a lucky trajectory; a simple hand-written controller solves them almost
+immediately.
+**Conclusion**: this resolves the causal fork the entire active-search investigation has been
+building toward. The failure is not the environment, the search geometry, the heading-assignment
+strategy, the timeout length, or (per the critic-LR ablation above) primarily the critic — all of
+those are held exactly fixed between the `ppo` and `scripted`/`adaptive` branches, which start
+from the *identical* state. The only thing that differs is which controller is driving from that
+point forward, and that difference alone is the entire gap between 0% and 100%. **The problem is
+the learned actor's own search execution.** This is consistent with, and sharpens, every earlier
+finding in this chain: the productive-agent-count signature (target_lost events average 0.41
+productive agents vs. reacquired's 2.25), the near-miss case study (one agent closing correctly
+while three drift confidently the wrong way), and the confidence-response saturation (the actor's
+response stops adapting once search mode is entered) all describe symptoms of the same underlying
+fact — PPO, from a state a much simpler controller solves immediately, usually does not correct
+course.
+**Status**: resolved — this is the capstone finding of the critic-collapse/actor-search-dynamics
+investigation chain. No fix has been designed or attempted yet; candidate directions (untested)
+include a training signal that specifically rewards heading correction/reassignment, or a
+credit-assignment change that makes a productive search action more clearly attributable across
+the many steps between committing to a heading and actually reacquiring. Not yet decided — open
+question for the user.

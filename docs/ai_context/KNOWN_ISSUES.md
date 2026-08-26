@@ -1,12 +1,18 @@
 # Known Issues
 
-Updated 2026-08-22 against commit `94216fd`/`3eae55b` on `phase3-resilience` (not yet merged to
-`main` — see `TODO.md`). Since the last pass (`62a685d`): item 12 (`target_lost_rate`) is
-substantially better but not fully resolved (active search); item 13 (brake relative velocity)
-is now implemented and adversarially verified, pending Kaggle-scale confirmation; two new items
-(16, 17) were found and resolved this pass. For issues that were investigated and resolved, see
-`EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues) — items below are
-only marked `[RESOLVED]` inline rather than removed, so the numbering stays stable and the
+Updated 2026-08-26 against commit `71327be` on `phase3-resilience` (not yet merged to `main` —
+see `TODO.md`). Since the last pass (`94216fd`/`3eae55b`): item 13 (brake relative velocity) was
+tested at full training scale and found net-harmful to convergence — **reverted**, no longer
+tagged resolved; item 12 (`target_lost_rate`) gained its most important update yet — the root
+cause is now localized to the actor's own learned search execution, not the environment,
+geometry, timeout, or critic, after a deep investigation chain (critic-collapse diagnostics,
+actor search-action dynamics, a scripted-controller ceiling test, and a decisive counterfactual
+branched from PPO's own real failure states). Two new items were added: 18 (`NUM_AGENTS=3`
+cannot learn at all under Phase 3's mechanisms, at any tested network size — a real deployment
+blocker) and 19 (the critic's final-layer saturation — confirmed real, demoted to a secondary
+pathology). For issues that were investigated and resolved, see `EXPERIMENT_LOG.md` (they're
+experiments with a conclusion, not open issues) — items below are only marked
+`[RESOLVED]`/`[REVERTED]` inline rather than removed, so the numbering stays stable and the
 resolution history is visible in place.
 
 ## 1. [RESOLVED] Collision-rate collapse recurred late in training
@@ -244,15 +250,57 @@ stuck seeds to 5M steps confirmed "more training helps" (70-72%→41% and 92-96%
 **New finding, not previously known**: when a seed *does* converge to the tight, confident
 tracking behavior active search enables, deterministic execution exposes a real collision-safety
 cost (8-14%) not seen at this magnitude since the original `N=4` brake gap — see item 13 below
-and the train-vs-eval discrepancy item further down. This is now the more actionable finding
-than `target_lost_rate` itself.
-**Status**: partially resolved. Active search is a real, adopted improvement; `target_lost_rate`
-is meaningfully better than the Phase 3 catastrophe (89-100%) but not fully solved even at good
-seeds' best case (~2-4%). Not under further active investigation this pass — the currently
-higher-priority, more tractable follow-up is the collision-safety cost this same convergence
-exposes (item 13). See `EXPERIMENT_LOG.md` for full data.
+and the train-vs-eval discrepancy item further down.
 
-## 13. [RESOLVED, pending Kaggle-scale confirmation] Closing-speed brake assumed each agent's own velocity, not relative velocity
+**Follow-up on the collision-safety cost (item 13) — inconclusive, then reverted**: the
+relative-velocity brake reformulation this cost motivated was adversarially verified but, once
+tested at full training scale across 7 seeds, turned out to be net-harmful to convergence itself
+(6 of 7 seeds failed to reach any tight tracking at all) for a mechanism that was never
+identified — reverted back to the original one-sided formula. See `DECISIONS.md` and item 13
+below. This closed off the collision-safety angle as the near-term priority and returned focus to
+`target_lost_rate` itself.
+
+**Network capacity investigated and ruled out for `N=4`, but surfaced a separate `N=3` blocker**:
+a 5-way hidden-width sweep confirmed the Phase 3 default (128/256) is a genuine sweet spot for
+`N=4` tracking (both smaller and larger sizes hurt, the larger size catastrophically), so capacity
+isn't the missing piece for `N=4`. But **neither tested network size gets `NUM_AGENTS=3` to learn
+anything at all** (flat ~100% `target_lost_rate` from the first rollout, both sizes) — the first
+time `N=3` was tried under the full Phase 3 mechanism set with a *working* brake, and it still
+completely fails. See item 18 below.
+
+**Critic saturation investigated as a candidate cause of recovery failure — confirmed real,
+rejected as the dominant one**: a deep diagnostic chain found the production critic's final Tanh
+layer saturates 100% within the first rollout of training, collapsing its value estimates to a
+near-constant. Real and reproducible, and delayable (not preventable) with a 30x-smaller critic
+learning rate — but a matched, full-scale 3-seed Kaggle ablation of that fix found saturation
+returns by the end of a full run regardless, and behavior was a mixed bag (one seed traded better
+tracking for worse collision safety and slower recovery; two showed no improvement or a
+regression). Rejected as a general fix. See item 19 below and `DECISIONS.md`.
+
+**Decisive result: the root cause is now localized to the actor's own search execution, not the
+environment.** With critic saturation demoted and search geometry/heading-strategy/timeout ruled
+out by a scripted-controller ceiling test (100% reacquisition regardless of heading strategy or a
+6-12s timeout sweep), the final experiment branched PPO/scripted/adaptive controllers from PPO's
+own *real* loss-onset states (not an artificial mask on a well-formed state). From the 16 states
+where PPO's real trajectory actually failed, **PPO replayed from that exact state fails again
+every time (0%), but a simple scripted controller and an adaptive-reassignment controller both
+reacquire from every single one (100%)**, typically within 1-2 steps, at distances right at the
+sensor boundary — not hard states. This is the strongest, most direct evidence in the whole
+investigation: holding the environment, geometry, timeout, and starting state exactly fixed, only
+the controller differs, and that alone explains the entire gap. See `EXPERIMENT_LOG.md`'s
+decisive counterfactual entry.
+**Status**: root cause localized, not yet fixed. Active search remains a real, adopted
+improvement over Phase 3's original catastrophe (89-100% → 60-81% at 6s, ~2-4% for seeds that
+converge well at 8-10s) — but the reason it doesn't reach 100% is now understood specifically:
+PPO's own search execution, not the environment, search geometry, heading-assignment strategy,
+timeout length, or critic. No fix has been designed or attempted yet for the actor-execution
+problem itself — candidate directions (untested) include a training signal that specifically
+rewards heading correction/reassignment, or a credit-assignment change that makes a productive
+search action more clearly attributable across the many steps between committing to a heading and
+actually reacquiring. This is now the single most important open problem in the project. See
+`EXPERIMENT_LOG.md` for the full evidence chain.
+
+## 13. [REVERTED] Closing-speed brake assumed each agent's own velocity, not relative velocity
 
 **Symptom**: `_apply_brake`'s `v_closing` is `dot(v_a, dir_to_b)` — agent A's own velocity
 component toward B — not the relative closing velocity `(v_a - v_b)`. The brake's adversarial
@@ -275,12 +323,29 @@ closing rate) in both the multi-pass correction loop and the post-hoc violation 
 see `DECISIONS.md`. Re-verified against both adversarial scenarios (now a committed regression
 test, `test_brake_relative_velocity.py`, not just a one-off manual claim) — still zero residual
 violation.
-**Kaggle validation ran but was inconclusive, not negative**: all 3 seeds (6s timeout, the
-current default) landed in a bad-tracking regime (88-97% `target_lost_rate`) rather than the
-tight, confident convergence where the original 8-14% collision problem was ever observed —
-0-2% collision in all 3, but with nothing to stress the brake against, this doesn't confirm or
-deny the fix. Retesting at a timeout known to let seeds converge well (8-10s) is the natural
-next step, not yet launched. See `EXPERIMENT_LOG.md`.
+**Kaggle validation ran but was inconclusive at the 6s timeout**: all 3 seeds landed in a
+bad-tracking regime (88-97% `target_lost_rate`) rather than the tight, confident convergence
+where the original 8-14% collision problem was ever observed — 0-2% collision in all 3, but with
+nothing to stress the brake against, this didn't confirm or deny the fix.
+**Retested at 8-10s (where seeds are known to converge) — reverted, net-harmful**: 5 more seeds
+were run at timeouts that let tracking converge well, with direct old-brake baselines available
+for 3 of them. Result: **all 3 seeds with a direct comparison flipped from a clean 3/3
+convergence record under the old brake to a clean 0/3 record under the new one**, on identical
+seeds, deterministic training. 6 of 7 total seeds failed to converge at all, including both
+`NUM_AGENTS=3` deployment-target attempts. The leading hypothesis (the new formula reads ~2x the
+closing speed and so penalizes/engages much harder) was tested directly and refuted — the failed
+run's brake barely engaged at all (`mean_brake_reduction` smaller, not larger, than the
+successful old-brake run), because the swarm never converged close enough to need it. The actual
+mechanism was never identified. **Reverted to the original one-sided formula (commit
+`55e7232`)** rather than continue chasing an unexplained convergence-breaking effect, given
+deployment-readiness was the more urgent priority and the new brake had no confirmed safety
+benefit to weigh against its convergence cost anyway. See `DECISIONS.md` and `EXPERIMENT_LOG.md`
+for the full per-seed data.
+**Status**: reverted. The relative-velocity idea itself isn't disproven as a concept — the
+mechanism for why it broke convergence was never found — just deprioritized in favor of
+deployment-readiness and the (higher-yield) actor-search-execution investigation in item 12.
+`test_brake_relative_velocity.py` stays as a general regression test against the reverted (old)
+formula, since both its scenarios are symmetric and pass either way.
 
 ## 14. Vertical jiggling — fixed, but only smoke-tested, not yet re-validated against a trained checkpoint
 
@@ -356,3 +421,59 @@ output fields weren't present), not assumed or guessed.
 `git status` shows up to date with `origin` immediately before every Kaggle launch from this
 worktree, every time, not just after this specific mistake. See `PHASE2_CHECKPOINT.md` for the
 full incident record and `ENVIRONMENT.md` for the workflow note.
+
+## 18. `NUM_AGENTS=3` does not converge at all under Phase 3's mechanism set, at any tested network size
+
+**Symptom**: every `NUM_AGENTS=3` attempt under Phase 3's full mechanism set (active search,
+ground awareness, dynamic target motion, per-axis dynamics) has failed to learn tracking at
+all — flat ~100% `target_lost_rate` from the very first logged rollout through a full 3M-step
+run, regardless of brake formulation (relative-velocity, then the reverted one-sided formula) or
+network size (128/256, 256/512).
+**Why this matters more than a normal open issue**: `deployment/inference_node.py` hard-asserts
+`NUM_AGENTS == 3` — confirmed by reading the code, not assumed. No checkpoint produced anywhere
+in the Phase 3 era (timeout sweep, active search, the t8/t10 bracket, either brake-relvel batch,
+the network-capacity sweep) is loadable by the real 3-drone deployment target, since every one of
+them was trained at `NUM_AGENTS=4` (different `OBS_DIM`, no weight transfer — see
+`DECISIONS.md`). This is currently the only thing standing between the training track's Phase 3
+work and a checkpoint the deployment track could actually fly.
+**What's been ruled out**: network capacity (two different sizes, 128/256 and 256/512, both
+completely fail, the same flat-from-rollout-1 shape as `n4-large`'s unrelated capacity failure —
+not a scaled-down version of `n4-medium`'s success) and the relative-velocity brake specifically
+(the two earlier `N=3` attempts used that formula and failed; the two network-capacity-sweep
+`N=3` attempts used the reverted, known-good formula and failed identically).
+**What hasn't been tried**: a smaller network at `N=3` (only 128/256 and 256/512 were tested;
+`N=3`'s smaller `OBS_DIM` than `N=4` was never considered as a reason it might need a *different*
+capacity, not just the same one), a longer training budget, or a direct comparison against how
+`N=3` behaved under the pre-Phase-3 mechanism set (which did work, per the original
+Phase2-combined validation) to isolate which specific Phase 3 mechanism (if any single one) is
+responsible rather than assuming it's all of them at once.
+**Status**: open, not yet under active investigation — flagged here specifically so it isn't
+lost, since the current investigative focus (actor search-execution dynamics, item 12) is on
+`N=4`. Whoever picks up the deployment track next should check this item's status before assuming
+any existing Phase 3 checkpoint is usable.
+
+## 19. [CONFIRMED, DEMOTED] Central critic's final hidden layer saturates 100% early in training
+
+**Symptom**: `CentralCritic`'s last Tanh layer before the value head saturates (`|activation| >
+0.999`) for 100% of a diagnostic sample within the first rollout of training (confirmed via a
+from-scratch reproduction: 0% saturated at pure random init, 100% by ~14,400 steps), collapsing
+value predictions to a near-constant regardless of state (`std=0.000000` measured across 90 real
+loss-states spanning the full 1-120 step horizon in one diagnostic).
+**Investigated thoroughly**: not specific to layer 2 (removing it relocates the same saturation
+onto whichever layer is last before the value head); not caused by reward heavy-tails (MSE/
+Huber/normalized-MSE losses all saturate identically despite ~50,000x different gradient norms);
+controlled by critic learning rate specifically (`CRITIC_LR=1e-5`, 30x smaller than the shared
+actor/critic default, fully prevents saturation over a 2250-update reproduction budget).
+**Confirmed real but demoted to a secondary/contributing pathology, not the dominant behavioral
+bottleneck**: a matched, full-scale 3-seed Kaggle ablation of `CRITIC_LR=1e-5` found saturation
+delayed, not prevented (all 3 treatment seeds saturate again by the end of a full 3M-step run),
+and mixed, inconsistent behavioral effects — see `DECISIONS.md`'s CRITIC_LR entry and
+`EXPERIMENT_LOG.md`. A later, more direct experiment (branching controllers from PPO's own real
+loss states) found the dominant cause lies elsewhere — in the actor's own search execution, not
+the critic — see item 12.
+**Status**: confirmed as a real training pathology, not pursued further as a fix target absent
+new evidence specifically motivating it. The critic-health diagnostic columns added to
+`training_log.csv` during this investigation (`critic_v_mean/std/min/max`,
+`critic_target_mean/std`, `critic_pearson`/`critic_spearman`, final-layer saturation
+fraction/pre-activation std) stay as standing instrumentation for any future investigation that
+touches the critic.

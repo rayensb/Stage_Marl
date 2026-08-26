@@ -24,87 +24,77 @@ project's history.
 
 ## Main objective
 
-Train a policy that, at `NUM_AGENTS=4` (the target agent count), maintains tight target
-tracking and formation cohesion while avoiding both collisions and losing sensor contact with
-the target — and, as of Phase 3, sustains that quality over a realistic flight duration (90s),
-not just the original 10-second training horizon. The original `N=4` collision problem (brake
-gaps under simultaneous multi-threat braking) **is now resolved** — see `DECISIONS.md`.
-**Phase 3's `target_lost` catastrophe (89-100%) is substantially better but not solved**:
-active search (each agent fans out on its own when the swarm loses contact, instead of everyone
-coasting toward the same stale point) got it down to 60-81% at the original 6s timeout, and to
-~2-4% for seeds that converge well at a longer (8-10s) timeout — but training is seed-sensitive,
-and 2 of 3 seeds tested at 10s got stuck in a much worse regime. **The current headline open
-problem is different again**: when a seed *does* converge to that tight, confident tracking
-behavior, deterministic execution (what a real flight controller actually runs) exposes a real
-collision-safety cost (8-14%) the training-time numbers never showed. The brake has been
-reformulated to use true relative velocity instead of each agent's own — adversarially verified,
-Kaggle-scale confirmation in progress. See `TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md`
-items 12-13.
+Train a policy that, at `NUM_AGENTS=4` (the primary validated agent count) and `NUM_AGENTS=3`
+(the real deployment target — see below), maintains tight target tracking and formation
+cohesion while avoiding both collisions and losing sensor contact with the target, and sustains
+that quality over a realistic flight duration (90s), not just the original 10-second training
+horizon. Collision avoidance at `N=4` **is resolved** (the closing-speed brake). `target_lost`
+during active search — the swarm's response to fully losing contact — **has its root cause
+identified but not yet fixed**: a deep investigation this pass (critic-collapse diagnostics,
+then actor search-action dynamics, culminating in a decisive counterfactual experiment) proved
+the failure is the **learned actor's own search execution**, not the environment, search
+geometry, heading-assignment strategy, timeout length, or the critic — branching a simple
+scripted controller from PPO's own real failure states reacquires the target 100% of the time
+from states where PPO's own trajectory failed 100% of the time. **This is now the single most
+important open problem in the project.** Separately, `NUM_AGENTS=3` — the actual deployment
+target — currently cannot learn tracking at all under Phase 3's full mechanism set, at any
+tested network size, a real blocker independent of the `target_lost` question above. See
+`TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` items 12 and 18.
 
-## Current status (code as of commit `94216fd`/`3eae55b` on `phase3-resilience`, 2026-08-22;
-`main` still at `b59c139`, well behind — see `TODO.md`)
+## Current status (code as of commit `71327be` on `phase3-resilience`, 2026-08-26;
+`origin/main` fast-forwarded to `8b724bb` on 2026-08-23 — no longer behind)
 
-- **Collision avoidance is solid at both `NUM_AGENTS=3` and `4`.** The closing-speed brake
-  (a deterministic mechanism, not reward shaping) was extended from a single sequential
-  correction pass to multi-pass POCS-style convergence, plus a thresholded direct reward
-  penalty on brake engagement — together these closed the one confirmed gap in the original
-  mechanism (simultaneous multi-threat braking at `N=4`). A 5-seed validation across
-  `N=2/3/4` showed 3/3 `N=4` seeds clean at 0% `collision_rate`, both at eval-time and in the
-  training-time rolling-window data that previously told a much worse story. See
-  `DECISIONS.md`/`EXPERIMENT_LOG.md`.
-- **Target tracking uses a vision-based cooperative sensing model**, unchanged in mechanism
-  from the original redesign: sensor-range-limited direct detection, instant swarm-wide
-  sharing on contact, time-limited dead-reckoning, `target_lost` termination beyond the grace
-  period. Clean at `N=2/3/4` under the original 10-second episode length. **Breaks badly at
-  the new 90-second episode length** (see below) — the mechanism itself didn't change, but a
-  constant tied to it stopped being valid once episodes got 9x longer.
-- **3D formation spread and an N-aware safety margin** were added on top of the brake fixes,
-  validated in the same combined sweep — the best `N=4` tracking accuracy of the project to
-  date (`tracking_rmse` averaging 1.91). A real geometry bug (conflating two different angular
-  quantities) was caught by review before being trusted, fixed, and given a permanent
-  regression test. See `DECISIONS.md`.
-- **Ground awareness, per-axis (Z vs XY) dynamics, dynamic target motion, and longer (90s)
-  episodes** were added together as Phase 3, an explicit "leap of faith" bundle directly
-  motivated by real evidence: a sustained-flight diagnostic showed tracking error nearly
-  quadrupling once a checkpoint flew longer than its training horizon, in a time window that
-  matches where a real PX4/Gazebo deployment (a separate, concurrent workstream — see
-  `ARCHITECTURE.md`) actually crashed. Ground awareness worked perfectly from the first test
-  (zero ground strikes across every validation rollout). **Target tracking did not** — see
-  below.
-- **`target_lost_rate`: a plain `LOST_TIMEOUT_SEC` sweep (6s/10s/18s) found no clean
-  dose-response** — 3 of 5 runs stayed catastrophically broken regardless of timeout length.
-  Default raised to 6.0 anyway; the real lever turned out to be **active search**, not the
-  timeout constant.
-- **Active search, implemented and validated as a real, major improvement.** Each agent now
-  fans out in its own fixed heading when the whole swarm loses contact, instead of every agent
-  coasting toward the same stale point — `contact_fraction` improved from ~16-21% to 85-90.7%
-  at the 6s timeout. A follow-up 8s/10s timeout bracket showed the mechanism can reach 99%+
-  contact / ~2-4% `target_lost_rate` when a seed converges well, but training is seed-sensitive
-  (2 of 3 `t10` seeds got stuck worse). Resuming the stuck seeds to 5M steps confirmed "more
-  training helps" but didn't fully close the gap. See `KNOWN_ISSUES.md` item 12,
-  `EXPERIMENT_LOG.md`.
-- **A separately-reported vertical-jiggling issue was confirmed and fixed in code**, bundled
-  into the same branch/sweep under time pressure — still not re-verified against a trained
-  checkpoint. See `KNOWN_ISSUES.md` item 14.
-- **New: deterministic execution (what real deployment runs) exposes a collision-safety cost
-  training-time numbers never showed.** Investigated directly — running the same frozen
-  checkpoint deterministically vs. stochastically on identical eval seeds showed determinism
-  alone can explain most/all of an observed gap (a policy's mean action can converge to a
-  knife-edge equilibrium the noise-perturbed training behavior never sat at). Deterministic
-  eval numbers, not training-time rolling numbers, are now the trusted safety signal. See
-  `DECISIONS.md`, `KNOWN_ISSUES.md` item 16.
-- **The brake's known relative-velocity gap (previously theoretical) has been reformulated and
-  adversarially verified — Kaggle-scale confirmation in progress.** `v_closing` now uses the
-  true mutual closing rate, not just one agent's own velocity. See `KNOWN_ISSUES.md` item 13.
+- **Collision avoidance is solid at `NUM_AGENTS=4`.** The closing-speed brake (a deterministic
+  mechanism, not reward shaping) uses multi-pass POCS-style convergence plus a thresholded
+  direct reward penalty on brake engagement — 3/3 `N=4` seeds clean at 0% `collision_rate` in
+  the Phase2-combined validation. **A relative-velocity reformulation of the brake, built to
+  close a known symmetry gap, was tested at full training scale and found net-harmful to
+  convergence for a reason that was never identified — reverted.** The collision-safety cost
+  that motivated it (8-14% under deterministic execution on well-converged checkpoints) remains
+  real and unaddressed.
+- **Target tracking uses a vision-based cooperative sensing model**, unchanged in mechanism:
+  sensor-range-limited direct detection, instant swarm-wide sharing on contact, time-limited
+  dead-reckoning, `target_lost` termination beyond the grace period (`LOST_TIMEOUT_SEC`,
+  resolved default `6.0` after a sweep found no clean dose-response). **Active search** (each
+  agent fans out on its own fixed heading when the swarm loses contact entirely) is a real,
+  validated improvement — `contact_fraction` ~16-21%→85-90.7% at 6s, up to 99%+ for seeds that
+  converge well at 8-10s.
+- **Why active search still doesn't reach 100% is now understood, not just observed.** A
+  supervisor-guided investigation traced the gap through several ruled-out candidates — the
+  central critic's value predictions were found to collapse to a near-constant early in training
+  (confirmed: its final Tanh layer saturates 100% within the first rollout), a real, reproducible
+  pathology, but a matched full-scale ablation of the fix (a 30x-smaller critic learning rate)
+  found it delays rather than prevents saturation and produces no reliable behavioral benefit —
+  **rejected as a general fix, demoted to a secondary/contributing pathology.** A separate
+  scripted-controller test (heading strategy A/B/C, timeout 6-12s) hit a 100% reacquisition
+  ceiling regardless of condition, ruling out search geometry and timeout length as standalone
+  bottlenecks — but only for well-formed starting states. **The decisive experiment** branched
+  PPO / scripted / adaptive controllers from PPO's own *real* loss-onset states: from states
+  where PPO's real trajectory failed, PPO fails again 100% of the time, but scripted and adaptive
+  both reacquire 100% of the time, typically within 1-2 steps. Holding environment, geometry,
+  timeout, and starting state exactly fixed, only the controller differs — **the problem is the
+  learned actor's own search execution.** No fix has been designed or attempted yet.
+- **Network capacity, measured for the first time.** A 5-way hidden-width sweep
+  (`ACTOR_HIDDEN`/`CRITIC_HIDDEN`, now env-overridable) confirmed Phase 3's 128/256 default is a
+  genuine sweet spot for `N=4` — a smaller network partially hurts, a larger one collapses
+  learning almost entirely. **`NUM_AGENTS=3` — the real deployment target — failed to learn
+  anything at all at either tested size**, the first time `N=3` was tried under Phase 3's full
+  mechanism set with a *working* brake. Not yet explained; not network capacity (ruled out by the
+  same sweep), not the brake formulation (failed under both). A real, currently-unexplained
+  deployment blocker.
+- **3D formation spread, N-aware safety margin, ground awareness, per-axis (Z vs XY) dynamics,
+  cruise-altitude preference, and Z-velocity smoothing** — all unchanged since the last pass,
+  still validated (ground/per-axis clean from the first test; the vertical-jiggling fix is
+  implemented but still not re-measured against a trained checkpoint).
 
 ## Important technologies / dependencies
 
 - Python 3.12, PyTorch, NumPy, Gymnasium, PettingZoo (`ParallelEnv`), pandas, matplotlib.
 - Training run primarily on **Kaggle** (CPU, not GPU — see `DECISIONS.md` for why CPU beats
   CUDA here). Local dev machine has no working CUDA and is used for code edits, smoke tests
-  (`test_env.py`), and log/plot review — but as of this session, the Kaggle API also works
-  directly from the local machine (`~/.kaggle-venv`), so runs can be launched, polled, and
-  their results downloaded without a manual notebook workflow. See `ENVIRONMENT.md`.
+  (`test_env.py`), local diagnostic scripts, and log/plot review — the Kaggle API also works
+  directly from the local machine (`~/.kaggle-venv`), so runs can be launched, polled, and their
+  results downloaded without a manual notebook workflow. See `ENVIRONMENT.md`.
 - See `ENVIRONMENT.md` for exact verified versions.
 
 ## What a new AI session should read, in order
@@ -141,25 +131,28 @@ lesson generalizes: an explanation that sounds coherent and is offered confident
 same as one that's been checked against the specific numbers it cites — re-verify a causal story
 against the actual source data before treating it as settled, even (especially) your own.
 
-**Also new this pass, a genuinely new class of finding, not a bug**: deterministic execution
-(what real deployment runs) can expose safety costs training-time numbers never show, because a
+**Deterministic execution can expose safety costs training-time numbers never show**, because a
 policy shaped by exploration noise can converge its *mean* action to a riskier equilibrium than
-the noise-perturbed behavior ever sat at. This isn't "eval-time understates, training overstates"
-like the earlier `N=4` brake lesson — it's closer to the opposite: training's own numbers can be
-optimistic in a way that only shows up once the noise is removed. Trust deterministic eval for
-safety claims; see `DECISIONS.md`.
+the noise-perturbed behavior ever sat at. Trust deterministic eval for safety claims; see
+`DECISIONS.md`.
 
-**On bundling multiple changes into one tested run**: this has happened several times now,
-with different outcomes worth distinguishing rather than treating as one lesson. Early on it
-happened by accident (three changes in one commit, correctly flagged afterward as a discipline
-lapse — attribution for that specific commit is genuinely weaker as a result). Later it
-happened deliberately and was reasoned about explicitly in `DECISIONS.md` each time:
-`phase2-combined` bundled two already-individually-tested pairs of changes for a final
-validation pass (lower risk — each half was already checked alone); Phase 3 bundled five
-genuinely-untested-together changes as an informed, time-constrained user decision with an
-agreed fallback plan. Phase 3's bundle then had a real partial failure (tracking broke, safety
-didn't) — exactly the attribution risk bundling creates, though in that specific case the
-failure turned out to be diagnosable without un-bundling anyway (see `EXPERIMENT_LOG.md`'s
-Phase 3 entry). The takeaway isn't "never bundle" — it's that bundling is a real, named
-trade-off to make consciously and record the reasoning for, not a default to fall into
+**On bundling multiple changes into one tested run**: this has happened several times now, with
+different outcomes worth distinguishing rather than treating as one lesson. `phase2-combined`
+bundled two already-individually-tested pairs of changes for a final validation (lower risk);
+Phase 3 bundled five genuinely-untested-together changes as an informed, time-constrained user
+decision with an agreed fallback plan, and did have a real partial failure (tracking broke,
+safety didn't) — exactly the attribution risk bundling creates, though diagnosable without
+un-bundling in that case. The takeaway isn't "never bundle" — it's that bundling is a real,
+named trade-off to make consciously and record the reasoning for, not a default to fall into
 silently.
+
+**Newest lesson (2026-08-25/26): a real, reproducible mechanism doesn't automatically mean
+fixing it is the dominant behavioral lever — test the behavioral claim directly, not just the
+mechanistic one.** Every diagnostic confirmed critic saturation was real; a full-scale ablation
+of the fix still found no reliable behavioral benefit. Relatedly, a diagnostic that hits a 100%
+ceiling can mean "this variable doesn't matter" or can mean "this test isn't reaching the states
+that matter" — the search-strategy/timeout sweep's ceiling result only became informative once
+paired with an experiment that branched from the learned policy's own real, harder states
+instead of an idealized warmup. When a mechanism looks confirmed or a result looks saturated,
+the next question is always "does this actually predict the behavior I care about," answered by
+a direct test, not by the mechanism's plausibility alone.

@@ -39,6 +39,22 @@ seeds were resumed to 5M steps to test "does more training help" (partially yes)
 `SESSION_HANDOFF.md` first for the current picture; `KNOWN_ISSUES.md` items 12/13/16/17 and
 `TODO.md` Critical for the specifics of what's still open.
 
+**Updated again 2026-08-26, now against commit `71327be` on `phase3-resilience`**: `main` was
+fast-forwarded (no longer behind, correcting a stale claim that had persisted three days past
+the actual push). The relative-velocity brake from the previous update was tested at full scale
+and found to **break training convergence** for a reason never identified — **reverted**. A
+network-capacity sweep confirmed `N=4`'s hidden-width default is a genuine sweet spot but found
+**`NUM_AGENTS=3` — the real deployment target — cannot learn tracking at all**, at any tested
+size, a new and still-unexplained blocker. A deep investigation (critic-collapse diagnostics,
+finding a real but non-dominant critic-saturation pathology; then actor search-action dynamics,
+finding a clean productive-agent-count signature and a confidence-response saturation) culminated
+in a **decisive experiment**: branching non-learned controllers from PPO's own real failure
+states reacquires the target 100% of the time from states where PPO's own trajectory failed 100%
+of the time — **the root cause of `target_lost` is the learned actor's own search execution, not
+the environment.** No fix has been designed yet; this is now the project's single most important
+open problem. See `SESSION_HANDOFF.md` first; `KNOWN_ISSUES.md` items 12/13/18/19 and `TODO.md`
+Critical for specifics.
+
 ## Read order for a new session
 
 1. **`AI_CONTEXT.md`** — start here. What this is, current status, what to read next.
