@@ -434,6 +434,101 @@ cleanly under the old brake before the relative-velocity detour) -- a free sanit
 the revert actually reproduces that result; if it doesn't, something is more wrong than just
 the brake formula, worth flagging as a red flag if it comes back non-converged.
 
+## Update 2026-08-25: critic-collapse investigation -> CRITIC_LR added -> matched-seed Kaggle experiment launched
+
+Deep supervisor-guided investigation into why active-search checkpoints fail to recover from
+`target_lost` (79-100% failure rate) despite a scripted (non-learned) controller solving the
+identical forced-loss task 96-100% of the time using the same search mechanism. Chain of local
+diagnostics (all in `/tmp/.../scratchpad/`, not merged into the repo): forced-loss masking test
+(confirmed the search mechanism itself is usable), PPO-vs-scripted action/reward instrumentation
+on a real trained checkpoint (found PPO's actions diverge substantially from scripted but
+one-step rewards are nearly identical -- pointed at credit assignment, not reward shaping), then
+a value/critic diagnostic that found the production `CentralCritic`'s **value predictions are
+essentially constant regardless of state** (`std=0.000000` across 90 real loss-states spanning
+the full 1-120 step horizon). Traced the mechanism: the critic's **second Tanh layer saturates
+100%** within the very first rollout of training (confirmed via a from-scratch reproduction,
+reproducing exactly at pure random init: 0% saturated; after ~14,400 steps: 100%), and this is
+**not specific to layer 2** -- removing it just relocates the same saturation onto whichever
+layer is last before the value head. A critic-loss-function sweep (MSE/Huber/normalized-MSE)
+found the loss function's outlier-sensitivity does **not** control this (all three saturate
+identically despite gradient norms differing by ~50,000x) -- instead, a per-update trajectory +
+LR sweep found **critic learning rate** is the controlling variable: `CRITIC_LR=1e-5` (30x
+smaller than the shared default) fully prevents saturation over a 2250-update reproduction,
+where the production default (shared with actor LR, `3e-4`) reaches 100%. A corrected, properly
+stratified (not temporally-contiguous) diagnostic confirmed the critic's earlier-measured
+anti-correlation with real returns was substantially a sampling artifact, and shrinks toward
+statistical noise as LR drops -- real signal, but short of confirmed-positive at this tiny
+diagnostic budget.
+
+**Production change** (commit `71327be`, pushed): `training/train.py` now has a separate,
+env-var-overridable `CRITIC_LR` (defaults to `LR`, i.e. unchanged behavior unless set), and
+logs critic-health diagnostics every rollout to `training_log.csv` (`critic_v_mean/std/min/max`,
+`critic_target_mean/std`, `critic_pearson`/`critic_spearman` vs real returns, and the final
+hidden layer's saturation fraction/pre-activation std) using a random subsample of that
+rollout's own pooled data. **Caught and fixed a real bug before any Kaggle spend**: the
+pre-existing LR-anneal block unconditionally set both `opt_actor` and `opt_critic` to the same
+actor-derived `lr_now` every rollout, silently overwriting `CRITIC_LR` back to a `LR`-derived
+value on the very first update regardless of what it was constructed with -- caught by a local
+smoke test producing bit-identical output under `CRITIC_LR=3e-4` vs `CRITIC_LR=1e-5`; each
+optimizer now anneals from its own base LR. Verified fixed (divergent `final_sat=0%` vs `100%`
+output) before pushing.
+
+**Launched, completed, and analyzed** -- `stage-marl-criticlr-{control,1e5}-s{1,2,3}` (5 on
+Kaggle, treatment-seed3 run locally instead -- local throughput measured faster than Kaggle's,
+~700 vs ~330 steps/sec). **Result: rejected as a general recovery fix.** Full writeup in
+`docs/ai_context/EXPERIMENT_LOG.md` ("Critic-LR ablation" entry) -- short version: saturation is
+delayed, not prevented (all 3 treatment seeds reach 100% final-layer saturation again by the end
+of the 3M-step run), and behavior was a mixed bag across the 3 matched seed-pairs -- one seed
+traded a real `target_lost`/`contact_fraction` improvement for a new collision cost, two seeds
+showed no improvement or regression, and `mean_reacquisition_steps` was worse under `CRITIC_LR=
+1e-5` in all three pairs (the one fully consistent effect, pointing against the treatment).
+`CRITIC_LR`'s default is unchanged (still equals `LR`) -- do not set it to `1e-5` based on this
+result. The critic-health columns added to `training_log.csv` (this commit, `71327be`) stay --
+useful instrumentation regardless of this specific ablation's outcome; older logs won't have them.
+
+**Follow-on, in progress**: since critic saturation is now a confirmed-but-secondary pathology,
+investigation moved to the actor's own action dynamics during search (natural loss events, PPO
+vs scripted at the per-step action level, not just reward/value). See EXPERIMENT_LOG.md's "Actor
+search-action dynamics" entry -- found a concrete near-miss mechanism (one agent closing steadily
+and correctly, ~30 steps from success, while 2-3 teammates drift consistently the wrong way for
+the whole event) rather than a uniform "PPO can't do this" failure. Two candidate mechanisms
+flagged (uncorrected bad headings persisting all event; the 120-step budget being a tight margin
+even for a working trajectory, not just a training-quality gap) -- neither yet tested, no
+direction chosen.
+
+## Update 2026-08-26: decisive result -- localized to the actor, not the environment/search mechanism
+
+Follow-on to the actor-dynamics work above. Best-agent/productive-agent re-analysis of the same
+30 natural PPO loss events gave a clean signature: reacquired events average 2.25 productive
+agents (0% have zero); target_lost events average 0.41 (70.6% have zero). A scripted-controller
+A/B/C search-strategy comparison and a 6/8/10/12s timeout sweep (both forced-loss, starting from
+a well-formed scripted warmup) both hit a 100% ceiling regardless of condition -- informative in
+itself (neither search heading choice nor the 6s window is the bottleneck when execution is
+already good), but structurally unable to test PPO's own, worse-formed states.
+
+**The decisive experiment**: branched PPO / scripted / adaptive-reassignment controllers from
+the *exact* env states (positions, velocities, target state, RNG) PPO's own policy created at
+28 real loss-onset moments -- not an artificial mask on a good formation. Cross-tabulated against
+what PPO's real trajectory actually did from each state. Result: from the 16 states where PPO's
+real trajectory failed (`target_lost`), **PPO replayed from that state fails again (0%), but
+both scripted and adaptive controllers reacquire from every single one (100%)**, typically
+within 1-2 steps. `min_true_dist` for those recoveries averages 7.88m, right at the 7.91m
+sensor boundary -- these are not hard states, PPO just doesn't execute the (comparatively easy)
+correction. This resolves the causal fork the whole active-search investigation has been
+building toward: **the problem is the learned actor's own search execution, not the
+environment, not the search geometry/heading strategy, not the 6s timeout, and (per the
+critic-LR ablation above) not primarily the critic.**
+
+**Update 2026-08-26 (later)**: now fully written up in `docs/ai_context/EXPERIMENT_LOG.md`
+(4 new entries: network-capacity sweep, best-agent/productive-agent/confidence-response
+reanalysis, search-strategy A/B/C + timeout-margin sweep, and the decisive counterfactual above),
+plus corresponding updates to `DECISIONS.md`, `KNOWN_ISSUES.md` (items 12/13/18/19),
+`ARCHITECTURE.md`, `ENVIRONMENT.md`, `COMMANDS.md`, `CURRENT_STATE.md`, `SESSION_HANDOFF.md`,
+`TODO.md`, `AI_CONTEXT.md`, and `INDEX.md` -- a full "document all" pass triggered by explicit
+user request. Also corrected a stale claim that had persisted across three days of doc passes:
+`origin/main` was actually fast-forwarded to `phase2-combined` (`8b724bb`) on 2026-08-23, not
+"still behind" as several files continued to say.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
