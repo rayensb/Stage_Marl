@@ -774,6 +774,60 @@ compare `target_lost_rate`, `contact_fraction`, `success_rate`, `productive_agen
 the acceptance criterion (meaningful `target_lost_rate` reduction in ≥2/3 seeds without
 unacceptable collision regression).
 
+## Update 2026-08-27 (later still): AUX_DIVERSIFY rejected (clean negative result); AUX_DIR_RAMP implemented and smoke-tested, awaiting launch go-ahead
+
+**AUX_DIVERSIFY result**: all 6 arms (5 Kaggle + 1 local) completed. Matched 3-seed comparison
+against the `AUX_DIR_COEF=0.01`-only baseline: 1 seed improved, 1 seed regressed clearly
+(`target_lost_rate` +0.18, the largest single movement in the table), 1 was essentially flat.
+`productive_agent_fraction` did not improve consistently either (flat-to-down in 2/3 seeds) --
+the specific hypothesis motivating this (uniform direction trades away useful coverage
+diversity) is not supported by this implementation. **Fails the pre-agreed ≥2/3-seeds bar --
+rejected.** Per explicit user instruction: this is a clean negative result about this specific
+diversification formulation, not evidence against the AUX approach generally (`AUX_DIR_COEF=0.01`
+was a clean 3/3 win and stays the baseline). `AUX_DIVERSIFY` stays off by default; no further
+diagnosis planned on this specific hypothesis. One methodological caveat noted but not
+disqualifying: seed 3's control ran on Kaggle while its treatment ran locally (an
+execution-environment confound), but seeds 1/2 (both fully on Kaggle) already independently show
+the same mixed 1-up-1-down split, so it doesn't change the conclusion.
+
+**`AUX_DIR_RAMP` implemented** (commit `dee4016`), a different kind of follow-on to
+`AUX_DIR_COEF` -- not a different target direction (that's what `AUX_DIVERSIFY` tried, and it
+didn't work), but a different *strength schedule* for the same, already-validated direction
+(`unit(_last_known_vel)`). Specified entirely from existing evidence, no new diagnostic run:
+(1) `r_contact`'s own urgency ramp (`CONTACT_URGENT_COEF * min(1, steps_since_contact/
+LOST_TIMEOUT_STEPS)`) is an already-validated pattern in this exact codebase for "increase
+pressure as the timeout approaches"; (2) the directional-entrenchment diagnostic found
+correction probability does *not* rise on its own as a bad streak lengthens (flat ~5.5-6.8% for
+streaks of 6-10/11-20/21+ steps) -- the actor doesn't self-generate escalating urgency, so an
+explicit signal that does could compensate; (3) the post-AUX_DIR_COEF failure audit found 67.9%
+of remaining `target_lost` failures are fatal on the swarm's very first loss event of the
+episode, with `contact_fraction` still ~0.865 even in failed episodes -- these are "ran out of
+time on the one search that mattered" failures, exactly where a pull that gets more assertive as
+time runs low has the most leverage. When set > 0, the per-transition auxiliary coefficient
+becomes `AUX_DIR_COEF * (1 + AUX_DIR_RAMP * min(1, steps_since_contact/LOST_TIMEOUT_STEPS))`
+instead of a flat `AUX_DIR_COEF` for the whole search window. Required extending
+`RolloutBuffer` (`training/buffer.py`) with a new `aux_ramp_frac` field threaded through
+`store()`/`get_tensors()`, and rewriting the minibatch loop's auxiliary-loss computation to use a
+per-row coefficient instead of one scalar.
+
+**Smoke-tested, three configurations, all local, all exercising real in-search rows (not just
+the trivial all-False case)**: `AUX_DIR_RAMP=0` -- `coef_mean` logged exactly `0.0100`
+(== `AUX_DIR_COEF`) in both rollouts despite real search rows present (`frac_insearch` 0.273/
+0.203), confirming the ramp is an exact no-op, not just algebraically but under live rollout
+conditions. `AUX_DIR_RAMP=50` (deliberately exaggerated) -- `coef_mean` jumped to 0.258/0.278,
+no NaN/crash, training proceeded normally. `AUX_DIR_RAMP=1.0` (the actual intended treatment
+value, doubling the coefficient by the time the timeout is reached) -- `coef_mean` landed at
+0.0156/0.0141, inside the expected `[0.01, 0.02]` band. `test_env.py` (N=2/3/4) and
+`test_geometry.py` both still pass (unaffected -- this change doesn't touch `envs/
+formation_env.py`).
+
+**Status**: implemented, smoke-tested, committed. **No Kaggle launch yet** -- awaiting the
+user's go-ahead on the matched 3-seed comparison (control = current baseline unchanged,
+`AUX_DIR_RAMP` unset; treatment = `AUX_DIR_RAMP=1.0`), same protocol and acceptance criterion
+(≥2/3 seeds improve `target_lost_rate` without unacceptable collision regression, plus a
+secondary check that `productive_agent_fraction` doesn't regress) as every prior ablation this
+investigation.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
