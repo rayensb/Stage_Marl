@@ -13,7 +13,7 @@ from training.networks import Actor, CentralCritic
 from training.buffer import RolloutBuffer
 from training.checkpoint import save_checkpoint, load_checkpoint, save_best_actor
 from training.logger import init_logger, log_row
-from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_STEPS, ACTOR_HIDDEN, CRITIC_HIDDEN
+from config import NUM_AGENTS, K_NEIGHBORS, OBS_DIM, ACT_DIM, MAX_STEPS, ACTOR_HIDDEN, CRITIC_HIDDEN, LOST_TIMEOUT_STEPS
 
 AGENTS = [f"drone{i+1}" for i in range(NUM_AGENTS)]
 # Phase 3 (2026-08-20): derived from MAX_STEPS instead of hardcoded
@@ -116,7 +116,45 @@ AUX_DIR_COEF = float(os.environ.get("AUX_DIR_COEF", 0.01))
 # else stay exactly as validated -- this isolates one variable (uniform vs.
 # per-agent-diverse target direction) against the CURRENT baseline, not the
 # pre-AUX one. Defaults to 0 (current, validated behavior unchanged).
+#
+# RESULT (2026-08-27): matched 3-seed comparison -- 1 seed improved, 1 seed
+# regressed clearly (target_lost_rate +0.18, the largest single movement in
+# the table), 1 was flat. productive_agent_fraction did not improve
+# consistently either (flat-to-down in 2/3 seeds) -- the specific
+# hypothesis (uniform direction trades away useful coverage diversity)
+# isn't supported by this implementation. REJECTED as a general fix; does
+# not meet the pre-agreed >=2/3-seeds bar. Does not invalidate AUX_DIR_COEF
+# itself (that was a clean 3/3 win) -- only this specific diversification
+# formulation. Left at its default (off); no further diagnosis planned on
+# this specific hypothesis. See EXPERIMENT_LOG.md/PHASE2_CHECKPOINT.md.
 AUX_DIVERSIFY = bool(int(os.environ.get("AUX_DIVERSIFY", 0)))
+
+# AUX_DIR_RAMP (2026-08-27): different kind of follow-on to AUX_DIR_COEF --
+# not a different target direction (AUX_DIVERSIFY tried that, rejected
+# above), but a different STRENGTH schedule for the same, already-validated
+# direction (unit(_last_known_vel)). Specified from existing evidence, no
+# new diagnostic run: (1) r_contact's own urgency ramp
+# (CONTACT_URGENT_COEF * min(1, steps_since_contact/LOST_TIMEOUT_STEPS),
+# see envs/formation_env.py) is an already-validated pattern in this exact
+# codebase for "increase pressure as the timeout approaches" -- this reuses
+# that shape, not a new idea; (2) the directional-entrenchment diagnostic
+# found correction PROBABILITY does not rise on its own as a bad streak
+# lengthens (flat ~5.5-6.8% for streaks of 6-10/11-20/21+ steps, after an
+# initial 1-5-step spike) -- the actor doesn't self-generate escalating
+# urgency, so an explicit signal that does could compensate; (3) the fresh
+# post-AUX_DIR_COEF baseline audit found 67.9% of remaining target_lost
+# failures are fatal on the swarm's very first loss event of the episode,
+# with contact_fraction still ~0.865 even in failed episodes -- these are
+# "ran out of time on the one search that mattered" failures, exactly where
+# a pull that gets more assertive as time runs low has the most leverage.
+# When set > 0, the per-transition auxiliary coefficient is
+# AUX_DIR_COEF * (1 + AUX_DIR_RAMP * min(1, steps_since_contact/
+# LOST_TIMEOUT_STEPS)) instead of a flat AUX_DIR_COEF for the whole search
+# window -- see the minibatch loop below. Defaults to 0.0 (current,
+# validated flat-coefficient behavior exactly reproduced -- see the
+# aux_ramp_frac/coef_vals computation below for why this is an exact
+# no-op at 0).
+AUX_DIR_RAMP = float(os.environ.get("AUX_DIR_RAMP", 0.0))
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
@@ -242,7 +280,7 @@ def joint(obs_dict):
 
 def main():
     global _stop_requested
-    print(f"[run] device={DEVICE} seed={SEED} critic_lr={CRITIC_LR} aux_dir_coef={AUX_DIR_COEF} aux_diversify={AUX_DIVERSIFY}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
+    print(f"[run] device={DEVICE} seed={SEED} critic_lr={CRITIC_LR} aux_dir_coef={AUX_DIR_COEF} aux_diversify={AUX_DIVERSIFY} aux_dir_ramp={AUX_DIR_RAMP}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -361,6 +399,11 @@ def main():
                 else:
                     aux_dir_dict = {a: lkv_dir for a in AGENTS}
                 in_search_dict = {a: in_search_now for a in AGENTS}
+                # AUX_DIR_RAMP (2026-08-27): 0 at loss onset, 1 at
+                # LOST_TIMEOUT_STEPS -- see AUX_DIR_RAMP's comment above.
+                # Swarm-wide like in_search_now/lkv_dir, for the same reason.
+                aux_ramp_frac_now = min(1.0, env._steps_since_contact / LOST_TIMEOUT_STEPS)
+                aux_ramp_frac_dict = {a: aux_ramp_frac_now for a in AGENTS}
 
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
             done = any(terms.values()) or any(truncs.values())
@@ -391,7 +434,7 @@ def main():
                     rewards[a] = rewards[a] + GAMMA * boot_values[agent_idx[a]].item()
 
             buf.store(obs, joint(obs), act_dict, logp_dict, rewards, float(done), value_dict,
-                      aux_dir_dict, in_search_dict)
+                      aux_dir_dict, in_search_dict, aux_ramp_frac_dict)
             # Sum across whichever agents were alive this step -- same
             # agent-step denominator as action_count, so mean_brake_reduction
             # (below) is directly comparable to mean_action_abs: how much of
@@ -493,6 +536,7 @@ def main():
         last_actor_loss, last_critic_loss = 0.0, 0.0
         last_approx_kl, last_clip_frac = 0.0, 0.0
         last_aux_loss, last_aux_cos, last_aux_frac = 0.0, float("nan"), 0.0
+        last_aux_coef_mean = AUX_DIR_COEF
         if buf.ptr == ROLLOUT_LEN:
             # Linear LR anneal to 0 over training -- constant with a
             # collapsing action std means the same gradient step moves the
@@ -526,13 +570,14 @@ def main():
             # reward stream and critic head), only the actor's training
             # batch is combined.
             o_list, jo_list, act_list, old_logp_list, adv_list, ret_list, head_list = [], [], [], [], [], [], []
-            aux_dir_list, in_search_list = [], []
+            aux_dir_list, in_search_list, aux_ramp_frac_list = [], [], []
             for a in AGENTS:
-                o, jo, act, old_logp, adv, ret, aux_dir_a, in_search_a = buf.get_tensors(a, last_value_dict[a])
+                o, jo, act, old_logp, adv, ret, aux_dir_a, in_search_a, aux_ramp_frac_a = buf.get_tensors(a, last_value_dict[a])
                 o_list.append(o); jo_list.append(jo); act_list.append(act)
                 old_logp_list.append(old_logp); adv_list.append(adv); ret_list.append(ret)
                 head_list.append(torch.full((o.shape[0],), agent_idx[a], dtype=torch.long))
                 aux_dir_list.append(aux_dir_a); in_search_list.append(in_search_a)
+                aux_ramp_frac_list.append(aux_ramp_frac_a)
 
             o = torch.cat(o_list).to(DEVICE)
             jo = torch.cat(jo_list).to(DEVICE)
@@ -543,6 +588,7 @@ def main():
             head_idx = torch.cat(head_list).to(DEVICE)
             aux_dir = torch.cat(aux_dir_list).to(DEVICE)
             in_search = torch.cat(in_search_list).to(DEVICE) > 0.5
+            aux_ramp_frac = torch.cat(aux_ramp_frac_list).to(DEVICE)
 
             n = o.shape[0]
             stop_early = False
@@ -564,18 +610,31 @@ def main():
                     # currently intend" must use. Restricted to in-search
                     # rows only (in_search[b]) -- inert (mask never true)
                     # outside active search, by construction.
+                    #
+                    # AUX_DIR_RAMP (2026-08-27): per-row coefficient instead
+                    # of the flat AUX_DIR_COEF -- see AUX_DIR_RAMP's comment
+                    # above. AUX_DIR_RAMP=0 makes coef_vals a constant
+                    # AUX_DIR_COEF tensor, reproducing the old flat-coefficient
+                    # loss exactly (verified: (1+0*x)==1 for all x).
                     search_mask = in_search[b]
                     if search_mask.any():
-                        aux_cos = torch.nn.functional.cosine_similarity(
+                        cos_vals = torch.nn.functional.cosine_similarity(
                             mean_dir[search_mask], aux_dir[b][search_mask], dim=-1)
-                        aux_loss = (1.0 - aux_cos).mean()
-                        last_aux_cos = aux_cos.mean().item()
+                        ramp_frac_vals = aux_ramp_frac[b][search_mask]
+                        coef_vals = AUX_DIR_COEF * (1.0 + AUX_DIR_RAMP * ramp_frac_vals)
+                        per_row_loss = 1.0 - cos_vals
+                        aux_term = (coef_vals * per_row_loss).mean()
+                        last_aux_cos = cos_vals.mean().item()
+                        last_aux_loss = per_row_loss.mean().item()
+                        last_aux_coef_mean = coef_vals.mean().item()
                     else:
-                        aux_loss = torch.zeros((), device=o.device)
+                        aux_term = torch.zeros((), device=o.device)
                         last_aux_cos = float("nan")
+                        last_aux_loss = 0.0
+                        last_aux_coef_mean = AUX_DIR_COEF
                     last_aux_frac = search_mask.float().mean().item()
 
-                    actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean() + AUX_DIR_COEF * aux_loss
+                    actor_loss = -torch.min(s1, s2).mean() - ent_coef * entropy.mean() + aux_term
 
                     value_pred = critic(jo[b])[torch.arange(len(b)), head_idx[b]]
                     critic_loss = ((value_pred - ret[b]) ** 2).mean()
@@ -602,7 +661,6 @@ def main():
                     last_actor_loss = actor_loss.item()
                     last_critic_loss = critic_loss.item()
                     last_entropy = entropy.mean().item()
-                    last_aux_loss = aux_loss.item()
 
                     # Per-minibatch check, not just per-epoch: the previous
                     # version only stopped between epochs, so a single bad
@@ -701,7 +759,8 @@ def main():
                   f"critic[v={critic_v_mean:.1f}±{critic_v_std:.2f} tgt={critic_target_mean:.1f}±{critic_target_std:.1f} "
                   f"pearson={critic_pearson:.3f} spearman={critic_spearman:.3f} "
                   f"final_sat={critic_final_sat_frac*100:.0f}% pre_std={critic_final_pre_std:.2f}] "
-                  f"aux[coef={AUX_DIR_COEF:.3f} loss={last_aux_loss:.4f} cos={last_aux_cos:.3f} frac_insearch={last_aux_frac:.3f}]")
+                  f"aux[coef={AUX_DIR_COEF:.3f} ramp={AUX_DIR_RAMP:.2f} coef_mean={last_aux_coef_mean:.4f} "
+                  f"loss={last_aux_loss:.4f} cos={last_aux_cos:.3f} frac_insearch={last_aux_frac:.3f}]")
 
             log_row(total_steps=total_steps, episode=ep_count, avg_reward=avg_reward,
                      collision_rate=collision_rate, target_lost_rate=target_lost_rate,
@@ -730,7 +789,7 @@ def main():
                      critic_pearson=critic_pearson, critic_spearman=critic_spearman,
                      critic_final_sat_frac=critic_final_sat_frac, critic_final_pre_std=critic_final_pre_std,
                      aux_dir_coef=AUX_DIR_COEF, aux_loss=last_aux_loss, aux_cos=last_aux_cos,
-                     aux_frac_insearch=last_aux_frac)
+                     aux_frac_insearch=last_aux_frac, aux_coef_mean=last_aux_coef_mean)
 
         save_checkpoint(actor, critic, opt_actor, opt_critic, total_steps, ep_count, RUN_ID)
 

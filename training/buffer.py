@@ -30,10 +30,15 @@ class RolloutBuffer:
         # AUX_DIR_COEF > 0 in training/train.py.
         self.aux_dir = {a: np.zeros((n, 3), np.float32) for a in self.agents}
         self.in_search = {a: np.zeros(n, np.float32) for a in self.agents}
+        # AUX_DIR_RAMP (2026-08-27): how far into the LOST_TIMEOUT_STEPS
+        # window this row was taken (0 at loss onset, 1 at the timeout) --
+        # see AUX_DIR_RAMP's comment in train.py. Inert (never read) unless
+        # AUX_DIR_RAMP > 0.
+        self.aux_ramp_frac = {a: np.zeros(n, np.float32) for a in self.agents}
         self.ptr = 0
 
     def store(self, obs_dict, joint_obs, act_dict, logp_dict, rew_dict, done, value_dict,
-              aux_dir_dict, in_search_dict):
+              aux_dir_dict, in_search_dict, aux_ramp_frac_dict):
         i = self.ptr
         for a in self.agents:
             self.obs[a][i] = obs_dict[a]
@@ -43,6 +48,7 @@ class RolloutBuffer:
             self.values[a][i] = value_dict[a]
             self.aux_dir[a][i] = aux_dir_dict[a]
             self.in_search[a][i] = in_search_dict[a]
+            self.aux_ramp_frac[a][i] = aux_ramp_frac_dict[a]
         self.joint_obs[i] = joint_obs
         self.dones[i] = done
         self.ptr += 1
@@ -73,4 +79,5 @@ class RolloutBuffer:
             torch.as_tensor(ret),
             torch.as_tensor(self.aux_dir[agent]),
             torch.as_tensor(self.in_search[agent]),
+            torch.as_tensor(self.aux_ramp_frac[agent]),
         )
