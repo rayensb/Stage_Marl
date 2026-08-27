@@ -71,16 +71,24 @@ CRITIC_LR = float(os.environ.get("CRITIC_LR", LR))
 # analogous ground-truth-free reward proxy has ~44.8% sign mismatch with
 # true progress -- too unreliable to reward) and NOT imitation of the
 # scripted controller (no hard-coded action target, only a directional
-# nudge the policy can override). Env-var overridable, defaults to 0.0 (a
-# verified no-op -- see AUX_DIR_COEF's use below, the term is multiplied
-# by this coefficient and contributes exactly nothing when it's 0).
-# 0.01 (the treatment value used for the matched-seed comparison this was
-# built for) was sized by comparing to this project's own logged
-# actor_loss magnitude (median 0.04, p90 0.11 across a real run) rather
-# than guessed outright -- a starting point, not a tuned value; the first
-# thing to revisit if the ablation shows a real but under- or over-shot
-# effect.
-AUX_DIR_COEF = float(os.environ.get("AUX_DIR_COEF", 0.0))
+# nudge the policy can override).
+#
+# RESULT (2026-08-27): matched 3-seed Kaggle comparison (control=unset vs
+# treatment=0.01) -- target_lost_rate, contact_fraction, success_rate, and
+# productive_agent_fraction all improved in 3/3 seeds at BOTH final and
+# best checkpoints (e.g. target_lost_rate 0.83/0.86/0.98 -> 0.26/0.14/0.38
+# final; 0.79/0.95/0.98 -> 0.26/0.14/0.56 best). collision_rate rose
+# slightly in 2/3 seeds (by 1-3 points) -- real but small next to the
+# 8-14% costs seen elsewhere in this project, accepted rather than
+# chased further. This is the first change in the whole active-search/
+# target_lost investigation that measurably improved the primary failure
+# metric, not just localized it -- see EXPERIMENT_LOG.md's "Search-
+# direction auxiliary objective" entry and DECISIONS.md for the full
+# per-seed/per-checkpoint tables and the adoption reasoning.
+# ADOPTED as the default (0.0 -> 0.01). Per explicit decision, no
+# coefficient sweep or further diagnosis is planned -- override to 0.0 to
+# recover the old (pre-2026-08-27) behavior for comparison/debugging.
+AUX_DIR_COEF = float(os.environ.get("AUX_DIR_COEF", 0.01))
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01

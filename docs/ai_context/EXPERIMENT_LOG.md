@@ -1168,3 +1168,81 @@ include a training signal that specifically rewards heading correction/reassignm
 credit-assignment change that makes a productive search action more clearly attributable across
 the many steps between committing to a heading and actually reacquiring. Not yet decided — open
 question for the user.
+
+## Search-direction auxiliary objective (AUX_DIR_COEF) — first intervention that moves target_lost_rate, validated across matched seeds and both final/best checkpoints
+
+**Objective**: follow-on to the decisive counterfactual above. A correction-quality diagnostic
+(natural loss events, real corrections >45° compared against a same-state random-rotation null)
+found PPO's directional corrections beat random 61-62% of the time (real, non-random judgment) but
+converted to sustained positive progress only 3.3-4.5% of the time for persistently-unproductive
+agents vs. 61.6-69.8% for eventually-productive ones — weak but genuine directional judgment, not
+simple wandering, and not entrenchment either (unproductive agents corrected *more* often, not
+less: 42.3% vs 31.1% ever-corrected during a sustained bad streak). A quick separability check
+(logistic regression on the raw pre-correction observation predicting sustained-positive-progress,
+AUC=0.834 vs. a 0.786 majority-class baseline) confirmed the agent-observable state already
+contains substantial information the policy isn't fully exploiting, ruling out "not enough
+information" and motivating an actor-side intervention rather than more diagnosis, reward shaping,
+or observation redesign. (Full diagnostic chain — heading-quality, entrenchment, correction-quality
+— recorded in `PHASE2_CHECKPOINT.md`, not reproduced in full here.)
+**Configuration**: `AUX_DIR_COEF`, a new env-overridable constant in `training/train.py`, adds a
+small auxiliary actor loss term — active only during search (`steps_since_contact > 0`),
+encouraging the actor's current mean action direction toward `unit(_last_known_vel)` (a cue already
+shown to correlate with PPO's own successful corrections: 0.292 vs 0.175 pooled, 0.410 vs 0.256 on
+matched failure states). Deliberately not reward shaping (the credit-assignment diagnostic found
+the ground-truth-free reward-proxy equivalent has ~44.8% sign mismatch with true progress — too
+unreliable to reward) and not imitation of the scripted controller (a directional nudge the policy
+can override via its own gradient, not a hard-coded target). Required extending
+`Actor.evaluate()` to also return the current mean action direction and threading `aux_dir`/
+`in_search` through `RolloutBuffer` so the loss uses a gradient-connected quantity, not the
+buffer's already-sampled (stale) action. Matched 3-seed comparison: control (`AUX_DIR_COEF`
+unset) vs. treatment (`AUX_DIR_COEF=0.01`, sized by comparing to this project's own logged
+`actor_loss` magnitude — median 0.04, p90 0.11 — rather than guessed), `NUM_AGENTS=4`, current
+`phase3-resilience` config otherwise unchanged (6s timeout, reverted one-sided brake, 128/256
+network), `TOTAL_STEPS=3,000,000`, seeds 1-3. Control seeds 1-3 and treatment seeds 1-2 ran on
+Kaggle; treatment seed 3 ran locally (Kaggle's 5-session cap, same pattern as the critic-LR
+ablation) — smoke-tested first at `AUX_DIR_COEF=0` (verified no-op), `=1.0` (exaggerated, confirmed
+the mechanism works end-to-end — `aux_cos` climbed 0.36→0.97 across 4 rollouts), and `=0.01` (the
+actual treatment value, confirmed a modest, non-dominating nudge) before spending any Kaggle
+compute.
+**Result, final model** (eval-time, 100 episodes each):
+
+| seed | condition | target_lost | contact_fraction | success_rate | collision_rate | productive_agent_fraction | mean_productive_agents |
+|---|---|---|---|---|---|---|---|
+| 1 | control | 0.830 | 0.863 | 0.170 | 0.000 | 0.189 | 0.757 |
+| 1 | treatment | **0.260** | **0.954** | **0.720** | 0.020 | **0.306** | **1.225** |
+| 2 | control | 0.860 | 0.832 | 0.130 | 0.010 | 0.199 | 0.795 |
+| 2 | treatment | **0.140** | **0.967** | **0.830** | 0.030 | **0.393** | **1.571** |
+| 3 | control | 0.980 | 0.753 | 0.020 | 0.000 | 0.168 | 0.673 |
+| 3 | treatment | **0.380** | **0.945** | **0.620** | 0.000 | **0.262** | **1.019** |
+
+`mean_reacquisition_steps` rises under treatment in every seed (e.g. seed 2: 6.70→25.97 steps),
+but this is a sample-composition effect, not recovery genuinely getting slower: `total_loss_events`
+drops sharply under treatment (e.g. seed 2: 497→119 — the swarm loses contact far less often in
+the first place), so the loss events that still occur are a harder, adverse-selected remainder;
+`median_reacquisition_steps` (less outlier-sensitive) only moves 2→4 for that same seed, confirmed
+before reporting this as a real effect rather than assumed.
+**Result, best checkpoint** (same protocol, run specifically to check the final-model comparison
+wasn't an artifact of where each seed's training trajectory happened to land):
+
+| seed | condition | target_lost | contact_fraction | success_rate | collision_rate | productive_agent_fraction |
+|---|---|---|---|---|---|---|
+| 1 | control | 0.790 | 0.863 | 0.210 | 0.000 | 0.192 |
+| 1 | treatment | **0.260** | **0.954** | **0.720** | 0.020 | **0.306** |
+| 2 | control | 0.950 | 0.811 | 0.050 | 0.000 | 0.256 |
+| 2 | treatment | **0.140** | **0.967** | **0.830** | 0.030 | **0.393** |
+| 3 | control | 0.980 | 0.741 | 0.010 | 0.010 | 0.149 |
+| 3 | treatment | **0.560** | **0.902** | **0.440** | 0.000 | **0.255** |
+
+Improvement holds in all 3 seeds on every core metric at both final and best checkpoints — seed
+3's margin is smaller at the best-checkpoint comparison (0.980→0.560 vs. 0.980→0.380 at final) but
+still large, consistent, and in the same direction as every other cell in both tables.
+**Conclusion**: this is the first intervention in the entire active-search/`target_lost`
+investigation that measurably moves the primary failure metric, not just localizes where the
+problem lives. Passes the pre-registered decision rule (≥2/3 seeds improve without unacceptable
+safety regression) decisively — 3/3 seeds improve on every core metric at both checkpoint
+selections. Collision cost is real but small (0-3%, well below the 8-14% costs seen elsewhere in
+this project when active search converges under other mechanisms) — treated as a metric to keep
+monitoring, not a disqualifying regression.
+**Status**: adopted. `AUX_DIR_COEF`'s default changed from `0.0` to `0.01` (see `DECISIONS.md`).
+Per explicit decision, no coefficient sweep or further diagnosis is planned — this is now the
+experimental baseline going forward.

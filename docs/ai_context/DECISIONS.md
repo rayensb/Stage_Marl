@@ -749,3 +749,29 @@ critic-health diagnostic columns added to `training_log.csv` alongside it stay, 
 useful instrumentation independent of this specific ablation's outcome. Investigation moved to
 the actor's own search-action dynamics, which located the dominant cause — see
 `EXPERIMENT_LOG.md`'s decisive counterfactual-from-PPO-states entry.
+
+## Search-direction auxiliary objective adopted as the new default (`AUX_DIR_COEF=0.01`)
+
+**Decision**: after a matched 3-seed Kaggle comparison (control: `AUX_DIR_COEF` unset vs.
+treatment: `AUX_DIR_COEF=0.01`) showed `target_lost_rate`, `contact_fraction`, `success_rate`, and
+`productive_agent_fraction` all improving in 3/3 seeds at *both* final and best checkpoints,
+`AUX_DIR_COEF`'s default changed from `0.0` to `0.01` in `training/train.py`.
+**Why adopted rather than requiring a coefficient sweep first**: the effect at the single tested
+value was already large and consistent across every seed and both checkpoint selections —
+`target_lost_rate` dropped by 30-81 percentage points depending on seed/checkpoint, `success_rate`
+rose by 43-80 points, with no seed or checkpoint selection going the wrong direction on any core
+metric. Per explicit decision, sweeping the coefficient now was judged more likely to turn a
+working intervention into another open-ended diagnosis loop than to meaningfully improve on an
+already-decisive result — if a specific reason emerges later to suspect the value is poorly tuned
+(an observed ceiling, an unexpected side effect at longer training, a different `NUM_AGENTS`
+behaving differently), revisit then, not preemptively.
+**Known cost, accepted rather than chased further**: `collision_rate` rises slightly in 2 of 3
+seeds (by 1-3 percentage points) — real, not zero, but small relative to the 8-14% collision costs
+seen elsewhere in this project when active search converges tightly under other mechanisms.
+Treated as a metric to keep monitoring in future work, not a reason to withhold adoption.
+**Result**: see `EXPERIMENT_LOG.md`'s "Search-direction auxiliary objective" entry for the full
+per-seed, per-checkpoint tables.
+**Status**: adopted. This is the first change in the whole active-search/`target_lost`
+investigation (spanning the critic-collapse chain, the actor-search-dynamics chain, and this
+auxiliary-objective intervention) that measurably improved the primary failure metric rather than
+only localizing where it lives.
