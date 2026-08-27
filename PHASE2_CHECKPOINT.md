@@ -697,6 +697,32 @@ Kaggle kernel and will be run locally for the 6th; compare `target_lost_rate`, `
 per the pre-agreed decision rule (≥2/3 seeds improve without unacceptable safety regression -> keep;
 otherwise abandon and move to the next intervention).
 
+## Update 2026-08-27: result — passes decisively at both final and best checkpoints; AUX_DIR_COEF=0.01 adopted as the new default
+
+All 5 Kaggle kernels completed; downloaded and parsed alongside the local seed-3 result. Every
+core metric improved in **3/3 seeds** (not just the ≥2/3 threshold), at **both** final and best
+checkpoints: `target_lost_rate` 0.83/0.86/0.98 → 0.26/0.14/0.38 (final), 0.79/0.95/0.98 →
+0.26/0.14/0.56 (best); `success_rate` 0.17/0.13/0.02 → 0.72/0.83/0.62 (final); `contact_fraction`
+and `productive_agent_fraction` up in every seed at both checkpoints (`mean_productive_agents`
+nearly doubles). `collision_rate` rises slightly in 2/3 seeds (1-3 points) — real but small next
+to the 8-14% costs seen elsewhere in this project, not treated as disqualifying.
+
+Per explicit user instruction, ran exactly the one requested validation (best-checkpoint
+comparison, same protocol) rather than a coefficient sweep or further diagnosis, confirmed the
+result survives it, then stopped. **`AUX_DIR_COEF`'s default changed from `0.0` to `0.01`**
+(commit `84232ab`) — this is now the standing default for any future `training/train.py` run at
+`NUM_AGENTS=4` unless explicitly overridden to `0.0`. Recorded in full in `EXPERIMENT_LOG.md`
+("Search-direction auxiliary objective" entry) and `DECISIONS.md`.
+
+**This is the first change in the entire active-search/`target_lost` investigation (spanning the
+critic-collapse chain, the actor-search-dynamics chain, and this intervention) that measurably
+improved the primary failure metric, not just localized where it lives.** Per explicit decision,
+no coefficient sweep, no further diagnosis, no other mechanism change planned right now — this is
+the new experimental baseline to build on. Whoever picks this up next (including the deployment
+thread, if a fresh `N=3` training attempt is tried) should know the default has changed and that
+`checkpoints/`/`models/` produced before commit `84232ab` were trained under the old
+(`AUX_DIR_COEF=0.0`) behavior, not this one.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
