@@ -723,6 +723,34 @@ thread, if a fresh `N=3` training attempt is tried) should know the default has 
 `checkpoints/`/`models/` produced before commit `84232ab` were trained under the old
 (`AUX_DIR_COEF=0.0`) behavior, not this one.
 
+## Update 2026-08-27 (later): new-baseline failure-mode audit -> AUX_DIVERSIFY implemented, launch pending
+
+Per explicit instruction, did **not** launch another 3M-step run just to check whether more
+training closes the remaining gap. Instead re-used the already-trained `AUX_DIR_COEF=0.01`
+checkpoints as the new Phase 3 baseline (zero new training cost) and audited remaining failures
+from data already downloaded: pooled 300 eval episodes (3 seeds) split **72.3% success / 26.0%
+target_lost / 1.7% collision / 0.0% ground_strike** -- target_lost remains ~15x more common than
+collision, still the dominant failure mode. Failed episodes average `episode_len=1176.5` (of 1800
+max) and `contact_fraction=0.865` even at failure -- these are late, genuine recovery failures,
+not early collapse. Of the 78 pooled target_lost episodes, 67.9% fail on the swarm's very first
+loss event of that episode (`longest_loss_streak` mean=121, a real 6s-timeout exhaustion, not
+something else).
+
+**`AUX_DIVERSIFY` implemented** (commit `bb2b3dd`), specified entirely from already-established
+evidence, no new diagnostic run: `AUX_DIR_COEF` as built pulls every agent toward the identical
+`unit(_last_known_vel)` direction every search step -- in tension with active search's own design
+(deliberately spread headings for coverage) at exactly the point this project's most robust,
+repeatedly-reconfirmed finding (productive-agent count/diversity separates success from failure,
+both pre- and post-AUX) says diversity still matters. When enabled, blends
+`unit(_last_known_vel)` with each agent's own already-diverse `_search_dirs[agent]` instead of
+using one shared direction for the whole swarm -- `AUX_DIR_COEF`'s magnitude and everything else
+unchanged, isolating exactly one variable against the *current* baseline. Smoke-tested both paths
+(`AUX_DIVERSIFY` unset vs `=1`), no crash, sane values, existing test suite still passes.
+
+**Status**: implemented and smoke-tested only. **No Kaggle launch yet** -- awaiting the user's
+go-ahead on the matched 3-seed comparison (control = current baseline, `AUX_DIVERSIFY` unset;
+treatment = `AUX_DIVERSIFY=1`), same protocol as every prior ablation this investigation.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
