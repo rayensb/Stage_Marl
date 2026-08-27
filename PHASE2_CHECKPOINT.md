@@ -751,6 +751,29 @@ unchanged, isolating exactly one variable against the *current* baseline. Smoke-
 go-ahead on the matched 3-seed comparison (control = current baseline, `AUX_DIVERSIFY` unset;
 treatment = `AUX_DIVERSIFY=1`), same protocol as every prior ablation this investigation.
 
+## Update 2026-08-27 (later still): AUX_DIVERSIFY matched comparison launched (5 Kaggle + 1 local)
+
+Explicit user go-ahead received. Checked `git status` was already up to date with `origin`
+(nothing new to push). Launched, identical structure to the AUX_DIR_COEF launch:
+`stage-marl-diversify-control-s{1,2,3}` (`AUX_DIVERSIFY` unset -- current baseline,
+`AUX_DIR_COEF=0.01` only) and `stage-marl-diversify-treat-s{1,2}` (`AUX_DIVERSIFY=1`) on Kaggle
+-- all 5 confirmed `RUNNING`. Treatment seed 3 run locally (Kaggle's 5-session cap).
+
+**Same checkpoint-collision issue as last time, caught proactively this round**: `run_id=3`
+locally still held the *previous* local run's artifacts (the `AUX_DIR_COEF=0.01`-only
+treatment-seed-3 run from the last ablation) at 3,009,600 steps -- checked for this specifically
+before launching (having been bitten by it once already) and moved
+`checkpoints/latest_3.pt`/`models/actor_3.pt`/`models/actor_best_3.pt`/`logs/training_log_3.csv`/
+`logs/eval_3.csv`/`logs/eval_best_3.csv` aside (preserved, not deleted) before relaunching --
+confirmed via `ps` the process is actually training this time, not exiting instantly. All 6 arms
+confirmed running as of this update.
+
+**Status**: launched, in progress. Same evaluation plan as before: download all 6 once complete,
+compare `target_lost_rate`, `contact_fraction`, `success_rate`, `productive_agent_fraction`/count,
+`collision_rate`, and the failure-category breakdown, at both final and best checkpoints, against
+the acceptance criterion (meaningful `target_lost_rate` reduction in ≥2/3 seeds without
+unacceptable collision regression).
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
