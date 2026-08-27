@@ -89,6 +89,34 @@ CRITIC_LR = float(os.environ.get("CRITIC_LR", LR))
 # coefficient sweep or further diagnosis is planned -- override to 0.0 to
 # recover the old (pre-2026-08-27) behavior for comparison/debugging.
 AUX_DIR_COEF = float(os.environ.get("AUX_DIR_COEF", 0.01))
+
+# AUX_DIVERSIFY (2026-08-27): targeted follow-on now that AUX_DIR_COEF is
+# the baseline. A fresh baseline evaluation (3 seeds, current committed
+# code) still shows target_lost_rate=26.0% -- 15x more common than the
+# next failure mode (collision, 1.7%) -- with 67.9% of those failures
+# fatal on the swarm's very first loss event of the episode, despite
+# contact_fraction ~0.87 even in the failed episodes (see PHASE2_CHECKPOINT.md).
+# Specified from existing evidence, no new diagnostic run: (1) as built,
+# AUX_DIR_COEF pulls EVERY agent toward the identical unit(_last_known_vel)
+# direction every search step (see aux_dir_dict below); (2) active search's
+# own design (_assign_search_directions, DECISIONS.md) deliberately spreads
+# agents across DIFFERENT headings so the swarm covers more area, not one;
+# (3) the single most robust signal in this whole investigation, checked
+# both before and after AUX_DIR_COEF, is that productive-agent count/
+# diversity is what separates success from failure (pre-AUX: reacquired
+# events averaged 2.25 productive agents vs 0.41 for target_lost; post-AUX,
+# productive_agent_fraction implies ~1.0-1.6 of 4, better but still well
+# short of 2.25). Putting (1)-(3) together: pulling every agent toward the
+# same direction may be trading away exactly the coverage diversity that
+# (3) says still matters, capping how many independent chances the swarm
+# gets per event. When enabled, blends unit(_last_known_vel) with each
+# agent's OWN already-diverse _search_dirs[agent] (plain vector sum, then
+# normalize -- no new tunable weight) instead of using the swarm-uniform
+# direction. AUX_DIR_COEF's magnitude, the search-mode gate, and everything
+# else stay exactly as validated -- this isolates one variable (uniform vs.
+# per-agent-diverse target direction) against the CURRENT baseline, not the
+# pre-AUX one. Defaults to 0 (current, validated behavior unchanged).
+AUX_DIVERSIFY = bool(int(os.environ.get("AUX_DIVERSIFY", 0)))
 CLIP = 0.2
 GAMMA = 0.99
 ENT_COEF_START = 0.01
@@ -214,7 +242,7 @@ def joint(obs_dict):
 
 def main():
     global _stop_requested
-    print(f"[run] device={DEVICE} seed={SEED} critic_lr={CRITIC_LR}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
+    print(f"[run] device={DEVICE} seed={SEED} critic_lr={CRITIC_LR} aux_dir_coef={AUX_DIR_COEF} aux_diversify={AUX_DIVERSIFY}" + (f" run_id={RUN_ID}" if RUN_ID else " (SEED env var unset -> outputs unsuffixed)"))
     torch.manual_seed(SEED)
     np.random.seed(SEED)
 
@@ -310,12 +338,28 @@ def main():
                 # from the state the action above was actually chosen from,
                 # before stepping -- steps_since_contact/_last_known_vel are
                 # swarm-wide (identical for every agent this step), see
-                # AUX_DIR_COEF's comment above. Inert data (never read) when
-                # AUX_DIR_COEF is left at its default 0.0.
+                # AUX_DIR_COEF's comment above.
                 in_search_now = float(env._steps_since_contact > 0)
                 lkv_norm = float(np.linalg.norm(env._last_known_vel))
-                aux_dir_now = (env._last_known_vel / lkv_norm).astype(np.float32) if lkv_norm > 1e-6 else np.zeros(3, np.float32)
-                aux_dir_dict = {a: aux_dir_now for a in AGENTS}
+                lkv_dir = (env._last_known_vel / lkv_norm).astype(np.float32) if lkv_norm > 1e-6 else np.zeros(3, np.float32)
+                if AUX_DIVERSIFY:
+                    # Per-agent blend (see AUX_DIVERSIFY's comment above):
+                    # unit(last_known_vel + own_search_dir), falling back to
+                    # the agent's own search direction alone if the two
+                    # nearly cancel (rare, but a real edge case -- a
+                    # near-zero blended vector would otherwise normalize to
+                    # an unstable/meaningless direction).
+                    aux_dir_dict = {}
+                    for a in AGENTS:
+                        search_dir_a = env._search_dirs.get(a)
+                        if search_dir_a is None:
+                            aux_dir_dict[a] = np.zeros(3, np.float32)
+                            continue
+                        blended = lkv_dir + search_dir_a
+                        b_norm = float(np.linalg.norm(blended))
+                        aux_dir_dict[a] = (blended / b_norm).astype(np.float32) if b_norm > 1e-6 else search_dir_a.astype(np.float32)
+                else:
+                    aux_dir_dict = {a: lkv_dir for a in AGENTS}
                 in_search_dict = {a: in_search_now for a in AGENTS}
 
             next_obs, rewards, terms, truncs, infos = env.step(act_dict)
