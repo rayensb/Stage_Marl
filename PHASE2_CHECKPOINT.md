@@ -852,6 +852,46 @@ checkpoints (≥2/3 seeds improve `target_lost_rate` without unacceptable collis
 `productive_agent_fraction` should not regress -> keep; otherwise reject and move to the next
 intervention).
 
+## Update 2026-08-27 (later still): AUX_DIR_RAMP result — decisive 3/3-seed regression, rejected
+
+All 6 arms completed (5 Kaggle + 1 local) and evaluated with the identical matched protocol.
+Confirmed clean comparison first: all 5 Kaggle kernels cloned the identical commit `aace112`,
+and the local run's one-commit-later HEAD (`a30b306`) differs from `aace112` only in
+`PHASE2_CHECKPOINT.md` (`git diff` on `training/`/`config.py`/`envs/` is empty) — no code drift
+between arms.
+
+**Result, `target_lost_rate` (final / best), treatment vs. its own matched control**:
+
+| seed | control final | control best | treat final | treat best | Δ final |
+|---|---|---|---|---|---|
+| 1 | 0.180 | 0.160 | 0.550 | 0.550 | **+0.370** |
+| 2 | 0.160 | 0.230 | 0.240 | 0.260 | **+0.080** |
+| 3 | 0.050 | 0.050 | 0.280 | 0.280 | **+0.230** |
+
+**All 3/3 seeds regressed, at both checkpoints** -- fails the ≥2/3-improve acceptance criterion
+in the wrong direction, more decisively than `AUX_DIVERSIFY`'s mixed 1-up-1-down-1-flat result.
+`collision_rate` moved inconsistently (down in 2/3, up in 1/3) and `productive_agent_fraction`
+was down in 2/3 seeds (0.173→0.096, 0.303→0.282) -- consistent with the regression, not
+offsetting it. **Rejected.**
+
+**Leading hypothesis for why, not further tested this round**: the pull target
+(`unit(_last_known_vel)`) is a fixed dead-reckoning cue that gets *staler* the longer contact
+stays lost, especially with Phase 3's dynamic target (mid-episode redirects, `TARGET_REDIRECT_
+INTERVAL_STEPS`). The ramp assumed urgency should rise while the cue stays equally reliable, but
+if the cue's reliability actually decays with `steps_since_contact`, escalating commitment to it
+as the timeout approaches is backwards -- it forces the actor toward an increasingly wrong
+direction exactly when it should be leaning more on its own real-but-weak directional judgment
+(the correction-quality diagnostic's finding), not less. This is a candidate lesson for any
+future strength-schedule idea on this same auxiliary signal, not something acted on now.
+
+**`AUX_DIR_RAMP` stays at its default (0.0)** -- no change needed, it was never adopted.
+`AUX_DIR_COEF=0.01` (flat, no ramp) remains the Phase 3 baseline, unaffected by this result --
+this ablation only tested a strength *schedule* on top of it, not the underlying signal itself.
+Recorded in `training/train.py`'s `AUX_DIR_RAMP` comment (RESULT block). Per the project's
+current "intervention → evaluation → accept/reject" mode: this is now two rejected follow-ons in
+a row (`AUX_DIVERSIFY`, `AUX_DIR_RAMP`) on top of the one validated win (`AUX_DIR_COEF`) -- next
+direction is an open question for the user, not chosen here.
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,

@@ -154,6 +154,24 @@ AUX_DIVERSIFY = bool(int(os.environ.get("AUX_DIVERSIFY", 0)))
 # validated flat-coefficient behavior exactly reproduced -- see the
 # aux_ramp_frac/coef_vals computation below for why this is an exact
 # no-op at 0).
+#
+# RESULT (2026-08-27): matched 3-seed comparison at AUX_DIR_RAMP=1.0 --
+# target_lost_rate got WORSE in 3/3 seeds at both final and best checkpoints
+# (final: +0.37/+0.08/+0.23 vs. each seed's own control). Worse than
+# AUX_DIVERSIFY's mixed result -- this is a clean, decisive regression, not
+# a wash. REJECTED. Leading hypothesis, not further tested: the pull target
+# (unit(_last_known_vel)) is a fixed dead-reckoning cue that gets STALER the
+# longer contact stays lost, especially with Phase 3's dynamic target
+# (mid-episode redirects) -- ramping the coefficient UP as time runs out
+# assumes the cue stays reliable while urgency rises, but if reliability
+# actually decays with steps_since_contact, escalating commitment to it is
+# backwards: it forces the actor toward an increasingly wrong direction
+# exactly when it should lean more on its own (weak-but-real, per the
+# correction-quality diagnostic) judgment, not less. Left at its default
+# (0.0, flat AUX_DIR_COEF behavior); no further tuning of this specific
+# ramp-shape idea planned. Does not invalidate AUX_DIR_COEF itself (still
+# the clean 3/3 win, unaffected -- this only changed its strength schedule).
+# See EXPERIMENT_LOG.md/PHASE2_CHECKPOINT.md.
 AUX_DIR_RAMP = float(os.environ.get("AUX_DIR_RAMP", 0.0))
 CLIP = 0.2
 GAMMA = 0.99
