@@ -828,6 +828,30 @@ user's go-ahead on the matched 3-seed comparison (control = current baseline unc
 secondary check that `productive_agent_fraction` doesn't regress) as every prior ablation this
 investigation.
 
+## Update 2026-08-27 (later still): AUX_DIR_RAMP matched comparison launched (5 Kaggle + 1 local)
+
+Explicit user go-ahead received. Confirmed `git status` up to date with `origin` (nothing
+pending), pushed the 2 local commits above first. Launched, identical structure to the two prior
+ablations: `stage-marl-auxramp-control-s{1,2,3}` (`AUX_DIR_RAMP` unset -- current baseline,
+`AUX_DIR_COEF=0.01` only) and `stage-marl-auxramp-treat-s{1,2}` (`AUX_DIR_RAMP=1.0`) on Kaggle --
+all 5 confirmed `RUNNING`. Treatment seed 3 run locally (Kaggle's 5-session cap).
+
+**Same checkpoint-reuse hazard as the last two launches, checked proactively again**: `run_id=3`
+locally still held the *previous* local run's artifacts (the `AUX_DIVERSIFY=1` treatment-seed-3
+run from the last ablation, fully consumed at 3,009,600 steps -- confirmed by reading the
+checkpoint before touching anything) -- moved `checkpoints/latest_3.pt`/`models/actor_3.pt`/
+`models/actor_best_3.pt`/`logs/training_log_3.csv`/`logs/eval_3.csv`/`logs/eval_best_3.csv` aside
+(preserved, not deleted) before relaunching. Confirmed via `ps` (real CPU usage, elapsed time
+advancing) that training is genuinely progressing, not exiting instantly. All 6 arms confirmed
+running as of this update.
+
+**Status**: launched, in progress. Same evaluation plan and acceptance criterion as the launch
+plan above: download all 6 once complete, compare `target_lost_rate`, `contact_fraction`,
+`success_rate`, `productive_agent_fraction`/count, `collision_rate` at both final and best
+checkpoints (≥2/3 seeds improve `target_lost_rate` without unacceptable collision regression,
+`productive_agent_fraction` should not regress -> keep; otherwise reject and move to the next
+intervention).
+
 ## Open, not yet decided
 
 - "Genetic/evolutionary" training as an alternative to PPO -- raised,
