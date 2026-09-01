@@ -55,6 +55,21 @@ the environment.** No fix has been designed yet; this is now the project's singl
 open problem. See `SESSION_HANDOFF.md` first; `KNOWN_ISSUES.md` items 12/13/18/19 and `TODO.md`
 Critical for specifics.
 
+**Updated again 2026-08-27, now against commit `77b79b3` on `phase3-resilience`**: the project
+moved from diagnosis to intervention on its top problem. `AUX_DIR_COEF=0.01`, a small auxiliary
+actor-loss term nudging search direction toward `unit(_last_known_vel)`, **measurably improved
+`target_lost_rate` in 3/3 seeds at both final and best checkpoints** — the first fix, not just
+localization, in the whole investigation — and was adopted as the default. A no-retraining audit
+of the new baseline found 26.0% `target_lost` remains, concentrated in late, first-loss-event-
+fatal failures (67.9% of failures die on the episode's very first loss event). Two follow-on
+interventions built directly from that audit — `AUX_DIVERSIFY` (per-agent heading diversity) and
+`AUX_DIR_RAMP` (urgency-scaled coefficient) — were each tested via a matched 3-seed comparison and
+**both rejected** (a mixed result, then a clean 3/3-seed regression). Neither adopted;
+`AUX_DIR_COEF=0.01` remains the baseline. Closing the remaining 26% is still the project's single
+most important open problem, and the two most directly evidence-motivated next ideas have already
+failed. See `SESSION_HANDOFF.md` first; `KNOWN_ISSUES.md` item 12 and `TODO.md` Critical for
+specifics.
+
 ## Read order for a new session
 
 1. **`AI_CONTEXT.md`** — start here. What this is, current status, what to read next.

@@ -6,7 +6,7 @@ session ends mid-task or reaches a natural checkpoint.
 
 ## Last updated
 
-2026-08-26. Prior entry (2026-08-22) covered resolving the `N=4` collision problem, validating it
+2026-08-27. Prior entry (2026-08-22) covered resolving the `N=4` collision problem, validating it
 alongside two formation-quality fixes (`phase2-combined`), bundling five sustained-flight changes
 (Phase 3) whose one serious failure (`target_lost_rate` near 100%) was diagnosed and improved by
 active search, and reformulating the closing-speed brake with relative velocity in response to a
@@ -20,8 +20,65 @@ unexplained deployment blocker; a deep supervisor-guided investigation traced `t
 failures through a real-but-secondary critic-saturation pathology (tested and rejected as a fix)
 to a decisive finding: **the root cause is the learned actor's own search execution, not the
 environment** — proven by branching non-learned controllers from PPO's own real failure states
-and watching them succeed 100% of the time where PPO fails 100% of the time. This doc-update pass
-("document all") is the most recent action.
+and watching them succeed 100% of the time where PPO fails 100% of the time. **The 2026-08-26
+doc pass ended there; since then (this entry)**: the project moved from diagnosis to
+intervention. `AUX_DIR_COEF=0.01` (a small actor-loss term nudging search direction toward
+`unit(_last_known_vel)`) was implemented, smoke-tested, and validated in a matched 3-seed
+comparison — `target_lost_rate` improved in **3/3 seeds at both final and best checkpoints**
+(e.g. 0.83/0.86/0.98 → 0.26/0.14/0.38 final), the first intervention in the whole investigation
+to move the primary metric rather than just localize it — and **adopted as the new default**. A
+no-retraining audit of the new baseline found 26.0% `target_lost` remains, concentrated in late,
+first-loss-event-fatal failures (67.9% of failures die on the episode's very first loss event).
+Two follow-on interventions built directly from that audit were tested and **both rejected**:
+`AUX_DIVERSIFY` (mixed: 1 up, 1 down, 1 flat) and `AUX_DIR_RAMP` (a clean, decisive 3/3-seed
+regression). This doc-update pass ("document all," alongside a full project report) is the most
+recent action.
+
+## What happened this session (2026-08-26 through 2026-08-27, intervention phase)
+
+**`AUX_DIR_COEF` implemented and validated.** Built from a chain of small, targeted diagnostics
+run just before this: a separability check (logistic regression on the raw pre-correction
+observation predicting sustained-positive-progress, AUC=0.834 vs. a 0.786 majority-class
+baseline) confirmed the agent-observable state already contains exploitable information the
+policy wasn't using, ruling out "not enough information" and justifying an actor-side
+intervention. `AUX_DIR_COEF` adds a small auxiliary actor-loss term — active only during search,
+gradient-connected to the actor's current mean action (required extending `Actor.evaluate()` and
+`RolloutBuffer`) — nudging toward `unit(_last_known_vel)`. Smoke-tested at 0 (no-op), 1.0
+(exaggerated, confirmed working end-to-end), and 0.01 (the sized treatment value) before any
+Kaggle spend. Matched 3-seed comparison passed decisively at both final and best checkpoints —
+see `EXPERIMENT_LOG.md`. Adopted; the user's explicit instruction after adoption was **not** to
+launch another long training run to see if more steps would close the gap, but to audit the
+existing data first.
+
+**New-baseline failure-mode audit (zero retraining cost).** Pooled the 300 already-collected
+`AUX_DIR_COEF=0.01` eval episodes: 72.3% success / 26.0% target_lost / 1.7% collision / 0.0%
+ground_strike. Failed episodes are late (`episode_len` mean 1176.5/1800) and high-contact
+(`contact_fraction` 0.865 even at failure) — genuine recovery failures, not early collapse — and
+67.9% fail on the swarm's very first loss event of the episode. This reframed the remaining
+problem as "ran out of time on the one search that mattered," which directly motivated the next
+two interventions.
+
+**`AUX_DIVERSIFY` and `AUX_DIR_RAMP`, both specified from this audit's evidence, both tested via
+matched 3-seed comparisons, both rejected.** `AUX_DIVERSIFY` blended the shared directional cue
+with each agent's own search heading (targeting the diversity hypothesis) — mixed result (1 up,
+1 down +0.18, 1 flat), and `productive_agent_fraction` didn't move the way the hypothesis
+predicted either. `AUX_DIR_RAMP` scaled the coefficient up as the timeout approached (targeting
+the first-event-fatal finding) — a clean 3/3-seed regression, worse than the mixed result.
+Leading hypothesis for the ramp's failure, not further tested: the pull target
+(`unit(_last_known_vel)`) gets staler the longer contact stays lost, especially with Phase 3's
+dynamic target — escalating commitment to it as urgency rises is backwards if its reliability is
+actually decaying over the same window. Neither adopted; `AUX_DIR_COEF=0.01` (flat) remains the
+baseline. See `EXPERIMENT_LOG.md`/`DECISIONS.md` for full detail on all three interventions.
+
+**Process notes, consistent with established practice**: every launch this session re-confirmed
+`git status` was up to date with `origin` immediately before pushing Kaggle kernels (per the
+standing rule from the earlier active-search incident). The local `run_id=3` checkpoint-collision
+hazard (reusing a `SEED` that still holds a previous unrelated local run's artifacts) recurred
+twice more this session and was caught both times by checking `ps`/logs before trusting a launch
+had started training, not assumed — the stale files were moved aside (preserved, not deleted)
+each time before relaunching. Both negative results (`AUX_DIVERSIFY`, `AUX_DIR_RAMP`) were
+reported plainly as failing the pre-agreed acceptance criterion rather than reframed positively,
+consistent with this project's established anti-overclaiming discipline.
 
 ## What was happening (the condensed history, through 2026-08-22)
 
@@ -211,13 +268,17 @@ this doc-update pass is what added them there.
 
 ## Unresolved / pending as of this handoff
 
-1. **The actor-search-execution problem — the real open question now, and the most important one
-   in the project.** Root cause localized (learned actor's own search execution, not the
-   environment) but **no fix has been designed or attempted**. Candidate directions, both
-   untested: a training signal that specifically rewards heading correction/reassignment, or a
-   credit-assignment change that makes a productive search action more clearly attributable
-   across the many steps between committing to a heading and actually reacquiring. This is an
-   open question for the user, not a decided next step.
+1. **The actor-search-execution problem — still the most important open question in the
+   project, now with a partial fix and two rejected follow-ons.** `AUX_DIR_COEF=0.01` (search-
+   direction auxiliary loss) closed part of the gap (3/3 seeds improved, e.g. target_lost_rate
+   0.83/0.86/0.98 → 0.26/0.14/0.38 final) and is adopted. 26% target_lost remains, concentrated in
+   late, first-loss-event-fatal failures. Two follow-ons built from that evidence —
+   `AUX_DIVERSIFY` (heading diversity) and `AUX_DIR_RAMP` (urgency-scaled coefficient) — were both
+   tested and both rejected (mixed, then a clean 3/3 regression). **No further fix direction has
+   been chosen** for the remaining 26% — this is an open question for the user, not a decided next
+   step. Whoever picks this up should read `EXPERIMENT_LOG.md`'s three AUX-intervention entries
+   before proposing a fourth idea, since the two most directly evidence-motivated ones from the
+   failure-mode audit have already been tried.
 2. **`NUM_AGENTS=3` cannot learn at all under Phase 3's mechanisms, at any tested network size.**
    A real deployment blocker, not yet under active investigation. Untried: a smaller network at
    `N=3` specifically (only 128/256 and 256/512 were tested), more training steps, or isolating
@@ -237,12 +298,13 @@ this doc-update pass is what added them there.
 
 ## Exact recommended next step for a new session
 
-This is now a decision point for the user, not a mechanical next step: the root cause of
-`target_lost` is understood, but no fix direction has been chosen. If picking this up cold, first
-confirm the two candidate fix directions above still look right (re-read `EXPERIMENT_LOG.md`'s
-decisive counterfactual entry), then either (a) propose a concrete fix design for the actor's
-search-execution problem and discuss before implementing anything in `envs/formation_env.py` or
-`training/train.py`, or (b) if the user wants to prioritize deployment-readiness instead, pivot to
-item 2 above (`N=3` won't learn at all) since that's the more concrete blocker for actually flying
-a Phase-3-era checkpoint. Check `PHASE2_CHECKPOINT.md` first if the deployment thread has moved in
-the meantime — this worktree is still shared.
+Still a decision point for the user, not a mechanical next step — now with more evidence about
+what *doesn't* work. `AUX_DIR_COEF=0.01` is adopted and real; the two most directly evidence-
+motivated follow-ons (diversify the pull direction, ramp its strength with urgency) have both been
+tried and rejected. If picking this up cold: first read `EXPERIMENT_LOG.md`'s three AUX-
+intervention entries (in order) to see what's already been ruled out, then either (a) propose a
+genuinely different mechanism for the remaining 26% (not a variant of the shared-direction pull
+already tested twice) and discuss before implementing, or (b) if the user wants to prioritize
+deployment-readiness instead, pivot to item 2 above (`N=3` won't learn at all) since that's the
+more concrete blocker for actually flying a Phase-3-era checkpoint. Check `PHASE2_CHECKPOINT.md`
+first if the deployment thread has moved in the meantime — this worktree is still shared.

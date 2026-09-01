@@ -1,6 +1,6 @@
 # Current State
 
-As of commit `71327be` on `phase3-resilience`, 2026-08-26. `origin/main` is at `8b724bb`
+As of commit `77b79b3` on `phase3-resilience`, 2026-08-27. `origin/main` is at `8b724bb`
 (`phase2-combined`'s reference point) — **fast-forwarded 2026-08-23**, no longer behind; this
 corrects a stale claim ("`main` still at `b59c139`") that persisted across several doc passes
 after the push actually happened. Local `main` in this worktree may still show an older commit
@@ -24,8 +24,16 @@ untracked `deployment/`-side files (not this doc suite's concern — see `ARCHIT
   clean dose-response).
 - **Active search**, validated as a real, major improvement over the plain-timeout approach:
   `contact_fraction` ~16-21% → 85-90.7% at 6s, and up to 99%+ contact / ~2-4% `target_lost_rate`
-  for seeds that converge well at 8-10s. **Why it still doesn't reach 100% is now understood** —
-  see "Known broken" below, the headline finding of this pass.
+  for seeds that converge well at 8-10s.
+- **Search-direction auxiliary objective (`AUX_DIR_COEF=0.01`), the new default as of
+  2026-08-27.** A small actor-loss term nudging search direction toward `unit(_last_known_vel)` —
+  the first intervention in the whole `target_lost` investigation to measurably move the primary
+  failure metric. 3/3 seeds improved on `target_lost_rate` at both final and best checkpoints
+  (e.g. 0.83/0.86/0.98 → 0.26/0.14/0.38 final), with `success_rate` and `productive_agent_fraction`
+  up in every seed and only a small collision-rate cost (0-3 points). Pooled new-baseline audit:
+  26.0% `target_lost` remains — late, first-loss-event-fatal failures, not early collapse. Two
+  follow-on ideas (`AUX_DIVERSIFY`, `AUX_DIR_RAMP`) were tested and **both rejected** — see "Known
+  broken" below.
 - **Ground awareness, per-axis (Z vs XY) action scaling, cruise-altitude preference, and
   Z-velocity smoothing** — all unchanged, still validated (0 ground strikes across every Phase 3
   validation rollout; jiggling fix still not re-measured, see "Unverified").
@@ -44,20 +52,25 @@ untracked `deployment/`-side files (not this doc suite's concern — see `ARCHIT
 
 ## Known broken / open problems
 
-**Headline: the root cause of `target_lost` failures during active search is now localized to
-the learned actor's own search execution — not the environment.** A deep investigation chain
-this pass (critic-collapse diagnostics, actor search-action dynamics, a scripted-controller
-ceiling test, and a decisive counterfactual experiment) ruled out the environment, search
-geometry, heading-assignment strategy, timeout length, and the critic, one at a time, with direct
-experiments rather than argument. The decisive result: branching PPO / scripted / adaptive
-controllers from PPO's own real loss-onset states (not an artificial mask), **PPO fails again
-100% of the time from states its own trajectory already failed from — but a simple scripted
-controller and an adaptive-reassignment controller both reacquire from every single one of those
-same states, typically within 1-2 steps.** Holding environment, geometry, timeout, and starting
-state exactly fixed, only the controller differs — that difference alone is the entire gap. See
-`EXPERIMENT_LOG.md`'s decisive counterfactual entry and `KNOWN_ISSUES.md` item 12. **No fix has
-been designed or attempted yet** — this is the single most important open problem in the project
-right now.
+**Headline: `target_lost_rate` has its first confirmed fix (`AUX_DIR_COEF`), but 26% remains and
+the two most-evidence-motivated follow-ons both failed.** The root cause (localized last pass to
+the learned actor's own search execution — a scripted controller reacquires 100% of the time from
+states where PPO's own trajectory failed 100% of the time, holding environment/geometry/timeout/
+starting-state exactly fixed) is unchanged; what's new this pass is the first working intervention
+against it. `AUX_DIR_COEF=0.01` — a small actor-loss term nudging search direction toward
+`unit(_last_known_vel)` — improved `target_lost_rate` in 3/3 seeds at both checkpoints (e.g.
+0.83/0.86/0.98 → 0.26/0.14/0.38 final) and is now the default. A pooled audit of the new baseline
+found 26.0% `target_lost` remains, concentrated in late, first-loss-event-fatal failures (67.9% of
+failures die on the swarm's very first loss event, `contact_fraction` still ~0.865 at failure) —
+not early collapse. Two follow-on ideas built directly from that audit were tested and **both
+rejected**: `AUX_DIVERSIFY` (per-agent heading-diversity blend) came back mixed (1 up, 1 down
++0.18, 1 flat); `AUX_DIR_RAMP` (urgency-scaled coefficient) came back as a clean **3/3-seed
+regression** (+0.37/+0.08/+0.23 percentage points), worse than the mixed result. Neither is
+adopted; `AUX_DIR_COEF=0.01` (flat) remains the baseline. **No further fix direction has been
+chosen** — closing the remaining 26% is still the single most important open problem in the
+project, and the two most-motivated next ideas from existing evidence have both been tried and
+failed. See `EXPERIMENT_LOG.md`'s decisive counterfactual and AUX-intervention entries, and
+`KNOWN_ISSUES.md` item 12.
 
 **The relative-velocity brake fix was tested at full scale and reverted — net-harmful, cause
 unknown.** The collision-safety cost that motivated it (8-14% under deterministic execution on

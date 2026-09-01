@@ -1,19 +1,20 @@
 # Known Issues
 
-Updated 2026-08-26 against commit `71327be` on `phase3-resilience` (not yet merged to `main` —
-see `TODO.md`). Since the last pass (`94216fd`/`3eae55b`): item 13 (brake relative velocity) was
-tested at full training scale and found net-harmful to convergence — **reverted**, no longer
-tagged resolved; item 12 (`target_lost_rate`) gained its most important update yet — the root
-cause is now localized to the actor's own learned search execution, not the environment,
-geometry, timeout, or critic, after a deep investigation chain (critic-collapse diagnostics,
-actor search-action dynamics, a scripted-controller ceiling test, and a decisive counterfactual
-branched from PPO's own real failure states). Two new items were added: 18 (`NUM_AGENTS=3`
-cannot learn at all under Phase 3's mechanisms, at any tested network size — a real deployment
-blocker) and 19 (the critic's final-layer saturation — confirmed real, demoted to a secondary
-pathology). For issues that were investigated and resolved, see `EXPERIMENT_LOG.md` (they're
-experiments with a conclusion, not open issues) — items below are only marked
-`[RESOLVED]`/`[REVERTED]` inline rather than removed, so the numbering stays stable and the
-resolution history is visible in place.
+Updated 2026-08-27 against commit `77b79b3` on `phase3-resilience`. Since the last pass
+(`71327be`): item 12 (`target_lost_rate`) gained its first *fix* — `AUX_DIR_COEF`, a small
+auxiliary actor-loss term nudging search direction toward `unit(_last_known_vel)`, measurably
+improved `target_lost_rate` in 3/3 seeds at both final and best checkpoints (the first
+intervention in the whole investigation to move the metric, not just localize it) and was
+adopted as the new default. A follow-on failure-mode audit of the new baseline (no retraining)
+found `target_lost` still dominant (26.0% pooled) but now a late, genuine-recovery problem
+(67.9% fatal on the swarm's first loss event, `contact_fraction` ~0.865 even at failure), which
+motivated two further interventions — `AUX_DIVERSIFY` (per-agent heading-diversity blend) and
+`AUX_DIR_RAMP` (urgency-scaled coefficient) — both tested via matched 3-seed comparisons and
+both **rejected** (mixed and decisively-regressive results respectively; neither adopted). Item
+12 below reflects all of this. For issues that were investigated and resolved, see
+`EXPERIMENT_LOG.md` (they're experiments with a conclusion, not open issues) — items below are
+only marked `[RESOLVED]`/`[REVERTED]` inline rather than removed, so the numbering stays stable
+and the resolution history is visible in place.
 
 ## 1. [RESOLVED] Collision-rate collapse recurred late in training
 
@@ -289,16 +290,36 @@ sensor boundary — not hard states. This is the strongest, most direct evidence
 investigation: holding the environment, geometry, timeout, and starting state exactly fixed, only
 the controller differs, and that alone explains the entire gap. See `EXPERIMENT_LOG.md`'s
 decisive counterfactual entry.
-**Status**: root cause localized, not yet fixed. Active search remains a real, adopted
-improvement over Phase 3's original catastrophe (89-100% → 60-81% at 6s, ~2-4% for seeds that
-converge well at 8-10s) — but the reason it doesn't reach 100% is now understood specifically:
-PPO's own search execution, not the environment, search geometry, heading-assignment strategy,
-timeout length, or critic. No fix has been designed or attempted yet for the actor-execution
-problem itself — candidate directions (untested) include a training signal that specifically
-rewards heading correction/reassignment, or a credit-assignment change that makes a productive
-search action more clearly attributable across the many steps between committing to a heading and
-actually reacquiring. This is now the single most important open problem in the project. See
-`EXPERIMENT_LOG.md` for the full evidence chain.
+**First fix, adopted (2026-08-27): `AUX_DIR_COEF`.** A small auxiliary actor-loss term, active
+only during search, nudges the actor's current mean action direction toward
+`unit(_last_known_vel)` — motivated by a correction-quality diagnostic and a separability check
+(both in `EXPERIMENT_LOG.md`) showing the agent-observable state already contains exploitable
+information the policy wasn't using. Matched 3-seed comparison: `target_lost_rate` improved in
+**3/3 seeds at both final and best checkpoints** (e.g. final: 0.83/0.86/0.98 → 0.26/0.14/0.38),
+`success_rate` and `productive_agent_fraction` both up in every seed, `collision_rate` up only
+slightly (0-3 points). **Adopted as the new default (`AUX_DIR_COEF=0.01`)** — the first
+intervention in this whole investigation to measurably move the primary failure metric, not just
+localize where it lives.
+**New-baseline audit (no retraining, reused existing eval data)**: `target_lost` remains the
+dominant failure mode at the new baseline (26.0% pooled, still ~15x collision's 1.7%), but the
+failure signature changed character — late (`episode_len` mean 1176.5/1800), high-contact-fraction
+(0.865 even at failure), and 67.9% fatal on the swarm's *first* loss event of the episode. This is
+now "ran out of time on the one search that mattered," not early collapse.
+**Two follow-on interventions, both rejected**: `AUX_DIVERSIFY` (blend the shared cue with each
+agent's own search heading, targeting the diversity hypothesis) came back mixed — 1 seed improved,
+1 regressed clearly, 1 flat, and `productive_agent_fraction` didn't move the way the hypothesis
+predicted. `AUX_DIR_RAMP` (scale the coefficient up as the timeout approaches, targeting the
+first-event-fatal finding) came back as a clean **3/3-seed regression** on `target_lost_rate` at
+both checkpoints — worse than `AUX_DIVERSIFY`'s mixed result, not just a miss. Leading hypothesis
+for why (not further tested): the pull target is a dead-reckoning cue that gets staler the longer
+contact stays lost, so escalating commitment to it as urgency rises is backwards. Neither is
+adopted; `AUX_DIR_COEF=0.01` (flat) remains the baseline, unaffected by either result.
+**Status**: partially fixed, still the single most important open problem in the project.
+`AUX_DIR_COEF` closed part of the gap (~-45 points of target_lost_rate on average across seeds)
+but 26% remains, and the two most-evidence-motivated follow-on ideas both failed to close more of
+it. No further fix direction has been chosen — this is an open question for the user, not a
+decided next step. See `EXPERIMENT_LOG.md` for the full evidence chain and all three intervention
+results.
 
 ## 13. [REVERTED] Closing-speed brake assumed each agent's own velocity, not relative velocity
 

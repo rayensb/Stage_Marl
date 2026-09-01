@@ -775,3 +775,56 @@ per-seed, per-checkpoint tables.
 investigation (spanning the critic-collapse chain, the actor-search-dynamics chain, and this
 auxiliary-objective intervention) that measurably improved the primary failure metric rather than
 only localizing where it lives.
+
+## AUX_DIVERSIFY rejected — per-agent heading-diversity blend does not improve on AUX_DIR_COEF
+
+**Decision**: after a matched 3-seed comparison (control: `AUX_DIR_COEF=0.01` alone vs. treatment:
+`AUX_DIVERSIFY=1` blending the shared cue with each agent's own search heading) came back mixed —
+1 seed improved, 1 regressed clearly (+0.18 points, the largest single movement in the table), 1
+was flat — `AUX_DIVERSIFY` stays off by default.
+**Why tested despite `AUX_DIR_COEF` already working**: specified from existing evidence, not a
+new diagnostic chain — `AUX_DIR_COEF` pulls every agent toward the identical shared direction,
+in tension with this project's most repeatedly-reconfirmed finding (productive-agent-count/
+diversity separates success from failure). Worth one targeted test before treating the flat cue as
+settled.
+**Why rejected rather than tuned further**: `productive_agent_fraction` — the exact metric the
+underlying hypothesis predicts should improve — did not improve consistently either (flat-to-down
+in 2 of 3 seeds), so the mixed target_lost_rate result isn't just noisy support for a real
+mechanism; the mechanism itself isn't showing up where it should. Fails the pre-agreed ≥2/3-seeds
+bar decisively enough that a coefficient/formulation sweep was judged more likely to produce
+another open-ended diagnosis loop than a fix.
+**Does not invalidate**: `AUX_DIR_COEF` itself, which remains a clean 3/3 win, unaffected by this
+result — only this specific diversification formulation is rejected.
+**Status**: resolved — rejected. See `EXPERIMENT_LOG.md` for the full per-seed data.
+
+## AUX_DIR_RAMP rejected — urgency-scaled auxiliary coefficient makes target_lost_rate decisively worse
+
+**Decision**: after a matched 3-seed comparison (control: `AUX_DIR_COEF=0.01` flat vs. treatment:
+`AUX_DIR_RAMP=1.0`, scaling the coefficient up to 2x as the timeout approaches) came back as a
+clean 3/3-seed regression on `target_lost_rate` at both final and best checkpoints (+0.37/+0.08/
++0.23 percentage points), `AUX_DIR_RAMP` stays at its default (`0.0`, never adopted).
+**Why tested**: specified entirely from existing evidence (no new diagnostic run) — `r_contact`'s
+own urgency ramp is an already-validated pattern in this codebase for the same "increase pressure
+as the timeout approaches" shape; the directional-entrenchment diagnostic found correction
+probability doesn't rise on its own as a bad streak lengthens, so an explicit escalating signal
+looked like it could compensate; and the new-baseline failure-mode audit found 67.9% of remaining
+failures are fatal on the swarm's very first loss event, exactly where a strengthening pull should
+have the most leverage.
+**Why rejected, more decisively than `AUX_DIVERSIFY`**: this wasn't a mixed result — all 3 seeds
+moved the wrong way, at both checkpoints, confirmed under a clean same-code comparison (verified no
+drift between the 5 Kaggle arms and the local arm's slightly-later commit, which differed only in a
+documentation file).
+**Leading hypothesis for the mechanism, not further tested**: the pull target
+(`unit(_last_known_vel)`) is a dead-reckoning cue that gets *staler* the longer contact stays lost,
+especially given Phase 3's dynamic target (mid-episode redirects). Ramping the coefficient up
+assumes the cue stays equally reliable while urgency rises — if reliability instead decays with
+`steps_since_contact`, escalating commitment to it as the timeout approaches pushes the actor
+toward an increasingly wrong direction exactly when it should be trusting its own weak-but-real
+judgment more, not less. This is a candidate lesson for any future strength-schedule idea on this
+same auxiliary signal, not something acted on now.
+**Does not invalidate**: `AUX_DIR_COEF=0.01` (flat, no ramp), which remains the unaffected Phase 3
+baseline — this ablation only tested a strength *schedule* on top of it, not the underlying
+directional signal itself.
+**Status**: resolved — rejected. This is now two rejected follow-ons in a row (`AUX_DIVERSIFY`,
+`AUX_DIR_RAMP`) on top of the one validated win (`AUX_DIR_COEF`). See `EXPERIMENT_LOG.md` for the
+full per-seed data.

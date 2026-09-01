@@ -1,13 +1,16 @@
 # Architecture
 
 Reference, not a copy: exact code lives in the files cited. Structural/conceptual
-descriptions below were verified directly against commit `71327be` on `phase3-resilience`
-(2026-08-26) by reading the actual functions, not from memory of older code — trust the file over
-any specific line number here if it's drifted since. Since the last pass
-(`94216fd`/`3eae55b`): the relative-velocity brake was tested at scale and **reverted**;
-`ACTOR_HIDDEN`/`CRITIC_HIDDEN` and `CRITIC_LR` were added as env-overridable training knobs, the
-former now validated by a network-capacity sweep, the latter tested and rejected as a fix for
-critic saturation (see `DECISIONS.md`/`EXPERIMENT_LOG.md`).
+descriptions below were verified directly against commit `77b79b3` on `phase3-resilience`
+(2026-08-27) by reading the actual functions, not from memory of older code — trust the file over
+any specific line number here if it's drifted since. Since the last pass (`71327be`):
+`AUX_DIR_COEF`, a small auxiliary actor-loss term nudging search direction, was added, validated
+(3/3 seeds improve `target_lost_rate`), and **adopted as the default (`0.01`)** — the first
+intervention in the `target_lost` investigation to measurably move the metric. Two follow-on
+mechanisms, `AUX_DIVERSIFY` (per-agent direction diversity) and `AUX_DIR_RAMP` (urgency-scaled
+coefficient), were implemented, tested, and **both rejected** — both exist in the code as inert,
+env-gated options at their default (off) values, not removed, so their rationale and results stay
+visible in place. See `DECISIONS.md`/`EXPERIMENT_LOG.md`.
 
 ## Module map
 
@@ -433,8 +436,11 @@ config.py  ──constants──▶  envs/formation_env.py  ◀──actions─�
   this was found net-harmful to training convergence at full scale and **reverted** (2026-08-24,
   commit `55e7232`) — production code is back to each agent's own velocity toward the other. See
   `KNOWN_ISSUES.md` item 13.
-- **What's now understood but not fixed**: `target_lost` failures during active search are
+- **What's now understood and partially fixed**: `target_lost` failures during active search are
   localized to the learned actor's own search execution — not the environment, search geometry,
   heading-assignment strategy, timeout length, or critic (all directly ruled out by experiment).
-  No fix has been designed yet. See `KNOWN_ISSUES.md` item 12, `EXPERIMENT_LOG.md`'s decisive
-  counterfactual entry.
+  `AUX_DIR_COEF=0.01` (a small auxiliary actor-loss term nudging search direction) is the first
+  fix, adopted after a 3/3-seed validated improvement — but 26% of episodes still fail this way,
+  and two direct follow-ons (`AUX_DIVERSIFY`, `AUX_DIR_RAMP`) have both been tried and rejected.
+  See `KNOWN_ISSUES.md` item 12, `EXPERIMENT_LOG.md`'s decisive counterfactual and
+  AUX-intervention entries.

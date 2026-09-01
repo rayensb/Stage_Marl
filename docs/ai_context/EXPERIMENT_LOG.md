@@ -1246,3 +1246,116 @@ monitoring, not a disqualifying regression.
 **Status**: adopted. `AUX_DIR_COEF`'s default changed from `0.0` to `0.01` (see `DECISIONS.md`).
 Per explicit decision, no coefficient sweep or further diagnosis is planned — this is now the
 experimental baseline going forward.
+
+## New-baseline failure-mode audit — target_lost still dominant, but now a late/genuine recovery problem, not early collapse
+
+**Objective**: per explicit instruction, do not launch another 3M-step run just to check whether
+more training closes the remaining gap after `AUX_DIR_COEF=0.01`'s adoption — instead, characterize
+the *new* baseline's remaining failures using data already downloaded (zero additional training
+cost), and identify the single highest-priority next problem.
+**Configuration**: pooled the 300 already-collected `AUX_DIR_COEF=0.01` evaluation episodes (3
+seeds x 100 episodes, final-checkpoint eval CSVs from the validation above) — no new runs.
+**Result**: pooled outcome split **72.3% success / 26.0% target_lost / 1.7% collision / 0.0%
+ground_strike** — target_lost remains ~15x more common than collision, still the dominant failure
+mode by a wide margin. Failed episodes average `episode_len=1176.5` (of 1800 max) and
+`contact_fraction=0.865` even at failure — these are late, genuine recovery failures, not early
+collapse (a swarm that fails early or never establishes contact would show a much shorter average
+length and lower contact fraction). Of the 78 pooled target_lost episodes, **67.9% fail on the
+swarm's very first loss-of-contact event of that episode** (`longest_loss_streak` mean=121, a real
+6s-timeout exhaustion, not something else) — most failing episodes don't get a second chance, they
+lose their one shot.
+**Conclusion**: 26% target-loss is the current engineering target, not a training-duration artifact
+— the failure signature (late, high-contact-fraction, first-event-fatal) points at "ran out of time
+on the one search that mattered" as the dominant remaining pattern, exactly where an intervention
+that raises pressure as the timeout approaches would have the most leverage.
+**Status**: resolved — directly motivated the two follow-on interventions below (`AUX_DIVERSIFY`,
+then `AUX_DIR_RAMP`), both specified from this audit's evidence without further diagnostic runs.
+
+## AUX_DIVERSIFY — per-agent heading-diversity blend — rejected, mixed result
+
+**Objective**: `AUX_DIR_COEF` as built pulls every agent toward the identical
+`unit(_last_known_vel)` direction every search step — in tension with active search's own design
+(deliberately spread headings for coverage) at exactly the point this project's most robust,
+repeatedly-reconfirmed finding (productive-agent count/diversity separates success from failure,
+both pre- and post-`AUX_DIR_COEF`) says diversity still matters. Test whether blending the shared
+directional cue with each agent's own already-diverse search heading, instead of using one shared
+direction for the whole swarm, improves on the `AUX_DIR_COEF=0.01` baseline.
+**Configuration**: `AUX_DIVERSIFY`, a new env-gated boolean in `training/train.py`. When enabled,
+each agent's auxiliary-loss target direction becomes `unit(unit(_last_known_vel) +
+_search_dirs[agent])` instead of the shared `unit(_last_known_vel)` — falling back to the agent's
+own search direction alone if the two nearly cancel. `AUX_DIR_COEF`'s magnitude and everything else
+left unchanged, isolating exactly one variable against the *current* (`AUX_DIR_COEF=0.01`)
+baseline, not the pre-`AUX_DIR_COEF` one. Matched 3-seed comparison: control (`AUX_DIVERSIFY`
+unset) vs. treatment (`AUX_DIVERSIFY=1`), otherwise identical to the `AUX_DIR_COEF` validation
+config. Control seeds 1-3 and treatment seeds 1-2 ran on Kaggle; treatment seed 3 ran locally.
+Smoke-tested (unset vs. `=1`, no crash, sane values) before spending Kaggle compute.
+**Result** (eval-time, final model, 100 episodes each): 1 of 3 seeds improved on `target_lost_rate`,
+1 regressed clearly (+0.18 percentage points, the largest single movement in the comparison table),
+1 was essentially flat. `productive_agent_fraction` did not improve consistently either (flat-to-
+down in 2 of 3 seeds) — the specific hypothesis motivating this change (uniform direction trades
+away useful coverage diversity) is not supported by what the metric that hypothesis predicts should
+move actually shows. One methodological caveat noted, not disqualifying: seed 3's control ran on
+Kaggle while its treatment ran locally (an execution-environment confound), but seeds 1/2 (both
+fully on Kaggle) already independently show the same mixed 1-up/1-down split, so it doesn't change
+the conclusion.
+**Conclusion**: fails the pre-agreed ≥2/3-seeds acceptance criterion — a clean negative result about
+this specific diversification formulation, not evidence against the `AUX_DIR_COEF` approach
+generally (which remains a clean 3/3 win, unaffected by this result).
+**Status**: rejected. `AUX_DIVERSIFY` stays off by default (`AUX_DIR_COEF=0.01` unaffected); no
+further diagnosis planned on this specific hypothesis.
+
+## AUX_DIR_RAMP — urgency-scaled auxiliary coefficient — rejected, decisive 3/3-seed regression
+
+**Objective**: a different kind of follow-on to `AUX_DIR_COEF` — not a different target direction
+(`AUX_DIVERSIFY` tried that, rejected above), but a different *strength schedule* for the same,
+already-validated direction (`unit(_last_known_vel)`). Specified entirely from existing evidence, no
+new diagnostic run: (1) `r_contact`'s own urgency ramp
+(`CONTACT_URGENT_COEF * min(1, steps_since_contact/LOST_TIMEOUT_STEPS)`) is an already-validated
+pattern in this codebase for "increase pressure as the timeout approaches"; (2) the directional-
+entrenchment diagnostic found correction probability does not rise on its own as a bad streak
+lengthens (flat ~5.5-6.8% for streaks of 6-10/11-20/21+ steps) — the actor doesn't self-generate
+escalating urgency, so an explicit signal that does could compensate; (3) the failure-mode audit
+above found 67.9% of remaining `target_lost` failures are fatal on the swarm's very first loss
+event, with `contact_fraction` still ~0.865 even in failed episodes — exactly where a pull that
+gets more assertive as time runs low should have the most leverage.
+**Configuration**: `AUX_DIR_RAMP`, a new env-overridable float in `training/train.py`. When set
+> 0, the per-transition auxiliary coefficient becomes `AUX_DIR_COEF * (1 + AUX_DIR_RAMP *
+min(1, steps_since_contact/LOST_TIMEOUT_STEPS))` instead of a flat `AUX_DIR_COEF` for the whole
+search window — required extending `RolloutBuffer` with a new `aux_ramp_frac` field and rewriting
+the minibatch loop's auxiliary-loss computation to use a per-row coefficient instead of one scalar.
+Matched 3-seed comparison: control (`AUX_DIR_RAMP` unset — current `AUX_DIR_COEF=0.01` baseline)
+vs. treatment (`AUX_DIR_RAMP=1.0`, doubling the coefficient by the time the timeout is reached).
+Smoke-tested three configurations, all exercising real in-search rows (not the trivial all-False
+case): `AUX_DIR_RAMP=0` — `coef_mean` logged exactly `0.0100` (== `AUX_DIR_COEF`) despite real
+search rows present, confirming an exact no-op under live rollout conditions, not just
+algebraically; `AUX_DIR_RAMP=50` (exaggerated) — `coef_mean` jumped to 0.26-0.28, no crash;
+`AUX_DIR_RAMP=1.0` (the treatment value) — `coef_mean` landed at 0.014-0.016, inside the expected
+`[0.01, 0.02]` band.
+**Result** (eval-time, final/best model, 100 episodes each) — `target_lost_rate`, treatment vs. its
+own matched control:
+
+| seed | control final | control best | treat final | treat best | Δ final |
+|---|---|---|---|---|---|
+| 1 | 0.180 | 0.160 | 0.550 | 0.550 | **+0.370** |
+| 2 | 0.160 | 0.230 | 0.240 | 0.260 | **+0.080** |
+| 3 | 0.050 | 0.050 | 0.280 | 0.280 | **+0.230** |
+
+All 3 seeds regressed, at both checkpoints — fails the ≥2/3-improve acceptance criterion in the
+wrong direction, more decisively than `AUX_DIVERSIFY`'s mixed result. `collision_rate` moved
+inconsistently (down in 2/3, up in 1/3) and `productive_agent_fraction` was down in 2/3 seeds —
+consistent with the regression, not offsetting it. Confirmed a clean comparison first: all 5 Kaggle
+kernels cloned the identical commit; the local run's one-commit-later HEAD differed from it only in
+a documentation file (`git diff` on `training/`/`config.py`/`envs/` empty) — no code drift between
+arms.
+**Conclusion, leading hypothesis, not further tested**: the pull target (`unit(_last_known_vel)`) is
+a fixed dead-reckoning cue that gets *staler* the longer contact stays lost, especially with Phase
+3's dynamic target (mid-episode redirects). Ramping the coefficient *up* as urgency rises assumes
+the cue stays equally reliable while urgency rises — but if the cue's reliability actually decays
+with `steps_since_contact`, escalating commitment to it as the timeout approaches is backwards: it
+forces the actor toward an increasingly wrong direction exactly when it should be leaning more on
+its own real-but-weak directional judgment (the correction-quality diagnostic's finding), not less.
+**Status**: rejected. `AUX_DIR_RAMP` stays at its default (`0.0`, never adopted — the flat
+`AUX_DIR_COEF=0.01` behavior is unaffected). No further tuning of this specific ramp-shape idea is
+planned. This is now two rejected follow-ons in a row (`AUX_DIVERSIFY`, `AUX_DIR_RAMP`) on top of
+the one validated win (`AUX_DIR_COEF`) — next direction is an open question for the user, not
+chosen here.

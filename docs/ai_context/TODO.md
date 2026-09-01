@@ -1,34 +1,41 @@
 # TODO / Roadmap
 
-Updated 2026-08-26. Prioritized, not sequenced by date. "Critical" blocks understanding current
+Updated 2026-08-27. Prioritized, not sequenced by date. "Critical" blocks understanding current
 results or represents the project's top open problem; "High" is the next real work; "Medium" is
 valuable but not blocking; "Research/Future" is speculative scope, not committed work.
 
-**Since the last pass**: `main` was fast-forwarded (no longer a pending item). The
-relative-velocity brake fix was tested at full scale and **reverted** (net-harmful to
-convergence, cause unknown) — no longer "confirm it works," now a closed, reverted experiment. A
-network-capacity sweep resolved `N=4`'s hidden-width question but surfaced a new one:
-`NUM_AGENTS=3` doesn't learn at all under Phase 3's mechanisms, at any tested size. A deep
-investigation (critic-collapse diagnostics, then actor search-action dynamics) **localized
-`target_lost`'s root cause to the learned actor's own search execution** — this is now the
-project's single most important open item, replacing the older, less-specific "push
-`target_lost_rate` further" framing.
+**Since the last pass**: the project moved from diagnosis to intervention on its top problem.
+`AUX_DIR_COEF=0.01` (search-direction auxiliary actor loss) was implemented, validated (3/3 seeds
+improve `target_lost_rate` at both checkpoints), and **adopted** — the first fix, not just
+localization, in this whole investigation. A no-retraining audit of the new baseline found 26%
+`target_lost` remains, concentrated in late, first-loss-event-fatal failures. Two follow-ons built
+from that audit — `AUX_DIVERSIFY` and `AUX_DIR_RAMP` — were tested and **both rejected**. The
+"design and test a fix" item below is updated accordingly: it's no longer "no fix has been
+attempted," it's "the two most directly evidence-motivated ideas have been tried and failed —
+the next one needs to be genuinely different, not a variant of the shared-direction pull."
 
 ## Critical
 
-- **Design and test a fix for the actor's own search-execution problem.** Decisively localized
-  (not just suspected): branching a scripted or adaptive-reassignment controller from PPO's own
-  real failure states reacquires 100% of the time where PPO's real trajectory failed 100% of the
-  time, holding environment/geometry/timeout/starting-state exactly fixed. No fix has been
-  designed or attempted yet. Candidate directions, both untested: (a) a training signal that
-  specifically rewards heading correction/reassignment once a chosen search direction stops
-  making progress, since the productive-agent-count data shows most failures have *zero* agents
-  making net progress, not one unlucky agent running out of time; (b) a credit-assignment change
-  that makes a productive search action more clearly attributable across the many steps between
-  committing to a heading and actually reacquiring, since standard per-step PPO credit assignment
-  may be too diffuse over a ~100+-step search. This is an open question for the user — discuss
-  before implementing either in `envs/formation_env.py` or `training/train.py`. See
-  `EXPERIMENT_LOG.md`'s decisive counterfactual entry, `KNOWN_ISSUES.md` item 12.
+- **Design and test a fix for the remaining 26% `target_lost_rate`.** Root cause remains the
+  actor's own search execution (decisively localized last pass: a scripted controller reacquires
+  100% of the time where PPO's own trajectory failed 100% of the time, from identical states).
+  `AUX_DIR_COEF=0.01` (a small, always-on nudge toward `unit(_last_known_vel)`) fixed part of this
+  and is adopted. Two direct follow-ons from the failure-mode audit have since been tried and
+  **rejected**: diversifying the pull direction per agent (`AUX_DIVERSIFY`, mixed result) and
+  scaling the pull's strength up with urgency (`AUX_DIR_RAMP`, a clean 3/3-seed regression — see
+  `DECISIONS.md` for the leading hypothesis: the pull target gets staler with time, so escalating
+  commitment to it as urgency rises is backwards). **Whoever picks this up next should read
+  `EXPERIMENT_LOG.md`'s three AUX-intervention entries before proposing a fourth idea** — a
+  genuinely different mechanism is needed, not another variant of "pull harder/differently toward
+  the same shared cue." Untested candidate directions, both from before `AUX_DIR_COEF` existed and
+  still open: (a) a credit-assignment change that makes a productive search action more clearly
+  attributable across the many steps between committing to a heading and actually reacquiring,
+  since standard per-step PPO credit assignment may be too diffuse over a ~100+-step search; (b)
+  something that addresses the first-loss-event-fatal signature specifically (67.9% of failures
+  never get a second attempt) rather than the per-step direction. This is an open question for the
+  user — discuss before implementing in `envs/formation_env.py` or `training/train.py`. See
+  `EXPERIMENT_LOG.md`'s decisive counterfactual and AUX-intervention entries, `KNOWN_ISSUES.md`
+  item 12.
 - **Get any `NUM_AGENTS=3` Phase-3-era checkpoint to learn at all.** A real deployment blocker:
   `deployment/inference_node.py` hard-requires `NUM_AGENTS=3`, and every `N=3` attempt so far
   (2 under the reverted relative-velocity brake, 2 more under the restored working brake at two

@@ -29,19 +29,22 @@ Train a policy that, at `NUM_AGENTS=4` (the primary validated agent count) and `
 cohesion while avoiding both collisions and losing sensor contact with the target, and sustains
 that quality over a realistic flight duration (90s), not just the original 10-second training
 horizon. Collision avoidance at `N=4` **is resolved** (the closing-speed brake). `target_lost`
-during active search — the swarm's response to fully losing contact — **has its root cause
-identified but not yet fixed**: a deep investigation this pass (critic-collapse diagnostics,
-then actor search-action dynamics, culminating in a decisive counterfactual experiment) proved
-the failure is the **learned actor's own search execution**, not the environment, search
-geometry, heading-assignment strategy, timeout length, or the critic — branching a simple
-scripted controller from PPO's own real failure states reacquires the target 100% of the time
-from states where PPO's own trajectory failed 100% of the time. **This is now the single most
-important open problem in the project.** Separately, `NUM_AGENTS=3` — the actual deployment
-target — currently cannot learn tracking at all under Phase 3's full mechanism set, at any
-tested network size, a real blocker independent of the `target_lost` question above. See
-`TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` items 12 and 18.
+during active search — the swarm's response to fully losing contact — has its root cause
+identified (the **learned actor's own search execution**, not the environment, search geometry,
+heading-assignment strategy, timeout length, or the critic — a scripted controller reacquires the
+target 100% of the time from states where PPO's own trajectory failed 100% of the time) **and now
+a first partial fix**: a small auxiliary actor-loss term (`AUX_DIR_COEF=0.01`) nudging search
+direction improved `target_lost_rate` in 3/3 seeds and is adopted, but 26% of episodes still fail
+this way, concentrated in late, first-loss-event-fatal failures. Two direct follow-on ideas
+(diversifying the pull direction, ramping its strength with urgency) were tested and rejected.
+**Closing the remaining 26% is still the single most important open problem in the project**, and
+the two most directly evidence-motivated next ideas have already failed. Separately,
+`NUM_AGENTS=3` — the actual deployment target — currently cannot learn tracking at all under
+Phase 3's full mechanism set, at any tested network size, a real blocker independent of the
+`target_lost` question above. See `TODO.md`/`SESSION_HANDOFF.md`/`KNOWN_ISSUES.md` items 12 and
+18.
 
-## Current status (code as of commit `71327be` on `phase3-resilience`, 2026-08-26;
+## Current status (code as of commit `77b79b3` on `phase3-resilience`, 2026-08-27;
 `origin/main` fast-forwarded to `8b724bb` on 2026-08-23 — no longer behind)
 
 - **Collision avoidance is solid at `NUM_AGENTS=4`.** The closing-speed brake (a deterministic
@@ -73,7 +76,20 @@ tested network size, a real blocker independent of the `target_lost` question ab
   where PPO's real trajectory failed, PPO fails again 100% of the time, but scripted and adaptive
   both reacquire 100% of the time, typically within 1-2 steps. Holding environment, geometry,
   timeout, and starting state exactly fixed, only the controller differs — **the problem is the
-  learned actor's own search execution.** No fix has been designed or attempted yet.
+  learned actor's own search execution.**
+- **First fix, adopted: `AUX_DIR_COEF=0.01`.** A small auxiliary actor-loss term, active only
+  during search, nudges the actor's current mean action direction toward `unit(_last_known_vel)`.
+  Matched 3-seed comparison: `target_lost_rate` improved in **3/3 seeds at both final and best
+  checkpoints** (e.g. 0.83/0.86/0.98 → 0.26/0.14/0.38 final) — the first intervention in this
+  investigation to move the metric, not just localize it. A no-retraining audit of the new
+  baseline found 26.0% `target_lost` remains, concentrated in late, first-loss-event-fatal
+  failures (67.9% of failures die on the episode's very first loss event). **Two follow-ons built
+  from that audit were tested and rejected**: `AUX_DIVERSIFY` (per-agent heading diversity, mixed
+  result) and `AUX_DIR_RAMP` (urgency-scaled coefficient, a clean 3/3-seed regression — leading
+  hypothesis: the pull target gets staler the longer contact stays lost, so escalating commitment
+  to it as urgency rises is backwards). Neither adopted; `AUX_DIR_COEF=0.01` (flat) remains the
+  baseline. Closing the remaining 26% is still the single most important open problem in the
+  project, and no fix direction has been chosen for it.
 - **Network capacity, measured for the first time.** A 5-way hidden-width sweep
   (`ACTOR_HIDDEN`/`CRITIC_HIDDEN`, now env-overridable) confirmed Phase 3's 128/256 default is a
   genuine sweet spot for `N=4` — a smaller network partially hurts, a larger one collapses
